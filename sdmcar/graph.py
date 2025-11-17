@@ -34,6 +34,47 @@ def build_laplacian_from_knn(coords, k: int = 8, gamma: float = 0.2, rho: float 
     L = D - rho * W
     return L, W
 
+def build_laplacian_from_radius(
+    coords: torch.Tensor,
+    radius: float,
+    rho: float = 1.0,
+    weight: str = "binary",
+    gamma: float = 0.2,
+):
+    """
+    Build Laplacian L = D - rho * W using radius-based neighbors
+    (similar to R's dnearneigh).
+
+    Args:
+        coords: [n, d] tensor (double) of coordinates.
+        radius: maximum distance for neighbors.
+        rho: CAR strength parameter.
+        weight: 'binary' or 'rbf'.
+        gamma: RBF length-scale if weight == 'rbf'.
+
+    Returns:
+        L: [n, n] Laplacian matrix (double, symmetric).
+        W: [n, n] adjacency matrix (double, symmetric).
+    """
+    n = coords.size(0)
+    dists = torch.cdist(coords, coords, p=2)
+
+    neighbor_mask = (dists > 0) & (dists <= radius)
+
+    W = torch.zeros((n, n), dtype=torch.double, device=coords.device)
+    if weight == "binary":
+        W[neighbor_mask] = 1.0
+    elif weight == "rbf":
+        W[neighbor_mask] = torch.exp(-dists[neighbor_mask] / gamma)
+    else:
+        raise ValueError(f"Unknown weight type: {weight}")
+
+    W = 0.5 * (W + W.T)
+    D = torch.diag(W.sum(1))
+    L = D - rho * W
+    return L, W
+
+
 def laplacian_eigendecomp(L):
     """
     Symmetric eigendecomposition L = U diag(λ) U^T.
