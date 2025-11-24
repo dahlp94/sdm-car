@@ -96,3 +96,108 @@ class DiffusionFilterFullVI(nn.Module):
         tau2_mean = torch.exp(self.mu_log_tau2)
         a_mean    = softplus(self.mu_a_raw)
         return tau2_mean, a_mean
+
+class MaternLikeFilterFullVI(nn.Module):
+    """
+    Variational Matérn-like spectral filter:
+
+        F(λ) = τ² * (λ + ρ₀)^(-ν),
+
+    with ρ₀ > 0 and ν > 0 enforced via softplus transforms:
+
+        ρ₀ = softplus(ρ0_raw),
+        ν  = softplus(nu_raw).
+
+    Variational posteriors (full VI):
+        q(log τ²)   = N(μ_τ, s_τ²)
+        q(a_raw)    = N(μ_a, diag(s_a²)), where
+                      a_raw = (ρ0_raw, nu_raw),
+
+    Priors (on unconstrained variables):
+        log τ²  ~ N(0, 1)
+        ρ0_raw  ~ N(0, 1)
+        nu_raw  ~ N(0, 1)
+    """
+    def __init__(self,
+                 mu_log_tau2: float = 0.0,
+                 log_std_log_tau2: float = -2.3,
+                 mu_rho0_raw: float = 0.0,
+                 log_std_rho0_raw: float = -2.3,
+                 mu_nu_raw: float = 0.0,
+                 log_std_nu_raw: float = -2.3):
+        super().__init__()
+
+        # q(log τ²)
+        self.mu_log_tau2 = nn.Parameter(
+            torch.tensor([mu_log_tau2], dtype=torch.double)
+        )
+        self.log_std_log_tau2 = nn.Parameter(
+            torch.tensor([log_std_log_tau2], dtype=torch.double)
+        )
+
+        # q(a_raw) where a_raw = (ρ0_raw, nu_raw)
+        self.mu_a_raw = nn.Parameter(
+            torch.tensor([mu_rho0_raw, mu_nu_raw], dtype=torch.double)
+        )
+        self.log_std_a_raw = nn.Parameter(
+            torch.tensor([log_std_rho0_raw, log_std_nu_raw], dtype=torch.double)
+        )
+
+    def sample_params(self):
+        """
+        Reparameterized samples of (τ², a) and the unconstrained variables.
+
+        Returns:
+            tau2: scalar τ²
+            a:    length-2 vector (ρ₀, ν), each > 0
+            log_tau2: scalar log τ² sample
+            a_raw:    length-2 vector (ρ0_raw, nu_raw) sample
+        """
+        eps1 = torch.randn_like(self.mu_log_tau2)
+        eps_a = torch.randn_like(self.mu_a_raw)
+
+        log_tau2 = self.mu_log_tau2 + torch.exp(self.log_std_log_tau2) * eps1
+        a_raw    = self.mu_a_raw    + torch.exp(self.log_std_a_raw)    * eps_a
+
+        tau2 = torch.exp(log_tau2)
+        a    = softplus(a_raw)  # elementwise: (ρ₀, ν) > 0
+        return tau2, a, log_tau2, a_raw
+
+    def F(self, lam, tau2, a):
+        """
+        Compute F(λ) elementwise for a given sample (τ², ρ₀, ν).
+
+        Args:
+            lam:  [n] eigenvalues (λ ≥ 0).
+            tau2: scalar τ².
+            a:    length-2 vector (ρ₀, ν), both > 0.
+
+        Returns:
+            F_lam: [n] spectral variances.
+        """
+        rho0, nu = a.unbind(-1)  # both scalars if a.shape == [2]
+        return tau2 * (lam + rho0).pow(-nu)
+
+    def kl_q_p(self):
+        """
+        KL( q(log τ²)||N(0,1) ) + KL( q(a_raw)||N(0,1) ).
+
+        Returns:
+            scalar KL value.
+        """
+        kl = kl_normal_std(self.mu_log_tau2, self.log_std_log_tau2)
+        kl += kl_normal_std(self.mu_a_raw,   self.log_std_a_raw)
+        return kl.sum()
+
+    @torch.no_grad()
+    def mean_params(self):
+        """
+        Return mean parameters under q: τ²_mean, a_mean.
+
+        Returns:
+            tau2_mean: scalar E_q[τ²]
+            a_mean:    length-2 vector E_q[(ρ₀, ν)]
+        """
+        tau2_mean = torch.exp(self.mu_log_tau2)
+        a_mean    = softplus(self.mu_a_raw)
+        return tau2_mean, a_mean
