@@ -60,9 +60,8 @@ class SpectralCAR_FullVI(nn.Module):
         self.log_std_log_sigma2 = nn.Parameter(
             torch.tensor([log_std_log_sigma2], dtype=torch.double, device=device)
         )
-
-    # ----- Gaussian conjugacy for β (per sample) -----
-    def _beta_update(self, inv_var):
+    
+    def _beta_update(self, inv_var, return_Xt_invSig_X: bool = False):
         """
         inv_var: [n] = 1 / (F(λ) + σ²)
 
@@ -73,14 +72,26 @@ class SpectralCAR_FullVI(nn.Module):
         using spectral trick:
             X^T Σ^{-1} X = X_tilde^T diag(inv_var) X_tilde
             X^T Σ^{-1} y = X_tilde^T (inv_var * y_tilde)
+
+        If return_Xt_invSig_X=True, also returns Xt_invSig_X = X^T Σ^{-1} X
+        for reuse in the ELBO trace term.
         """
-        Xt_invSig_X = self.X_tilde.T @ (inv_var.unsqueeze(1) * self.X_tilde)
-        Xt_invSig_y = self.X_tilde.T @ (inv_var * self.y_tilde)
+        # X̃^T Σ^{-1} X̃
+        Xt_weighted = inv_var.unsqueeze(1) * self.X_tilde        # [n, p]
+        Xt_invSig_X = self.X_tilde.T @ Xt_weighted               # [p, p]
+
+        # X̃^T Σ^{-1} ỹ
+        Xt_invSig_y = self.X_tilde.T @ (inv_var * self.y_tilde)  # [p]
 
         V_beta_inv = self.V0_inv + Xt_invSig_X
         V_beta = torch.inverse(V_beta_inv)
         m_beta = V_beta @ (self.V0_inv @ self.m0 + Xt_invSig_y)
-        return m_beta, V_beta
+
+        if return_Xt_invSig_X:
+            return m_beta, V_beta, Xt_invSig_X
+        else:
+            return m_beta, V_beta    
+    
 
     def _kl_beta(self, m_beta, V_beta):
         """
@@ -91,20 +102,23 @@ class SpectralCAR_FullVI(nn.Module):
         term2 = torch.trace(self.V0_inv @ V_beta)
         dm = (m_beta - self.m0).unsqueeze(0)
         term3 = (dm @ self.V0_inv @ dm.T).squeeze()
-        return 0.5 * (term1 - p + term2 + term3)
+        return 0.5 * (term1 - p + term2 + term3)    
 
-    # ----- ELBO computation -----
     def elbo(self):
         """
         Monte-Carlo estimate of ELBO over q(hyperparams):
             hyperparams = {log σ²} ∪ filter hyperparams.
+
+        Uses the exact analytic E_q(beta|theta)[log p(y|beta,theta)]
+        for each sampled theta, rather than a plug-in log-likelihood.
         """
-        # Sample q(log σ²)
+
+        # ---- Sample log σ² from q(log σ²) ----
         eps_sig = torch.randn_like(self.mu_log_sigma2)
         log_sigma2 = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps_sig
         sigma2 = torch.exp(log_sigma2).clamp_min(1e-12)
 
-        # KL for σ²
+        # KL(q(log σ²) || N(0,1))
         kl_sigma2 = kl_normal_std(self.mu_log_sigma2, self.log_std_log_sigma2).sum()
 
         mc_loglik = 0.0
@@ -112,39 +126,50 @@ class SpectralCAR_FullVI(nn.Module):
         last_m_beta, last_V_beta = None, None
 
         for _ in range(self.num_mc):
-            # Sample τ² and a from q in the filter (or more general hyperparams)
-            tau2, a, log_tau2, a_raw = self.filter.sample_params()
+            # ---- Sample filter hyperparameters from q(filter) ----
+            tau2, a, _, _ = self.filter.sample_params()
 
-            # Build spectral variance
-            F_lam = self.filter.F(self.lam, tau2, a)      # [n]
-            var = F_lam + sigma2
-            inv_var = 1.0 / var
+            # ---- Build spectral variance ----
+            F_lam = self.filter.F(self.lam, tau2, a)  # [n]
+            var = F_lam + sigma2                      # [n]
+            inv_var = 1.0 / var                       # [n]
 
-            # Analytic q(β) for this sample
-            m_beta, V_beta = self._beta_update(inv_var)
+            # ---- Exact posterior of β for this theta ----
+            # Also get Xt_invSig_X = X^T Σ^{-1} X for trace term.
+            m_beta, V_beta, Xt_invSig_X = self._beta_update(inv_var, return_Xt_invSig_X=True)
 
-            # Collapsed log-likelihood for this sample:
-            # log p(y|β, F, σ²) = -0.5 Σ_i [ log(var_i) + g_i^2 / var_i ]
-            g = self.y_tilde - self.X_tilde @ m_beta
-            loglik = -0.5 * torch.sum(torch.log(var) + g**2 * inv_var)
+            # ---- Residual in spectral domain ----
+            g = self.y_tilde - self.X_tilde @ m_beta   # [n]
 
-            # KL(q(β)||p(β)) for this sample
-            klb = self._kl_beta(m_beta, V_beta)
+            # ---- Plug-in part of log-likelihood (what we used before) ----
+            loglik_plugin = -0.5 * torch.sum(torch.log(var) + g**2 * inv_var)
 
-            mc_loglik += loglik
-            mc_kl_beta += klb
-            last_m_beta, last_V_beta = m_beta, V_beta  # keep last for reporting
+            # ---- Exact variance correction: -0.5 * tr(V_beta X^T Σ^{-1} X) ----
+            trace_term = torch.trace(V_beta @ Xt_invSig_X)
 
+            # ---- Exact E_q(beta|theta)[log p(y|beta,theta)] (up to -0.5 n log(2π)) ----
+            loglik_exact = loglik_plugin - 0.5 * trace_term
+
+            # ---- KL(q(β|θ) || p(β)) for this θ ----
+            kl_beta = self._kl_beta(m_beta, V_beta)
+
+            mc_loglik += loglik_exact
+            mc_kl_beta += kl_beta
+
+            last_m_beta = m_beta
+            last_V_beta = V_beta
+
+        # ---- Average over Monte Carlo samples ----
         mc_loglik /= self.num_mc
         mc_kl_beta /= self.num_mc
 
-        # KL for filter hyperparameters
+        # ---- KL for filter hyperparameters ----
         kl_filter = self.filter.kl_q_p()
 
-        # ELBO = E[loglik - KL_beta] - KL_filter - KL_sigma2
+        # ---- Final ELBO ----
         elbo = mc_loglik - mc_kl_beta - kl_filter - kl_sigma2
 
-        # store last β posterior (for inspection/reporting)
+        # Store last β posterior for inspection/reporting
         self.m_beta = last_m_beta.detach()
         self.V_beta = last_V_beta.detach()
 
@@ -156,6 +181,7 @@ class SpectralCAR_FullVI(nn.Module):
             "sigma2": sigma2.detach(),
         }
         return elbo, stats
+
 
     @torch.no_grad()
     def posterior_phi(self, use_q_means: bool = True):
