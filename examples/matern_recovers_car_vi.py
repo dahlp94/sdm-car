@@ -171,8 +171,40 @@ def main():
     print(f"  rho0_hat ≈ {rho0_hat.item():.6f} (CAR eps = {eps_car})")
     print(f"  nu_hat   ≈ {nu_hat.item():.4f} (CAR corresponds to ν ≈ 1)")
 
+    # # --------------------------------------------
+    # # 5. Compare filters: CAR vs fitted Matérn (mean q)
+    # # --------------------------------------------
+    # with torch.no_grad():
+    #     F_matern_hat = tau2_hat * (lam + rho0_hat).pow(-nu_hat)
+
+    # mask = lam > 1e-6
+    # lam_plot = lam[mask].cpu()
+    # F_car_plot = F_car[mask].cpu()
+    # F_matern_plot = F_matern_hat[mask].cpu()
+
+    # plt.figure(figsize=(6, 4))
+    # plt.loglog(lam_plot, F_car_plot, label="True CAR: τ² / (λ + ε)")
+    # plt.loglog(lam_plot, F_matern_plot, "--", label="Fitted Matérn-like (VI mean)")
+    # plt.xlabel("Eigenvalue λ")
+    # plt.ylabel("Spectral variance F(λ)")
+    # plt.title("CAR vs Matérn-like spectral filter (VI)")
+    # plt.legend()
+    # plt.tight_layout()
+
+    # fig_dir = Path("examples") / "figures"
+    # fig_dir.mkdir(parents=True, exist_ok=True)
+    # fig_path_filter = fig_dir / "matern_recovers_car_filter_vi.png"
+    # plt.savefig(fig_path_filter, dpi=200)
+    # plt.close()
+    # print(f"Saved filter comparison plot to: {fig_path_filter}")
+
+
     # --------------------------------------------
     # 5. Compare filters: CAR vs fitted Matérn (mean q)
+    #    → 3-panel figure:
+    #      (1) smooth curves
+    #      (2) scatter per eigenvalue
+    #      (3) spectral ratio F_matern / F_car
     # --------------------------------------------
     with torch.no_grad():
         F_matern_hat = tau2_hat * (lam + rho0_hat).pow(-nu_hat)
@@ -182,21 +214,52 @@ def main():
     F_car_plot = F_car[mask].cpu()
     F_matern_plot = F_matern_hat[mask].cpu()
 
-    plt.figure(figsize=(6, 4))
-    plt.loglog(lam_plot, F_car_plot, label="True CAR: τ² / (λ + ε)")
-    plt.loglog(lam_plot, F_matern_plot, "--", label="Fitted Matérn-like (VI mean)")
-    plt.xlabel("Eigenvalue λ")
-    plt.ylabel("Spectral variance F(λ)")
-    plt.title("CAR vs Matérn-like spectral filter (VI)")
-    plt.legend()
-    plt.tight_layout()
+    R_plot = (F_matern_plot / F_car_plot).cpu()
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
+
+    # ---- Panel 1: smooth log–log curves ----
+    ax = axes[0]
+    ax.loglog(lam_plot, F_car_plot, label="True CAR: τ² / (λ + ε)")
+    ax.loglog(lam_plot, F_matern_plot, "--", label="Fitted Matérn-like (VI mean)")
+    ax.set_xlabel("Eigenvalue λ")
+    ax.set_ylabel("Spectral variance F(λ)")
+    ax.set_title("Filters (smooth curves)")
+    ax.legend(fontsize=8)
+
+    # ---- Panel 2: scatter per eigenvalue ----
+    ax = axes[1]
+    ax.loglog(lam_plot, F_car_plot, 'o', markersize=3,
+              label="CAR (per eigenvalue)")
+    ax.loglog(lam_plot, F_matern_plot, 'x', markersize=3,
+              label="Matérn (per eigenvalue)")
+    ax.set_xlabel("Eigenvalue λ")
+    ax.set_ylabel("Spectral variance F(λ)")
+    ax.set_title("Filters (scatter)")
+    ax.legend(fontsize=8)
+
+    # ---- Panel 3: spectral ratio ----
+    ax = axes[2]
+    ax.semilogx(lam_plot, R_plot)
+    ax.axhline(1.0, color="gray", linestyle="--", linewidth=1)
+    ax.set_xlabel("Eigenvalue λ")
+    ax.set_ylabel("Ratio F_Mat / F_CAR")
+    ax.set_title("Spectral ratio")
+    ax.grid(True, which="both", linestyle=":", linewidth=0.5)
 
     fig_dir = Path("examples") / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
-    fig_path_filter = fig_dir / "matern_recovers_car_filter_vi.png"
-    plt.savefig(fig_path_filter, dpi=200)
+    fig_path_filter = fig_dir / "matern_recovers_car_filter_vi_3panel.png"
+    fig.suptitle("CAR vs Matérn-like spectral filter (VI)", y=1.02, fontsize=12)
+    plt.savefig(fig_path_filter, dpi=200, bbox_inches="tight")
     plt.close()
-    print(f"Saved filter comparison plot to: {fig_path_filter}")
+    print(f"Saved 3-panel filter comparison plot to: {fig_path_filter}")
+
+
+
+
+
+
 
     # --------------------------------------------
     # 6. Sample φ fields: CAR vs fitted Matérn, plot on grid
