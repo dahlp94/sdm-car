@@ -145,6 +145,11 @@ def main():
 
     elbo_history = []
 
+    tau2_trace = []
+    rho0_trace = []
+    nu_trace = []
+
+
     for it in range(num_iters):
         optimizer.zero_grad()
         elbo = elbo_matern_on_car(matern, lam, z_true, num_mc=num_mc)
@@ -155,10 +160,17 @@ def main():
         # record ELBO
         elbo_history.append(elbo.item())
 
-        if it % 100 == 0:
-            with torch.no_grad():
+        # record current mean parameters under q
+        with torch.no_grad():
                 tau2_mean, a_mean = matern.mean_params()
                 rho0_mean, nu_mean = a_mean.unbind(-1)
+        
+        tau2_trace.append(tau2_mean.item())
+        rho0_trace.append(rho0_mean.item())
+        nu_trace.append(nu_mean.item())
+
+
+        if it % 100 == 0:
             print(
                 f"[{it:04d}] ELBO={elbo.item():.2f}, "
                 f"tau2_mean={tau2_mean.item():.4f}, "
@@ -185,6 +197,44 @@ def main():
     plt.close()
     print(f"Saved ELBO convergence plot to: {fig_path_elbo}")
 
+    # --------------------------------------------
+    # 4c. Plot parameter traces (τ², ρ₀, ν)
+    # --------------------------------------------
+    iters = range(num_iters)
+
+    fig, axes = plt.subplots(3, 1, figsize=(7, 8), sharex=True, constrained_layout=True)
+
+    # τ² trace
+    axes[0].plot(iters, tau2_trace, label=r"$\tau^2$ (VI mean)")
+    axes[0].axhline(tau2_true, color="gray", linestyle="--", linewidth=1,
+                    label=r"true $\tau^2$")
+    axes[0].set_ylabel(r"$\tau^2$")
+    axes[0].set_title(r"Parameter traces (Matérn VI on CAR samples)")
+    axes[0].legend(fontsize=8)
+
+    # ρ₀ trace
+    axes[1].plot(iters, rho0_trace, label=r"$\rho_0$ (VI mean)")
+    axes[1].axhline(eps_car, color="gray", linestyle="--", linewidth=1,
+                    label=r"CAR $\epsilon$")
+    axes[1].set_ylabel(r"$\rho_0$")
+    axes[1].legend(fontsize=8)
+
+    # ν trace
+    axes[2].plot(iters, nu_trace, label=r"$\nu$ (VI mean)")
+    axes[2].axhline(1.0, color="gray", linestyle="--", linewidth=1,
+                    label=r"CAR-equivalent $\nu \approx 1$")
+    axes[2].set_xlabel("Iteration")
+    axes[2].set_ylabel(r"$\nu$")
+    axes[2].legend(fontsize=8)
+
+    fig_dir = Path("examples") / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    fig_path_params = fig_dir / "matern_recovers_car_params_vi.png"
+    plt.savefig(fig_path_params, dpi=200)
+    plt.close()
+    print(f"Saved parameter trace plot to: {fig_path_params}")
+
+
     # Final variational mean parameters (posterior means)
     with torch.no_grad():
         tau2_hat, a_hat = matern.mean_params()
@@ -195,41 +245,6 @@ def main():
     print(f"  rho0_hat ≈ {rho0_hat.item():.6f} (CAR eps = {eps_car})")
     print(f"  nu_hat   ≈ {nu_hat.item():.4f} (CAR corresponds to ν ≈ 1)")
 
-    # # --------------------------------------------
-    # # 5. Compare filters: CAR vs fitted Matérn (mean q)
-    # # --------------------------------------------
-    # with torch.no_grad():
-    #     F_matern_hat = tau2_hat * (lam + rho0_hat).pow(-nu_hat)
-
-    # mask = lam > 1e-6
-    # lam_plot = lam[mask].cpu()
-    # F_car_plot = F_car[mask].cpu()
-    # F_matern_plot = F_matern_hat[mask].cpu()
-
-    # plt.figure(figsize=(6, 4))
-    # plt.loglog(lam_plot, F_car_plot, label="True CAR: τ² / (λ + ε)")
-    # plt.loglog(lam_plot, F_matern_plot, "--", label="Fitted Matérn-like (VI mean)")
-    # plt.xlabel("Eigenvalue λ")
-    # plt.ylabel("Spectral variance F(λ)")
-    # plt.title("CAR vs Matérn-like spectral filter (VI)")
-    # plt.legend()
-    # plt.tight_layout()
-
-    # fig_dir = Path("examples") / "figures"
-    # fig_dir.mkdir(parents=True, exist_ok=True)
-    # fig_path_filter = fig_dir / "matern_recovers_car_filter_vi.png"
-    # plt.savefig(fig_path_filter, dpi=200)
-    # plt.close()
-    # print(f"Saved filter comparison plot to: {fig_path_filter}")
-
-
-    # --------------------------------------------
-    # 5. Compare filters: CAR vs fitted Matérn (mean q)
-    #    → 3-panel figure:
-    #      (1) smooth curves
-    #      (2) scatter per eigenvalue
-    #      (3) spectral ratio F_matern / F_car
-    # --------------------------------------------
     with torch.no_grad():
         F_matern_hat = tau2_hat * (lam + rho0_hat).pow(-nu_hat)
 
