@@ -143,12 +143,17 @@ def main():
     num_iters = 1000
     num_mc = 5
 
+    elbo_history = []
+
     for it in range(num_iters):
         optimizer.zero_grad()
         elbo = elbo_matern_on_car(matern, lam, z_true, num_mc=num_mc)
         loss = -elbo
         loss.backward()
         optimizer.step()
+
+        # record ELBO
+        elbo_history.append(elbo.item())
 
         if it % 100 == 0:
             with torch.no_grad():
@@ -160,6 +165,25 @@ def main():
                 f"rho0_mean={rho0_mean.item():.5f}, "
                 f"nu_mean={nu_mean.item():.4f}"
             )
+    
+    # --------------------------------------------
+    # 4b. Plot ELBO convergence
+    # --------------------------------------------
+    fig_dir = Path("examples") / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(range(num_iters), elbo_history, label="ELBO")
+    plt.xlabel("Iteration")
+    plt.ylabel("ELBO")
+    plt.title("ELBO convergence (Matérn VI on CAR samples)")
+    plt.legend()
+    plt.tight_layout()
+
+    fig_path_elbo = fig_dir / "matern_recovers_car_elbo_vi.png"
+    plt.savefig(fig_path_elbo, dpi=200)
+    plt.close()
+    print(f"Saved ELBO convergence plot to: {fig_path_elbo}")
 
     # Final variational mean parameters (posterior means)
     with torch.no_grad():
