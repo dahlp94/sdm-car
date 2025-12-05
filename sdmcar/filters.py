@@ -177,7 +177,7 @@ class MaternLikeFilterFullVI(nn.Module):
         """
         rho0, nu = a.unbind(-1)  # both scalars if a.shape == [2]
         return tau2 * (lam + rho0).pow(-nu)
-
+    
     def kl_q_p(self):
         """
         KL( q(log τ²)||N(0,1) ) + KL( q(a_raw)||N(0,1) ).
@@ -185,9 +185,11 @@ class MaternLikeFilterFullVI(nn.Module):
         Returns:
             scalar KL value.
         """
-        kl = kl_normal_std(self.mu_log_tau2, self.log_std_log_tau2)
-        kl += kl_normal_std(self.mu_a_raw,   self.log_std_a_raw)
-        return kl.sum()
+        # Each kl_normal_std returns per-dimension KLs; sum them to scalars.
+        kl_log_tau2 = kl_normal_std(self.mu_log_tau2, self.log_std_log_tau2).sum()
+        kl_a        = kl_normal_std(self.mu_a_raw,    self.log_std_a_raw).sum()
+        return kl_log_tau2 + kl_a
+
 
     @torch.no_grad()
     def mean_params(self):
