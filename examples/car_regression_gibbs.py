@@ -157,6 +157,7 @@ def main():
 
     beta_samples = []
     sigma2_samples = []
+    phi_samples = []
 
     for it in range(num_iters):
         beta = sample_beta(y, X, phi, sigma2, sigma2_beta)
@@ -169,19 +170,26 @@ def main():
         if it >= burn_in:
             beta_samples.append(beta.detach().cpu().numpy())
             sigma2_samples.append(sigma2)
+            phi_samples.append(phi.detach().cpu().numpy())
 
     #beta_samples = torch.tensor(beta_samples)        # [N_samp, p]
     beta_samples = torch.from_numpy(np.stack(beta_samples, axis=0))
     sigma2_samples = torch.tensor(sigma2_samples)    # [N_samp]
+    phi_samples = torch.from_numpy(np.stack(phi_samples, axis=0))  
 
     beta_mean = beta_samples.mean(0)
     sigma2_mean = sigma2_samples.mean()
+
+    # Posterior mean φ and RMSE vs φ_true
+    phi_mean = phi_samples.mean(0)            # [n]
+    rmse_phi = torch.sqrt(torch.mean((phi_mean - phi_true.cpu())**2))
 
     print("\nPosterior means (Gibbs, CAR fixed):")
     print(f"  beta_true    = {beta_true.cpu().numpy()}")
     print(f"  beta_mean    = {beta_mean.numpy()}")
     print(f"  sigma2_true  = {sigma2_true:.4f}")
     print(f"  sigma2_mean  = {sigma2_mean.item():.4f}")
+    print(f"  RMSE(phi_mean, phi_true) = {rmse_phi.item():.4f}")
 
     # --------------------------------------------
     # 6. Simple trace plots
