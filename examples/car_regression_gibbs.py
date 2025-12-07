@@ -216,6 +216,40 @@ def main():
     plt.close()
     print(f"Saved trace plot to: {fig_path_traces}")
 
+    
+    # --------------------------------------------
+    # 7. Compare φ_true vs posterior mean φ
+    # --------------------------------------------
+    phi_true_grid = phi_true.view(nx, ny).cpu()
+    phi_mean_grid = phi_mean.view(nx, ny)
+
+    vmax = torch.max(torch.stack([
+        phi_true_grid.abs().max(),
+        phi_mean_grid.abs().max()
+    ])).item()
+    vmin, vmax = -vmax, vmax
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+
+    im0 = axes[0].imshow(phi_true_grid, origin="lower", vmin=vmin, vmax=vmax)
+    axes[0].set_title("φ_true")
+    axes[0].set_xticks([])
+    axes[0].set_yticks([])
+
+    im1 = axes[1].imshow(phi_mean_grid, origin="lower", vmin=vmin, vmax=vmax)
+    axes[1].set_title("E[φ | y] (Gibbs)")
+    axes[1].set_xticks([])
+    axes[1].set_yticks([])
+
+    cbar = fig.colorbar(im1, ax=axes.ravel().tolist(), shrink=0.8)
+    cbar.set_label("φ")
+
+    fig_path_phi = fig_dir / "car_regression_gibbs_phi_true_vs_mean.png"
+    plt.savefig(fig_path_phi, dpi=200)
+    plt.close()
+    print(f"Saved φ comparison plot to: {fig_path_phi}")
+
+
 
 if __name__ == "__main__":
     main()
