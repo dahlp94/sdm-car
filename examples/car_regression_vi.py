@@ -303,12 +303,20 @@ def main():
     plt.close()
     print(f"Saved beta trace plot to: {fig_path_beta_trace}")
 
-    # Trace plot for sigma^2
+
+    # ---- trace plot for sigma^2 with true value ----
     plt.figure(figsize=(6, 4))
-    plt.plot(range(num_iters), sigma2_trace)
+    plt.plot(it_axis, sigma2_trace, label="sigma2 mean")
+    plt.axhline(
+        y=sigma2_true,
+        linestyle="--",
+        linewidth=1,
+        label="sigma2 true"
+    )
     plt.xlabel("Iteration")
     plt.ylabel("Posterior mean of sigma^2")
     plt.title("Trace of sigma^2 posterior mean (VI)")
+    plt.legend()
     plt.tight_layout()
     fig_path_sigma_trace = fig_dir / "car_regression_vi_sigma2_trace.png"
     plt.savefig(fig_path_sigma_trace, dpi=200)
