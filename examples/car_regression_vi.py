@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 # ---- set seeds here ----
 import random
 import numpy as np
-seed = 1010  # pick any integer you like
+seed = 0  # pick any integer you like
 torch.manual_seed(seed)
 np.random.seed(seed)
 random.seed(seed)
@@ -142,7 +142,7 @@ def main():
         coords,
         k=8,
         gamma=0.2,
-        rho=0.95,
+        rho=0.99,
     )
 
     lam, U = laplacian_eigendecomp(L)
@@ -198,6 +198,11 @@ def main():
     U = U.to(device)
     F_car = F_car.to(device)
 
+    # To store trace of posterior means
+    beta_trace = []
+    sigma2_trace = []
+
+
     for it in range(num_iters):
         optimizer.zero_grad()
         elbo = model.elbo(y, X, U, F_car, a0=a0, b0=b0, sigma2_beta=sigma2_beta)
@@ -206,6 +211,16 @@ def main():
         optimizer.step()
 
         elbo_history.append(elbo.item())
+
+        # --- record trace of beta and sigma2 ---
+        with torch.no_grad():
+            m_beta = model.m_beta.detach().cpu().clone()
+            v_s = torch.exp(model.log_v_s.detach())
+            mu_s = model.mu_s.detach()
+            sigma2_mean = torch.exp(mu_s + 0.5 * v_s).item()
+
+        beta_trace.append(m_beta.numpy())
+        sigma2_trace.append(sigma2_mean)
 
         if it % 200 == 0:
             with torch.no_grad():
@@ -220,6 +235,10 @@ def main():
                 f"beta_mean={m_beta.cpu().numpy()}, "
                 f"sigma2_mean={sigma2_mean:.4f}"
             )
+
+    beta_trace = np.array(beta_trace)        # shape [num_iters, p]
+    sigma2_trace = np.array(sigma2_trace)    # shape [num_iters]
+
 
     # --------------------------------------------
     # 6. Posterior summaries
@@ -260,6 +279,42 @@ def main():
     plt.savefig(fig_path_elbo, dpi=200)
     plt.close()
     print(f"Saved ELBO plot to: {fig_path_elbo}")
+
+
+    # ---- trace plot for beta with true values ----
+    it_axis = np.arange(len(beta_trace))
+
+    plt.figure(figsize=(6, 4))
+    for j in range(p):
+        plt.plot(it_axis, beta_trace[:, j], label=f"beta_{j} mean")
+        plt.axhline(
+            y=beta_true[j].item(),
+            linestyle="--",
+            linewidth=1,
+            label=f"beta_{j} true" if j == 0 else None,  # avoid duplicate legend entries
+        )
+    plt.xlabel("Iteration")
+    plt.ylabel("Posterior mean of beta_j")
+    plt.title("Trace of beta posterior means (VI)")
+    plt.legend()
+    plt.tight_layout()
+    fig_path_beta_trace = fig_dir / "car_regression_vi_beta_trace.png"
+    plt.savefig(fig_path_beta_trace, dpi=200)
+    plt.close()
+    print(f"Saved beta trace plot to: {fig_path_beta_trace}")
+
+    # Trace plot for sigma^2
+    plt.figure(figsize=(6, 4))
+    plt.plot(range(num_iters), sigma2_trace)
+    plt.xlabel("Iteration")
+    plt.ylabel("Posterior mean of sigma^2")
+    plt.title("Trace of sigma^2 posterior mean (VI)")
+    plt.tight_layout()
+    fig_path_sigma_trace = fig_dir / "car_regression_vi_sigma2_trace.png"
+    plt.savefig(fig_path_sigma_trace, dpi=200)
+    plt.close()
+    print(f"Saved sigma^2 trace plot to: {fig_path_sigma_trace}")
+
 
     # φ_true vs φ_mean
     phi_true_grid = phi_true.view(nx, ny).cpu()
