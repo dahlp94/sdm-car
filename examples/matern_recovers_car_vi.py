@@ -11,6 +11,15 @@ from torch.optim import Adam
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
+# ---- set seeds here ----
+import random
+import numpy as np
+seed = 0  # pick any integer you like
+torch.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
+
+
 from sdmcar.graph import build_laplacian_from_knn, laplacian_eigendecomp
 from sdmcar.filters import MaternLikeFilterFullVI
 
@@ -91,7 +100,7 @@ def main():
     # -----------------------------
     # 1. Build a grid + Laplacian
     # -----------------------------
-    nx, ny = 20, 20  # 20x20 grid = 400 nodes
+    nx, ny = 40, 40  # 20x20 grid = 400 nodes
     xs = torch.linspace(0.0, 1.0, nx, dtype=torch.double, device=device)
     ys = torch.linspace(0.0, 1.0, ny, dtype=torch.double, device=device)
     Xg, Yg = torch.meshgrid(xs, ys, indexing="ij")  # [nx, ny] each
@@ -104,7 +113,7 @@ def main():
         coords,
         k=8,
         gamma=0.2,
-        rho=0.95,
+        rho=0.99,
     )
 
     # Eigendecomposition
