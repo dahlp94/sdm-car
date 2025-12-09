@@ -13,6 +13,15 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 
+# ---- set seeds here ----
+import random
+import numpy as np
+seed = 0  # pick any integer you like 123, 129
+torch.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
+
+
 from sdmcar.graph import build_laplacian_from_knn, laplacian_eigendecomp
 from sdmcar.filters import MaternLikeFilterFullVI
 
@@ -240,6 +249,11 @@ def main():
     num_mc_theta = 10   # was 5
     elbo_history = []
 
+    tau2_trace = []
+    rho0_trace = []
+    nu_trace = []
+
+
     # push tensors to device
     y = y.to(device)
     X = X.to(device)
@@ -261,6 +275,16 @@ def main():
         optimizer.step()
 
         elbo_history.append(elbo.item())
+
+        # Record current posterior means of θ each iteration
+        with torch.no_grad():
+            tau2_mean, a_mean = matern.mean_params()
+            rho0_mean, nu_mean = a_mean.unbind(-1)
+
+        tau2_trace.append(tau2_mean.item())
+        rho0_trace.append(rho0_mean.item())
+        nu_trace.append(nu_mean.item())
+
 
         if it % 200 == 0:
             with torch.no_grad():
@@ -330,6 +354,38 @@ def main():
     plt.savefig(fig_path_elbo, dpi=200)
     plt.close()
     print(f"Saved ELBO plot to: {fig_path_elbo}")
+
+    # Parameter traces for θ = (τ², ρ₀, ν)
+    iters = range(num_iters)
+    plt.figure(figsize=(8, 8))
+
+    # τ² trace
+    ax1 = plt.subplot(3, 1, 1)
+    ax1.plot(iters, tau2_trace)
+    ax1.axhline(tau2_true, linestyle="--", label="τ²_true")
+    ax1.set_ylabel("τ²")
+    ax1.legend(loc="best")
+
+    # ρ₀ trace
+    ax2 = plt.subplot(3, 1, 2)
+    ax2.plot(iters, rho0_trace)
+    ax2.axhline(eps_car, linestyle="--", label="ε (CAR)")
+    ax2.set_ylabel("ρ₀")
+    ax2.legend(loc="best")
+
+    # ν trace
+    ax3 = plt.subplot(3, 1, 3)
+    ax3.plot(iters, nu_trace)
+    ax3.axhline(1.0, linestyle="--", label="target ν ≈ 1")
+    ax3.set_xlabel("Iteration")
+    ax3.set_ylabel("ν")
+    ax3.legend(loc="best")
+
+    plt.tight_layout()
+    fig_path_theta = fig_dir / "matern_regression_vi_theta_traces.png"
+    plt.savefig(fig_path_theta, dpi=200)
+    plt.close()
+    print(f"Saved θ trace plot to: {fig_path_theta}")
 
     # Spectral filter comparison: CAR vs learned Matérn
     with torch.no_grad():
