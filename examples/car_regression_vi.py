@@ -131,7 +131,7 @@ def main():
     # 1. Grid + Laplacian + eigen-decomposition
     #    (same setup as in car_regression_gibbs.py)
     # --------------------------------------------
-    nx, ny = 20, 20
+    nx, ny = 40, 40
     xs = torch.linspace(0.0, 1.0, nx, dtype=torch.double, device=device)
     ys = torch.linspace(0.0, 1.0, ny, dtype=torch.double, device=device)
     Xg, Yg = torch.meshgrid(xs, ys, indexing="ij")
