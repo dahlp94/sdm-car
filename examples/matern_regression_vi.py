@@ -152,7 +152,7 @@ def main():
     # --------------------------------------------
     # 1. Grid + Laplacian + eigen-decomposition
     # --------------------------------------------
-    nx, ny = 20, 20
+    nx, ny = 40, 40
     xs = torch.linspace(0.0, 1.0, nx, dtype=torch.double, device=device)
     ys = torch.linspace(0.0, 1.0, ny, dtype=torch.double, device=device)
     Xg, Yg = torch.meshgrid(xs, ys, indexing="ij")
@@ -252,6 +252,7 @@ def main():
     tau2_trace = []
     rho0_trace = []
     nu_trace = []
+    beta_trace = []
 
 
     # push tensors to device
@@ -280,10 +281,12 @@ def main():
         with torch.no_grad():
             tau2_mean, a_mean = matern.mean_params()
             rho0_mean, nu_mean = a_mean.unbind(-1)
+            beta_mean = model.m_beta.detach().cpu().clone()  # [p]
 
         tau2_trace.append(tau2_mean.item())
         rho0_trace.append(rho0_mean.item())
         nu_trace.append(nu_mean.item())
+        beta_trace.append(beta_mean)
 
 
         if it % 200 == 0:
@@ -321,6 +324,9 @@ def main():
         tau2_hat, a_hat = matern.mean_params()
         rho0_hat, nu_hat = a_hat.unbind(-1)
 
+    # Convert beta_trace list -> array for plotting
+    beta_trace = torch.stack(beta_trace, dim=0).numpy()  # [num_iters, p]
+
     print("\nPosterior means (Matérn VI, CAR data):")
     print(f"  beta_true    = {beta_true.cpu().numpy()}")
     print(f"  beta_mean    = {m_beta.cpu().numpy()}")
@@ -354,6 +360,42 @@ def main():
     plt.savefig(fig_path_elbo, dpi=200)
     plt.close()
     print(f"Saved ELBO plot to: {fig_path_elbo}")
+
+    
+    # β trace plot
+    beta_trace_np = beta_trace  # if already numpy
+    # β trace plot
+    iters = range(num_iters)
+    plt.figure(figsize=(6, 4))
+
+    for j in range(p):
+        # Plot mean β_j; let matplotlib choose the color
+        (line,) = plt.plot(
+            iters,
+            beta_trace[:, j],
+            label=rf"$\beta_{j}$ (mean)",
+        )
+
+        # Get the color Matplotlib assigned and reuse it for the true value
+        color = line.get_color()
+
+        plt.axhline(
+            beta_true[j].item(),
+            linestyle="--",
+            color=color,
+            label=rf"$\beta_{j}$ true",
+        )
+
+    plt.xlabel("Iteration")
+    plt.ylabel(r"$\beta$ coefficients")
+    plt.title("Posterior mean β trace (VI)")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    fig_path_beta = fig_dir / "matern_regression_vi_beta_traces.png"
+    plt.savefig(fig_path_beta, dpi=200)
+    plt.close()
+    print(f"Saved β trace plot to: {fig_path_beta}")
+
 
     # Parameter traces for θ = (τ², ρ₀, ν)
     iters = range(num_iters)
