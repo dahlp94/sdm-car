@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 # ---- set seeds here ----
 import random
 import numpy as np
-seed = 1010  # pick any integer you like
+seed = 0  # pick any integer you like
 torch.manual_seed(seed)
 np.random.seed(seed)
 random.seed(seed)
@@ -91,7 +91,7 @@ def main():
     # --------------------------------------------
     # 1. Grid + Laplacian + eigen-decomp
     # --------------------------------------------
-    nx, ny = 20, 20
+    nx, ny = 40, 40
     xs = torch.linspace(0.0, 1.0, nx, dtype=torch.double, device=device)
     ys = torch.linspace(0.0, 1.0, ny, dtype=torch.double, device=device)
     Xg, Yg = torch.meshgrid(xs, ys, indexing="ij")
@@ -102,7 +102,7 @@ def main():
         coords,
         k=8,
         gamma=0.2,
-        rho=0.95,
+        rho=0.99,
     )
 
     lam, U = laplacian_eigendecomp(L)
@@ -147,8 +147,8 @@ def main():
     # --------------------------------------------
     # 5. Gibbs sampler
     # --------------------------------------------
-    num_iters = 5000
-    burn_in = 1000
+    num_iters = 8000
+    burn_in = 2000
 
     # init
     beta = torch.zeros(p, dtype=torch.double, device=device)
