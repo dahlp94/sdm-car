@@ -124,8 +124,16 @@ class MaternLikeFilterFullVI(nn.Module):
                  mu_rho0_raw: float = 0.0,
                  log_std_rho0_raw: float = -2.3,
                  mu_nu_raw: float = 0.0,
-                 log_std_nu_raw: float = -2.3):
+                 log_std_nu_raw: float = -2.3,
+                 fixed_nu: float | None = None,
+                 fixed_rho0: float | None = None,
+    ):
         super().__init__()
+        if fixed_nu is not None and fixed_rho0 is not None:
+            raise ValueError("Choose at most one: fixed_nu or fixed)rho0 (not both)")
+        
+        self.fixed_nu = fixed_nu
+        self.fixed_rho0 = fixed_rho0
 
         # q(log τ²)
         self.mu_log_tau2 = nn.Parameter(
@@ -135,13 +143,50 @@ class MaternLikeFilterFullVI(nn.Module):
             torch.tensor([log_std_log_tau2], dtype=torch.double)
         )
 
-        # q(a_raw) where a_raw = (ρ0_raw, nu_raw)
-        self.mu_a_raw = nn.Parameter(
-            torch.tensor([mu_rho0_raw, mu_nu_raw], dtype=torch.double)
-        )
-        self.log_std_a_raw = nn.Parameter(
-            torch.tensor([log_std_rho0_raw, log_std_nu_raw], dtype=torch.double)
-        )
+        # Decide which components are free in a_raw
+        # a_raw holds only the free unconstrained variables, but sample_params returns a=(rho0,nu) always.
+        self.learn_rho0 = (fixed_rho0 is None)
+        self.learn_nu = (fixed_nu is None)
+
+        a_mu = []
+        a_lstd = []
+        if self.learn_rho0:
+            a_mu.append(mu_rho0_raw)
+            a_lstd.append(log_std_rho0_raw)
+        if self.learn_nu:
+            a_mu.append(mu_nu_raw)
+            a_lstd.append(log_std_nu_raw)
+        
+        if len(a_mu) == 0:
+            self.mu_a_raw = None
+            self.log_std_a_raw = None
+        else:
+            self.mu_a_raw = nn.Parameter(torch.tensor(a_mu, dtype=torch.double))
+            self.log_std_a_raw = nn.Parameter(torch.tensor(a_lstd, dtype=torch.double))
+    
+    def _assemble_a(self, a_raw_free: torch.Tensor) -> torch.Tensor:
+        """
+        Convert free raw vars into full a = (rho0, nu) with constraints applied.
+        """
+        device = self.mu_log_tau2.device
+        dtype = self.mu_log_tau2.dtype
+
+        idx = 0
+        # rho0
+        if self.learn_rho0:
+            rho0 = softplus(a_raw_free[idx])
+            idx += 1
+        else:
+            rho0 = torch.tensor(self.fixed_rho0, dtype=dtype, device=device)
+
+        # nu
+        if self.learn_nu:
+            nu = softplus(a_raw_free[idx])
+            idx += 1
+        else:
+            nu = torch.tensor(self.fixed_nu, dtype=dtype, device=device)
+
+        return torch.stack([rho0, nu])
 
     def sample_params(self):
         """
@@ -149,18 +194,22 @@ class MaternLikeFilterFullVI(nn.Module):
 
         Returns:
             tau2: scalar τ²
-            a:    length-2 vector (ρ₀, ν), each > 0
+            a:    length-2 vector (ρ₀, ν), each > 0 (or fixed)
             log_tau2: scalar log τ² sample
-            a_raw:    length-2 vector (ρ0_raw, nu_raw) sample
+            a_raw:    unconstrained FREE raw vector (len 1 or 2 depending on constraint)
         """
         eps1 = torch.randn_like(self.mu_log_tau2)
-        eps_a = torch.randn_like(self.mu_a_raw)
-
         log_tau2 = self.mu_log_tau2 + torch.exp(self.log_std_log_tau2) * eps1
-        a_raw    = self.mu_a_raw    + torch.exp(self.log_std_a_raw)    * eps_a
-
         tau2 = torch.exp(log_tau2)
-        a    = softplus(a_raw)  # elementwise: (ρ₀, ν) > 0
+        
+        if self.mu_a_raw is None:
+            a_raw = torch.zeros(0, dtype=log_tau2.dtype, device=log_tau2.device)
+            a = self._assemble_a(a_raw)
+            return tau2, a, log_tau2, a_raw
+
+        eps_a = torch.randn_like(self.mu_a_raw)
+        a_raw    = self.mu_a_raw    + torch.exp(self.log_std_a_raw)    * eps_a        
+        a    = self._assemble_a(a_raw)
         return tau2, a, log_tau2, a_raw
 
     def F(self, lam, tau2, a):
@@ -187,7 +236,9 @@ class MaternLikeFilterFullVI(nn.Module):
         """
         # Each kl_normal_std returns per-dimension KLs; sum them to scalars.
         kl_log_tau2 = kl_normal_std(self.mu_log_tau2, self.log_std_log_tau2).sum()
-        kl_a        = kl_normal_std(self.mu_a_raw,    self.log_std_a_raw).sum()
+        if self.mu_a_raw is None:
+            return kl_log_tau2
+        kl_a = kl_normal_std(self.mu_a_raw, self.log_std_a_raw).sum()
         return kl_log_tau2 + kl_a
 
 
@@ -201,5 +252,9 @@ class MaternLikeFilterFullVI(nn.Module):
             a_mean:    length-2 vector E_q[(ρ₀, ν)]
         """
         tau2_mean = torch.exp(self.mu_log_tau2)
-        a_mean    = softplus(self.mu_a_raw)
+        if self.mu_a_raw is None:
+            a_raw = torch.zeros(0, dtype=tau2_mean.dtype, device=tau2_mean.device)
+        else:
+            a_raw = self.mu_a_raw
+        a_mean = self._assemble_a(a_raw)
         return tau2_mean, a_mean
