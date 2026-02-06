@@ -32,32 +32,32 @@ Both **collapsed variational inference** and **collapsed MCMC** are implemented 
 ## 2. Model formulation
 
 Let
-( L = U \operatorname{diag}(\lambda) U^\top )
+$L = U \operatorname{diag}(\lambda) U^\top$
 denote the eigendecomposition of a graph Laplacian constructed from spatial locations.
 
 The spatial random effect is defined as
 
-[
+$$
 \phi = U z, \qquad
-z \sim \mathcal N!\big(0,; \operatorname{diag}(F(\lambda;\theta))\big),
-]
+z \sim \mathcal N!\big(0,\operatorname{diag}(F(\lambda;\theta))\big),
+$$
 
-where ( F(\lambda;\theta) \ge 0 ) is a parametric **spectral filter**.
+where $F(\lambda;\theta) \ge 0$ is a parametric **spectral filter**.
 
 This induces the covariance
 
-[
+$$
 \Sigma_\phi = U \operatorname{diag}(F(\lambda;\theta)) U^\top.
-]
+$$
 
 The observation model is
 
-[
+$$
 y = X\beta + \phi + \varepsilon, \qquad
-\varepsilon \sim \mathcal N(0, \sigma^2 I).
-]
+\varepsilon \sim \mathcal N(0,\sigma^2 I).
+$$
 
-All inference is performed after analytically marginalizing ( \phi ).
+All inference is performed after analytically marginalizing $\phi$.
 
 ---
 
@@ -65,15 +65,15 @@ All inference is performed after analytically marginalizing ( \phi ).
 
 When the spectral filter is chosen as
 
-[
+$$
 F(\lambda) = \frac{\tau^2}{\lambda + \rho_0},
-]
+$$
 
 the resulting covariance satisfies
 
-[
+$$
 \Sigma_\phi^{-1} \propto L + \rho_0 I,
-]
+$$
 
 which corresponds exactly to a **proper CAR model**.
 
@@ -85,11 +85,11 @@ This guarantees that SDM-CAR strictly contains classical CAR as a special case a
 
 All filters are implemented under a unified interface and support **both VI and MCMC**.
 
-| Filter family      | Spectrum (F(\lambda))                | Interpretation       |
-| ------------------ | ------------------------------------ | -------------------- |
-| Inverse-linear CAR | ( \tau^2 / (\lambda + \rho_0) )      | Exact CAR            |
-| Matérn-like        | ( \tau^2 (\lambda + \rho_0)^{-\nu} ) | Learnable smoothness |
-| Diffusion          | ( \tau^2 \exp(-a\lambda) )           | Heat-kernel behavior |
+| Filter family      | Spectrum $F(\lambda)$              | Interpretation       |
+| ------------------ | ---------------------------------- | -------------------- |
+| Inverse-linear CAR | $\tau^2 / (\lambda + \rho_0)$      | Exact CAR            |
+| Matérn-like        | $\tau^2 (\lambda + \rho_0)^{-\nu}$ | Learnable smoothness |
+| Diffusion          | $\tau^2 \exp(-a\lambda)$           | Heat-kernel behavior |
 
 Each filter specifies:
 
@@ -104,8 +104,8 @@ Each filter specifies:
 
 ### 5.1 Collapsed Variational Inference
 
-* Spatial effect ( \phi ) integrated out analytically
-* Exact conditional Gaussian posterior for ( \beta )
+* Spatial effect $\phi$ integrated out analytically
+* Exact conditional Gaussian posterior for $\beta$
 * Monte Carlo integration only over spectral hyperparameters
 * Efficient for large graphs and rapid experimentation
 
@@ -163,7 +163,7 @@ Everything under `sdmcar/` is **experiment-agnostic** and mirrors the mathematic
   This is the only place where spatial geometry enters the model.
 
 * **`filters.py`**
-  Defines spectral covariance families (F(\lambda;\theta)).
+  Defines spectral covariance families $F(\lambda;\theta)$.
   Filters expose a common interface used by *both* VI and MCMC and optionally define parameter blocks for joint MCMC proposals.
 
 * **`models.py`**
