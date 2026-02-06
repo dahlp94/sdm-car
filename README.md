@@ -46,7 +46,7 @@ $$
 z \sim \mathcal{N}\left(0, \mathrm{diag}(F(\lambda;\theta))\right),
 $$
 
-where $ F(\lambda;\theta) \ge 0 $ is a parametric **spectral filter**.
+where $F(\lambda;\theta) \ge 0$ is a parametric **spectral filter**.
 
 This induces the covariance
 
