@@ -34,7 +34,7 @@ Both **collapsed variational inference** and **collapsed MCMC** are implemented 
 Let
 
 $$
-L = U \, \mathrm{diag}(\lambda) \, U^\top
+L = U  \mathrm{diag}(\lambda)  U^\top
 $$
 
 denote the eigendecomposition of a graph Laplacian constructed from spatial locations.
@@ -43,17 +43,15 @@ The spatial random effect is defined as
 
 $$
 \phi = U z, \qquad
-z \sim \mathcal{N}\!\left(0, \mathrm{diag}(F(\lambda;\theta))\right),
+z \sim \mathcal{N}\left(0, \mathrm{diag}(F(\lambda;\theta))\right),
 $$
 
-where \( F(\lambda;\theta) \ge 0 \) is a parametric **spectral filter**.
+where $ F(\lambda;\theta) \ge 0 $ is a parametric **spectral filter**.
 
 This induces the covariance
 
 $$
-\Sigma_\phi
-=
-U \, \mathrm{diag}(F(\lambda;\theta)) \, U^\top.
+\Sigma_\phi = U \mathrm{diag}(F(\lambda;\theta)) U^\top.
 $$
 
 The observation model is
