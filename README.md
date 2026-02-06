@@ -1,204 +1,272 @@
-# **SDM-CAR: Spectral-Density-Modulated Conditional Autoregressive Models**
+# **SDM-CAR: Spectral Density–Modulated Conditional Autoregressive Models**
 
-### **A flexible, spectral, and variationally tractable generalization of CAR models**
+This repository contains the reference implementation for **Spectral Density–Modulated Conditional Autoregressive (SDM-CAR) models**, a flexible class of spatial Gaussian regression models that generalize classical CAR priors through **learned spectral covariance filters**.
 
-This repository contains a modular PyTorch implementation of
-**Spectral-Density-Modulated Conditional Autoregressive (SDM-CAR)** models
-along with a **collapsed variational inference (VI)** framework for fast and scalable posterior learning.
+The framework is designed to support:
+
+* exact recovery of classical CAR models,
+* interpretable spectral hyperparameters,
+* **collapsed variational inference (VI)** for fast approximation,
+* **collapsed Metropolis-within-Gibbs MCMC** for gold-standard validation,
+* and a fully modular experimental pipeline.
+
+All inference—VI or MCMC, any filter family—is executed through a **single, filter-agnostic runner**.
 
 ---
 
-## 🔍 **What is SDM-CAR?**
+## 1. Overview
 
-Classical Conditional Autoregressive (CAR) models define a spatial prior
+Conditional Autoregressive (CAR) models are widely used for spatially indexed data, but rely on fixed neighborhood-based precision structures that limit expressiveness and adaptability.
+
+SDM-CAR replaces fixed CAR precision matrices with **parametric spectral filters of the graph Laplacian**, yielding:
+
+* a strict generalization of CAR models,
+* interpretable parameters controlling variance, range, and smoothness,
+* exact CAR recovery as a special case,
+* scalable inference via spectral diagonalization.
+
+Both **collapsed variational inference** and **collapsed MCMC** are implemented under a shared abstraction, enabling principled comparison between approximate and exact inference.
+
+---
+
+## 2. Model formulation
+
+Let
+( L = U \operatorname{diag}(\lambda) U^\top )
+denote the eigendecomposition of a graph Laplacian constructed from spatial locations.
+
+The spatial random effect is defined as
 
 [
-\phi \sim \mathcal N!\left(0,,\tau^2 Q^{-1}\right),\qquad Q = D - \rho W,
+\phi = U z, \qquad
+z \sim \mathcal N!\big(0,; \operatorname{diag}(F(\lambda;\theta))\big),
 ]
 
-where:
+where ( F(\lambda;\theta) \ge 0 ) is a parametric **spectral filter**.
 
-* (W) is an adjacency matrix (distance-based *or* abstract graph-based),
-* (Q) is the graph Laplacian (up to scaling),
-* (\tau^2) controls marginal variance,
-* (\rho) controls local smoothing.
-
-Such models are fast and popular but **structurally rigid**—they impose a single global smoothness level.
-
----
-
-## 🌟 **Spectral-Density-Modulated CAR (SDM-CAR)**
-
-We generalize the CAR prior by **modulating the spectral density of the Laplacian eigenmodes**:
+This induces the covariance
 
 [
-\Sigma_F = V ,\operatorname{diag}!\big(F(\lambda_i)\big), V^\top,
-\qquad \lambda_i = \text{Laplacian eigenvalues},
+\Sigma_\phi = U \operatorname{diag}(F(\lambda;\theta)) U^\top.
 ]
 
-where:
+The observation model is
 
-* (V) are the Laplacian eigenvectors (graph Fourier basis),
-* (F(\lambda)) is a **learnable spectral density** prescribing how much power each mode receives,
-* classical CAR corresponds to (F(\lambda) = \tau^2 / \lambda).
+[
+y = X\beta + \phi + \varepsilon, \qquad
+\varepsilon \sim \mathcal N(0, \sigma^2 I).
+]
 
-### SDM-CAR = **keep CAR geometry**, flexibly reshape its **frequency-domain covariance**
-
-This includes, as special cases:
-
-* diffusion kernels
-* Matérn-like kernels
-* rational filters
-* nonparametric binned filters
-* learned parametric spectral shapes
+All inference is performed after analytically marginalizing ( \phi ).
 
 ---
 
-## 📦 **Key Features**
+## 3. CAR as a special case
 
-### ✔ **Collapsed variational inference**
+When the spectral filter is chosen as
 
-We analytically integrate out the field (\phi), yielding a fast ELBO:
+[
+F(\lambda) = \frac{\tau^2}{\lambda + \rho_0},
+]
 
-* analytic Gaussian updates for regression coefficients (β),
-* low-variance Monte-Carlo updates for spectral hyperparameters,
-* full VI over (\log\tau^2), (a) (diffusion rate), and (\log\sigma^2),
-* reparameterization gradients for smooth, stable optimization.
+the resulting covariance satisfies
 
-### ✔ **Supports both geographic and non-geographic graphs**
+[
+\Sigma_\phi^{-1} \propto L + \rho_0 I,
+]
 
-You can build (W) using:
+which corresponds exactly to a **proper CAR model**.
 
-* **coordinates** (kNN, RBF kernels),
-* **abstract adjacency** (social networks, pixel grids, power grids),
-* **any symmetric weighted graph**.
-
-### ✔ **Modular package design**
-
-* `sdmcar.models` — SDM-CAR model class
-* `sdmcar.filters` — parametric and nonparametric spectral filters
-* `sdmcar.graph` — Laplacian builders, eigen decompositions
-* `sdmcar.utils` — helpers
-* `sdmcar.diagnostics` — plotting and recovery utilities
-* `examples/` — runnable scripts with synthetic data
+This guarantees that SDM-CAR strictly contains classical CAR as a special case and allows direct empirical validation against established spatial models.
 
 ---
 
-## 🧪 **Example: Full VI for Diffusion SDM-CAR**
+## 4. Implemented spectral filter families
 
-Run the synthetic experiment:
+All filters are implemented under a unified interface and support **both VI and MCMC**.
 
-```bash
-python -m examples.synthetic_diffusion_full_vi
-```
+| Filter family      | Spectrum (F(\lambda))                | Interpretation       |
+| ------------------ | ------------------------------------ | -------------------- |
+| Inverse-linear CAR | ( \tau^2 / (\lambda + \rho_0) )      | Exact CAR            |
+| Matérn-like        | ( \tau^2 (\lambda + \rho_0)^{-\nu} ) | Learnable smoothness |
+| Diffusion          | ( \tau^2 \exp(-a\lambda) )           | Heat-kernel behavior |
 
-This:
+Each filter specifies:
 
-* builds a graph from a 2D grid,
-* simulates a spatial field from a diffusion kernel,
-* runs collapsed VI,
-* saves diagnostic plots to:
-
-```
-examples/figures/
-    elbo.png
-    filter_recovery.png
-    beta_intervals.png
-    residual_spectrum.png
-    phi_post.png
-    phi_true.png
-```
+* unconstrained parameterization,
+* positivity-preserving transforms,
+* KL divergence to priors (for VI),
+* block structure for MCMC proposals.
 
 ---
 
-## 📁 **Repository Structure**
+## 5. Inference methods
 
-```
+### 5.1 Collapsed Variational Inference
+
+* Spatial effect ( \phi ) integrated out analytically
+* Exact conditional Gaussian posterior for ( \beta )
+* Monte Carlo integration only over spectral hyperparameters
+* Efficient for large graphs and rapid experimentation
+
+### 5.2 Collapsed Metropolis-within-Gibbs MCMC
+
+* Spatial effect analytically marginalized
+* Gibbs updates for regression coefficients
+* Random-walk MH updates for spectral hyperparameters
+* Blockwise proposals aligned with filter structure
+* Used as a gold standard for validation
+
+Both inference methods operate on the **same model and filter abstractions**.
+
+---
+
+## 6. Repository structure
+
+The repository is organized to cleanly separate **modeling and inference logic** from **experimental configuration and execution**.
+
+```text
 sdm-car/
 │
-├── sdmcar/
-│   ├── __init__.py
-│   ├── graph.py          # Laplacian + adjacency builders
-│   ├── filters.py        # spectral filter modules
-│   ├── models.py         # SDM-CAR VI implementation
-│   ├── utils.py          # helper functions
-│   ├── diagnostics.py    # plotting utilities
+├── sdmcar/                     # Core research library (model + inference)
+│   ├── graph.py                # Graph construction and Laplacian eigendecomposition
+│   ├── filters.py              # Spectral filter families (VI + MCMC compatible)
+│   ├── models.py               # Collapsed variational inference engine
+│   ├── mcmc.py                 # Collapsed Metropolis-within-Gibbs sampler
+│   ├── diagnostics.py          # Posterior diagnostics and visualization
+│   └── utils.py                # Shared utilities (transforms, KLs, helpers)
 │
 ├── examples/
-│   ├── synthetic_diffusion_full_vi.py
-│   └── figures/
+│   ├── run_benchmark.py        # Single universal experiment runner
+│   └── benchmarks/
+│       ├── base.py             # CaseSpec / FilterSpec abstractions
+│       ├── registry.py         # Global filter registry
+│       ├── matern.py           # Matérn-like SDM-CAR filter family
+│       ├── invlinear_car.py    # Exact CAR baseline (inverse-linear spectrum)
+│       └── __init__.py         # Auto-registration of benchmark modules
 │
-├── README.md
-└── pyproject.toml        # (optional) for packaging
+├── examples/figures/benchmarks # Auto-generated figures and summaries
+│
+└── README.md
 ```
 
 ---
 
-## 🚀 Installation
+## 7. Design philosophy
 
-Install locally in development mode:
+### 7.1 `sdmcar/`: model- and inference-level code only
+
+Everything under `sdmcar/` is **experiment-agnostic** and mirrors the mathematical structure of the model.
+
+* **`graph.py`**
+  Constructs spatial graphs, Laplacians, and eigendecompositions.
+  This is the only place where spatial geometry enters the model.
+
+* **`filters.py`**
+  Defines spectral covariance families (F(\lambda;\theta)).
+  Filters expose a common interface used by *both* VI and MCMC and optionally define parameter blocks for joint MCMC proposals.
+
+* **`models.py`**
+  Implements collapsed variational inference with exact marginalization of spatial effects and analytic posteriors for regression coefficients.
+
+* **`mcmc.py`**
+  Implements collapsed Metropolis-within-Gibbs MCMC.
+  The sampler is constructed directly from a fitted VI model, ensuring consistency between inference methods.
+
+* **`diagnostics.py`**
+  Posterior diagnostics and visualization utilities.
+
+Nothing in `sdmcar/` is aware of specific experiments or ablations.
+
+---
+
+### 7.2 `examples/benchmarks/`: declarative experiment definitions
+
+All experiments are defined **declaratively**, without inference logic.
+
+* **`base.py`**
+
+  * `FilterSpec`: defines a filter family
+  * `CaseSpec`: defines a specific experimental configuration (baseline, fixed parameters, ablations)
+
+* **`registry.py`**
+  Maintains a global registry mapping filter names to `FilterSpec`s, enabling dynamic discovery from the command line.
+
+* **`matern.py`, `invlinear_car.py`, …**
+  Each file defines a filter family, its valid cases, and registers itself automatically on import.
+
+Adding a new experiment never requires modifying the runner.
+
+---
+
+### 7.3 `examples/run_benchmark.py`: single execution entry point
+
+All experiments are run via:
 
 ```bash
-pip install -e .
+python -m examples.run_benchmark --filter <name> --cases <ids>
 ```
 
-or simply make sure the folder is on your `PYTHONPATH`.
+The runner:
+
+1. builds a spatial graph and Laplacian,
+2. generates synthetic data under a CAR ground truth,
+3. runs collapsed variational inference,
+4. initializes and runs collapsed MCMC from the VI solution,
+5. produces diagnostics, plots, and summaries.
+
+The runner is **filter-agnostic** and **case-agnostic**.
 
 ---
 
-## 🧠 Research Motivation
+## 8. Outputs and reproducibility
 
-SDM-CAR fits into a broader movement toward **modern spatial statistics**:
+All figures and summaries are written to:
 
-* spectral representations of Gaussian random fields
-* scalable variational inference
-* learned covariance structures
-* graph-based models beyond Euclidean domains
+```text
+examples/figures/benchmarks/<filter>/<case>/
+```
 
-It provides:
+This ensures:
 
-* interpretable spectral smoothing,
-* frequency-adaptive uncertainty,
-* a unified view of CAR / SAR / GP priors,
-* compatibility with learned graphs (e.g., kNN, similarity networks).
-
----
-
-## 📈 Current Example: Diffusion Filter
-
-We use:
-
-[
-F(\lambda) = \tau^2 \exp(-a\lambda)
-]
-
-where (a) is strictly positive (via softplus reparam).
-
-Extensions (coming soon):
-
-* Matérn-like spectra
-* Rational filters
-* Bernstein-basis nonparametric filters
-* Learned graph eigenbasis (U-learning / EM)
-* α-divergence variational inference
+* no manual bookkeeping,
+* deterministic results given a seed,
+* clean separation between code and results,
+* direct VI–MCMC comparison for validation.
 
 ---
 
-## 📚 References
+## 9. Extensibility
 
-* Besag (1974). *Spatial Interaction and the Statistical Analysis of Lattice Systems.*
-* Sandryhaila & Moura (2013). *Discrete Signal Processing on Graphs.*
-* Huang et al. (2020). *Graph Signal Processing: Overview.*
-* Rue & Held (2005). *Gaussian Markov Random Fields.*
+New spectral filters can be added by:
 
----
+1. Implementing a filter class in `sdmcar/filters.py`,
+2. Defining experimental cases in `examples/benchmarks/<name>.py`,
+3. Registering the filter via `FilterSpec`.
 
-## 🤝 Contributing
-
-Pull requests, issues, and discussions are welcome once the repo goes public.
+No changes to inference code or the runner are required.
 
 ---
 
-## 📝 License
+## 10. Intended use
 
-MIT License.
+This repository is intended for:
+
+* methodological research in spatial statistics and GMRFs,
+* development of structured covariance models on graphs,
+* reproducible comparison of CAR and CAR-generalized models.
+
+It is **not** optimized as a production library.
+
+---
+
+## 11. Citation
+
+```bibtex
+@misc{sdmcar2026,
+  title  = {Spectral-Density-Modulated Conditional Autoregressive Models},
+  author = {Pratik Dahal},
+  year   = {2026},
+  note   = {Contact: pd006@uark.edu, mapratikdahal@gmail.com}
+}
+```
