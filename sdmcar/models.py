@@ -259,8 +259,9 @@ class SpectralCAR_FullVI(nn.Module):
         # This term is NOT inside E_{q(θ)q(s)}[...] in the usual ELBO decomposition.
         kl_sigma2 = self._kl_sigma2()
 
-        mc_loglik = 0.0
-        mc_kl_beta = 0.0
+        mc_loglik = torch.zeros((), dtype=self.y.dtype, device=self.y.device)
+        mc_kl_beta = torch.zeros((), dtype=self.y.dtype, device=self.y.device)
+
         last_m_beta, last_V_beta = None, None
         last_sigma2 = None
 
@@ -271,12 +272,12 @@ class SpectralCAR_FullVI(nn.Module):
             sigma2 = torch.exp(s).clamp_min(1e-12)  # scalar tensor
             last_sigma2 = sigma2
 
-            # ---- Sample filter hyperparameters θ from q(filter) ----
-            tau2, a, _, _ = self.filter.sample_params()
+            # ---- Sample filter hyperparameters θ (unconstrained) from q(filter) ----
+            theta = self.filter.sample_unconstrained()  # dict[name -> tensor]
 
             # ---- Build spectral variance diag(F(λ;θ) + σ²) ----
-            F_lam = self.filter.F(self.lam, tau2, a)  # [n]
-            var = F_lam + sigma2                      # [n]
+            F_lam = self.filter.spectrum(self.lam, theta)  # [n] # can clamp to 0.0
+            var = (F_lam + sigma2).clamp_min(1e-12)    # [n]
             inv_var = 1.0 / var                       # [n]
 
             # ---- Exact posterior of β given (θ, s) ----
@@ -372,9 +373,9 @@ class SpectralCAR_FullVI(nn.Module):
         # (A) Plug-in hyperparameters
         # --------------------------------------------------
         if mode == "plugin":
-            tau2_mean, a_mean = self.filter.mean_params()
+            theta_mean = self.filter.mean_unconstrained()
             sigma2 = torch.exp(self.mu_log_sigma2).clamp_min(1e-12)
-            F_lam = self.filter.F(self.lam, tau2_mean, a_mean)
+            F_lam = self.filter.spectrum(self.lam, theta_mean) # can clamp to 0.0
 
             denom = (F_lam + sigma2).clamp_min(1e-12)
             w = F_lam / denom
@@ -396,9 +397,10 @@ class SpectralCAR_FullVI(nn.Module):
             if num_mc <= 0:
                 raise ValueError("num_mc must be positive for mode='mc'.")
 
-            mean_acc = 0.0
-            var_within_acc = 0.0
-            mean2_acc = 0.0
+            n = self.y.shape[0]
+            mean_acc = torch.zeros(n, dtype=self.y.dtype, device=self.y.device)
+            var_within_acc = torch.zeros(n, dtype=self.y.dtype, device=self.y.device)
+            mean2_acc = torch.zeros(n, dtype=self.y.dtype, device=self.y.device)
 
             for _ in range(int(num_mc)):
                 # sample s = log σ²
@@ -407,8 +409,8 @@ class SpectralCAR_FullVI(nn.Module):
                 sigma2 = torch.exp(s).clamp_min(1e-12)
 
                 # sample θ
-                tau2, a, _, _ = self.filter.sample_params()
-                F_lam = self.filter.F(self.lam, tau2, a)
+                theta = self.filter.sample_unconstrained()
+                F_lam = self.filter.spectrum(self.lam, theta) # can clamp to 0.0
 
                 denom = (F_lam + sigma2).clamp_min(1e-12)
                 w = F_lam / denom
