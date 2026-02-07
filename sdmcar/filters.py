@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
-from typing import Sequence, Union, Tuple
+from typing import Sequence, Union, Dict, List, Tuple, Optional
 from .utils import softplus, kl_normal_std
 
 
@@ -16,6 +16,18 @@ class ParamBlock:
     @staticmethod
     def single(param: str) -> "ParamBlock":
         return ParamBlock(name=param, param_names=(param,))
+
+def _poly_eval(x: torch.Tensor, coeffs: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Evaluate poly sum_k coeffs[k] * x^k for x shape [n], coeffs scalars.
+    Stable enough for x in [0,1].
+    """
+    out = torch.zeros_like(x)
+    x_pow = torch.ones_like(x)
+    for c in coeffs:
+        out = out + c * x_pow
+        x_pow = x_pow * x
+    return out
 
 
 class BaseSpectralFilter(nn.Module):
@@ -692,3 +704,181 @@ class InverseLinearCARFilterFullVI(BaseSpectralFilter):
         return self.F(lam, c["tau2"], c["rho0"])
 
 
+class _BasePosCoeffPolyRationalVI(nn.Module):
+    """
+    Shared machinery: diagonal Gaussian variational params over:
+      - log_tau2
+      - a_raw_k (numerator or polynomial coeffs)
+      - b_raw_m (denominator coeffs, only for rational)
+    Priors: standard normal on all unconstrained coords.
+    """
+    def __init__(self, names: List[str], mu0: Optional[Dict[str, float]] = None, log_std0: float = -2.3):
+        super().__init__()
+        self._names = list(names)
+        mu0 = {} if mu0 is None else dict(mu0)
+
+        # variational params (diag Gaussian)
+        for nm in self._names:
+            self.register_parameter(f"mu_{nm}", nn.Parameter(torch.tensor([mu0.get(nm, 0.0)], dtype=torch.double)))
+            self.register_parameter(f"logstd_{nm}", nn.Parameter(torch.tensor([log_std0], dtype=torch.double)))
+
+    # -------- required API --------
+    def unconstrained_names(self) -> List[str]:
+        return list(self._names)
+
+    def pack(self, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return torch.cat([theta[nm].reshape(-1) for nm in self._names], dim=0)
+
+    def unpack(self, vec: torch.Tensor) -> Dict[str, torch.Tensor]:
+        vec = vec.reshape(-1)
+        out = {}
+        idx = 0
+        for nm in self._names:
+            out[nm] = vec[idx:idx+1].clone()
+            idx += 1
+        return out
+
+    def mean_unconstrained(self) -> Dict[str, torch.Tensor]:
+        return {nm: getattr(self, f"mu_{nm}").detach().clone() for nm in self._names}
+
+    def sample_unconstrained(self) -> Dict[str, torch.Tensor]:
+        out = {}
+        for nm in self._names:
+            mu = getattr(self, f"mu_{nm}")
+            std = torch.exp(getattr(self, f"logstd_{nm}"))
+            eps = torch.randn_like(mu)
+            out[nm] = mu + std * eps
+        return out
+
+    def log_prior(self, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        # standard normal on unconstrained
+        lp = torch.zeros((), dtype=torch.double, device=next(self.parameters()).device)
+        for nm in self._names:
+            x = theta[nm].reshape(())
+            lp = lp + (-0.5 * x * x)  # + const dropped
+        return lp
+
+    def kl_q_p(self) -> torch.Tensor:
+        # sum KL for each coordinate vs N(0,1)
+        kl = torch.zeros((), dtype=torch.double, device=next(self.parameters()).device)
+        for nm in self._names:
+            mu = getattr(self, f"mu_{nm}")
+            logstd = getattr(self, f"logstd_{nm}")
+            kl = kl + kl_normal_std(mu, logstd)
+        return kl
+
+    # subclasses must implement:
+    #   blocks()
+    #   _constrain()
+    #   spectrum(lam, theta)
+
+
+class PolyPosCoeffFilterFullVI(_BasePosCoeffPolyRationalVI):
+    """
+    Polynomial spectral filter with nonnegative coefficients:
+
+      F(λ) = τ² * sum_{k=0..K} a_k x^k,  x = λ / max(λ)
+
+    Unconstrained:
+      log_tau2, a0_raw..aK_raw
+
+    Constrained:
+      tau2 = exp(log_tau2)
+      a_k = softplus(a_k_raw) >= 0
+    """
+    def __init__(self, degree: int = 3, mu_log_tau2: float = 0.0, log_std0: float = -2.3):
+        self.degree = int(degree)
+        names = ["log_tau2"] + [f"a{k}_raw" for k in range(self.degree + 1)]
+        mu0 = {"log_tau2": float(mu_log_tau2)}
+        super().__init__(names=names, mu0=mu0, log_std0=log_std0)
+
+    def blocks(self) -> List[ParamBlock]:
+        # block tau2 separately; propose all a's jointly (good mixing)
+        return [
+            ParamBlock.single("log_tau2"),
+            ParamBlock(name="a_raw", param_names=tuple([f"a{k}_raw" for k in range(self.degree + 1)])),
+        ]
+
+    def _constrain(self, theta: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        tau2 = torch.exp(theta["log_tau2"])
+        a = torch.stack([softplus(theta[f"a{k}_raw"]) for k in range(self.degree + 1)]).reshape(-1)  # [K+1]
+        return {"tau2": tau2.reshape(()), "a": a}
+
+    def spectrum(self, lam: torch.Tensor, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        c = self._constrain(theta)
+        tau2 = c["tau2"]
+        a = c["a"]  # [K+1]
+        lam_max = lam.max().clamp_min(1e-12)
+        x = (lam / lam_max).clamp(0.0, 1.0)
+        coeffs = [a[k].reshape(()) for k in range(a.numel())]
+        P = _poly_eval(x, coeffs).clamp_min(0.0)
+        return (tau2 * P).reshape(-1)
+
+
+class RationalPosCoeffFilterFullVI(_BasePosCoeffPolyRationalVI):
+    """
+    Rational spectral filter:
+
+      F(λ) = τ² * P(x) / (Q(x) + eps),
+      P(x) = sum_{k=0..K} a_k x^k,  a_k>=0
+      Q(x) = sum_{m=0..M} b_m x^m,  b_m>=0
+      x = λ/max(λ)
+
+    Unconstrained:
+      log_tau2, a*_raw, b*_raw
+
+    You can optionally propose (a_raw, b_raw) jointly via joint_ab = True.
+    """
+    def __init__(
+        self,
+        deg_num: int = 0,
+        deg_den: int = 1,
+        mu_log_tau2: float = 0.0,
+        log_std0: float = -2.3,
+        eps_den: float = 1e-12,
+        joint_ab: bool = True,
+    ):
+        self.deg_num = int(deg_num)
+        self.deg_den = int(deg_den)
+        self.eps_den = float(eps_den)
+        self.joint_ab = bool(joint_ab)
+
+        names = (
+            ["log_tau2"]
+            + [f"a{k}_raw" for k in range(self.deg_num + 1)]
+            + [f"b{m}_raw" for m in range(self.deg_den + 1)]
+        )
+        mu0 = {"log_tau2": float(mu_log_tau2)}
+        super().__init__(names=names, mu0=mu0, log_std0=log_std0)
+
+    def blocks(self) -> List[ParamBlock]:
+        blocks = [ParamBlock.single("log_tau2")]
+
+        a_names = tuple([f"a{k}_raw" for k in range(self.deg_num + 1)])
+        b_names = tuple([f"b{m}_raw" for m in range(self.deg_den + 1)])
+
+        if self.joint_ab:
+            # JOINT proposal over numerator+denominator (often best)
+            blocks.append(ParamBlock(name="ab_raw", param_names=a_names + b_names))
+        else:
+            blocks.append(ParamBlock(name="a_raw", param_names=a_names))
+            blocks.append(ParamBlock(name="b_raw", param_names=b_names))
+        return blocks
+
+    def _constrain(self, theta: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        tau2 = torch.exp(theta["log_tau2"]).reshape(())
+        a = torch.stack([softplus(theta[f"a{k}_raw"]) for k in range(self.deg_num + 1)]).reshape(-1)
+        b = torch.stack([softplus(theta[f"b{m}_raw"]) for m in range(self.deg_den + 1)]).reshape(-1)
+        return {"tau2": tau2, "a": a, "b": b}
+
+    def spectrum(self, lam: torch.Tensor, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        c = self._constrain(theta)
+        tau2, a, b = c["tau2"], c["a"], c["b"]
+
+        lam_max = lam.max().clamp_min(1e-12)
+        x = (lam / lam_max).clamp(0.0, 1.0)
+
+        P = _poly_eval(x, [a[k].reshape(()) for k in range(a.numel())]).clamp_min(0.0)
+        Q = _poly_eval(x, [b[m].reshape(()) for m in range(b.numel())]).clamp_min(0.0)
+
+        return (tau2 * P / (Q + self.eps_den)).reshape(-1)
