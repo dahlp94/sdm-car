@@ -68,6 +68,44 @@ def plot_hist_with_lines(
     plt.savefig(save_path, dpi=200)
     plt.close()
 
+def plot_spectrum_curves(
+    lam: torch.Tensor,
+    curves: dict[str, np.ndarray],
+    title: str,
+    save_path: Path,
+    loglog: bool = False,
+):
+    """
+    Plot spectral variance curves F(lambda).
+
+    lam: torch.Tensor [n]
+    curves: dict[label -> np.ndarray [n]] already aligned with lam
+    """
+    lam_np = lam.detach().cpu().numpy().astype(float)
+    order = np.argsort(lam_np)
+    x = lam_np[order]
+
+    plt.figure(figsize=(6.5, 4.0))
+
+    for label, y in curves.items():
+        y = np.asarray(y, dtype=float)[order]
+
+        if loglog:
+            # avoid log problems; keep shape but clamp for plotting only
+            x_plot = np.clip(x, 1e-12, None)
+            y_plot = np.clip(y, 1e-12, None)
+            plt.loglog(x_plot, y_plot, linewidth=2, label=label)
+        else:
+            plt.plot(x, y, linewidth=2, label=label)
+
+    plt.xlabel(r"eigenvalue $\lambda$")
+    plt.ylabel(r"$F(\lambda)$")
+    plt.title(title)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=220)
+    plt.close()
+
 
 def resolve_fixed_tokens(fixed: dict, eps_car: float) -> dict:
     """
@@ -82,31 +120,120 @@ def resolve_fixed_tokens(fixed: dict, eps_car: float) -> dict:
     return out
 
 
+# def unpack_filter_params_from_means(filter_module):
+#     """
+#     Returns dict with tau2 and (optionally) rho0, nu if mean_params provides them.
+#     This stays generic-ish and won't crash if shapes vary.
+#     """
+#     tau2_m, a_m = filter_module.mean_params()
+#     a_flat = a_m.reshape(-1)
+
+#     rho0_m = None
+#     nu_m = None
+#     if a_flat.numel() == 2:
+#         rho0_m = a_flat[0]
+#         nu_m = a_flat[1]
+#     elif a_flat.numel() == 1:
+#         rho0_m = a_flat[0]
+
+#     return {
+#         "tau2": tau2_m.reshape(()),
+#         "rho0": None if rho0_m is None else rho0_m.reshape(()),
+#         "nu": None if nu_m is None else nu_m.reshape(()),
+#     }
+
 def unpack_filter_params_from_means(filter_module):
     """
-    Returns dict with tau2 and (optionally) rho0, nu if mean_params provides them.
-    This stays generic-ish and won't crash if shapes vary.
+    Generic: uses mean_unconstrained() + _constrain() if available.
+    Falls back to legacy mean_params() if needed.
+    Returns scalars where possible.
     """
-    tau2_m, a_m = filter_module.mean_params()
-    a_flat = a_m.reshape(-1)
+    # New-style API
+    if hasattr(filter_module, "mean_unconstrained") and hasattr(filter_module, "_constrain"):
+        theta_mean = filter_module.mean_unconstrained()
+        c = filter_module._constrain(theta_mean)
 
-    rho0_m = None
-    nu_m = None
-    if a_flat.numel() == 2:
-        rho0_m = a_flat[0]
-        nu_m = a_flat[1]
-    elif a_flat.numel() == 1:
-        rho0_m = a_flat[0]
+        out = {
+            "tau2": c.get("tau2", None),
+            "rho0": c.get("rho0", None),
+            "nu":   c.get("nu", None),
+        }
 
-    return {
-        "tau2": tau2_m.reshape(()),
-        "rho0": None if rho0_m is None else rho0_m.reshape(()),
-        "nu": None if nu_m is None else nu_m.reshape(()),
-    }
+        # Optional extras you may want later
+        # poly/rational:
+        if "a" in c:
+            out["a"] = c["a"]
+        if "b" in c:
+            out["b"] = c["b"]
 
+        # reshape scalars
+        for k in ("tau2", "rho0", "nu"):
+            if out.get(k, None) is not None:
+                out[k] = out[k].reshape(())
+
+        return out
+
+    # Legacy API fallback
+    if hasattr(filter_module, "mean_params"):
+        tau2_m, a_m = filter_module.mean_params()
+        a_flat = a_m.reshape(-1)
+
+        rho0_m = None
+        nu_m = None
+        if a_flat.numel() == 2:
+            rho0_m = a_flat[0]
+            nu_m = a_flat[1]
+        elif a_flat.numel() == 1:
+            rho0_m = a_flat[0]
+
+        return {
+            "tau2": tau2_m.reshape(()),
+            "rho0": None if rho0_m is None else rho0_m.reshape(()),
+            "nu": None if nu_m is None else nu_m.reshape(()),
+        }
+
+    raise AttributeError(
+        f"{type(filter_module).__name__} must implement either "
+        f"(mean_unconstrained + _constrain) or mean_params()."
+    )
+
+
+
+# def decode_theta_chain(out, filter_module):
+#     theta_mat = out["theta"].numpy()
+#     names = out["theta_names"]
+
+#     raw = {names[j]: theta_mat[:, j].copy() for j in range(len(names))}
+
+#     # device/dtype from filter
+#     try:
+#         p0 = next(filter_module.parameters())
+#         device, dtype = p0.device, p0.dtype
+#     except StopIteration:
+#         device, dtype = torch.device("cpu"), torch.double
+
+#     constrained = {}
+#     S = theta_mat.shape[0]
+#     for i in range(S):
+#         theta_dict = {
+#             names[j]: torch.tensor([theta_mat[i, j]], dtype=dtype, device=device)
+#             for j in range(len(names))
+#         }
+#         c = filter_module._constrain(theta_dict)
+#         for k, v in c.items():
+#             if k not in constrained:
+#                 constrained[k] = np.zeros(S, dtype=float)
+#             constrained[k][i] = float(v.reshape(()).detach().cpu().numpy())
+
+#     return raw, constrained
 
 def decode_theta_chain(out, filter_module):
-    theta_mat = out["theta"].numpy()
+    """
+    Returns:
+      raw: dict[name -> np.ndarray shape [S]]
+      constrained: dict[key -> np.ndarray shape [S] or [S,d]]
+    """
+    theta_mat = out["theta"].numpy()   # [S, d_theta]
     names = out["theta_names"]
 
     raw = {names[j]: theta_mat[:, j].copy() for j in range(len(names))}
@@ -120,16 +247,30 @@ def decode_theta_chain(out, filter_module):
 
     constrained = {}
     S = theta_mat.shape[0]
+
     for i in range(S):
         theta_dict = {
             names[j]: torch.tensor([theta_mat[i, j]], dtype=dtype, device=device)
             for j in range(len(names))
         }
         c = filter_module._constrain(theta_dict)
+
         for k, v in c.items():
-            if k not in constrained:
-                constrained[k] = np.zeros(S, dtype=float)
-            constrained[k][i] = float(v.reshape(()).detach().cpu().numpy())
+            v_np = v.detach().cpu().numpy()
+            v_np = np.asarray(v_np)
+
+            # scalar
+            if v_np.size == 1:
+                if k not in constrained:
+                    constrained[k] = np.zeros(S, dtype=float)
+                constrained[k][i] = float(v_np.reshape(-1)[0])
+
+            # vector / matrix -> store as [S, ...]
+            else:
+                v_shape = v_np.shape
+                if k not in constrained:
+                    constrained[k] = np.zeros((S,) + v_shape, dtype=float)
+                constrained[k][i, ...] = v_np
 
     return raw, constrained
 
@@ -316,6 +457,8 @@ def run_case(
     tau2_chain = theta_constr.get("tau2", None)  # np.ndarray [S] or None
     rho0_chain = theta_constr.get("rho0", None)
     nu_chain   = theta_constr.get("nu", None)
+    a_chain = theta_constr.get("a", None)        # [S, degree+1]
+
 
 
     phi_mean_chain = out["phi_mean"].numpy()  # [S,n]
@@ -327,6 +470,49 @@ def run_case(
     named = {}
     if case_spec.transform_chain is not None:
         named = case_spec.transform_chain(out, fixed_resolved=fixed, eps_car=eps_car)
+    
+
+    # -------------------------
+    # Spectrum curve plots: F(lambda)
+    # truth vs VI mean vs MCMC mean
+    # -------------------------
+    with torch.no_grad():
+        # truth in your benchmark is always CAR: F_true = tau2_true / (lam + eps_car)
+        F_true = (tau2_true / (lam + eps_car)).detach().cpu().numpy()
+
+        # VI mean curve using mean unconstrained theta
+        theta_vi_mean = model.filter.mean_unconstrained()
+        F_vi = model.filter.spectrum(lam, theta_vi_mean).detach().cpu().numpy()
+
+        # MCMC mean curve: take mean of packed theta vectors, unpack -> theta dict
+        theta_vec_mean = out["theta"].mean(dim=0).to(device=device, dtype=torch.double).reshape(-1)
+        theta_mcmc_mean = model.filter.unpack(theta_vec_mean)
+        F_mcmc = model.filter.spectrum(lam, theta_mcmc_mean).detach().cpu().numpy()
+
+    plot_spectrum_curves(
+        lam=lam,
+        curves={
+            "Truth (CAR)": F_true,
+            "VI mean": F_vi,
+            "MCMC mean": F_mcmc,
+        },
+        title=f"Spectral variance F(λ) — {filter_name}/{case_spec.display_name}",
+        save_path=case_dir / "spectrum_F_linear.png",
+        loglog=False,
+    )
+
+    plot_spectrum_curves(
+        lam=lam,
+        curves={
+            "Truth (CAR)": F_true,
+            "VI mean": F_vi,
+            "MCMC mean": F_mcmc,
+        },
+        title=f"Spectral variance F(λ) (log-log) — {filter_name}/{case_spec.display_name}",
+        save_path=case_dir / "spectrum_F_loglog.png",
+        loglog=True,
+    )
+
 
     # -------------------------
     # Parameter recovery printout
@@ -363,6 +549,11 @@ def run_case(
         m, sd, lo, hi = summarize_chain(nu_chain)
         nu_vi_str = "NA" if nu_vi is None else f"{nu_vi.item():.6g}"
         print(f"      nu  true={1.0:.6g}  VI={nu_vi_str}  MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]")
+    
+    a_chain = theta_constr.get("a", None)
+    if a_chain is not None:
+        print("  poly coeff mean:", np.mean(a_chain, axis=0))
+
 
     # -------------------------
     # Save plots
