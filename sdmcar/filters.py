@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from typing import Sequence, Union, Dict, List, Tuple, Optional
+from torch.distributions import Normal
 from .utils import softplus, kl_normal_std
 
 
@@ -882,3 +883,114 @@ class RationalPosCoeffFilterFullVI(_BasePosCoeffPolyRationalVI):
         Q = _poly_eval(x, [b[m].reshape(()) for m in range(b.numel())]).clamp_min(0.0)
 
         return (tau2 * P / (Q + self.eps_den)).reshape(-1)
+
+class ClassicCARFilterFullVI(nn.Module):
+    """
+    Classic CAR spectral variance:
+
+        F(λ) = τ^2 / (λ + eps_car)
+
+    eps_car is FIXED (not learned).
+    Variational posterior:
+        q(log τ^2) = Normal(mu_log_tau2, std_log_tau2^2)
+
+    Prior:
+        log τ^2 ~ Normal(0, 1)
+
+    This class is designed to be compatible with:
+      - SpectralCAR_FullVI (VI)
+      - CollapsedSpectralCARMCMC (MCMC)
+      - our run_benchmark helpers (mean_params, _constrain, blocks, pack/unpack)
+    """
+
+    def __init__(
+        self,
+        *,
+        eps_car: float,
+        mu_log_tau2: float = 0.0,
+        log_std_log_tau2: float = -2.3,
+    ):
+        super().__init__()
+        if eps_car <= 0:
+            raise ValueError("eps_car must be > 0 for Classic CAR.")
+
+        self.eps_car = float(eps_car)
+
+        # unconstrained variational parameters
+        self.mu_log_tau2 = nn.Parameter(torch.tensor([mu_log_tau2], dtype=torch.double))
+        self.log_std_log_tau2 = nn.Parameter(torch.tensor([log_std_log_tau2], dtype=torch.double))
+
+    # -------------------------
+    # interface helpers
+    # -------------------------
+    def unconstrained_names(self) -> List[str]:
+        return ["log_tau2"]
+
+    def blocks(self) -> list:
+        # use your ParamBlock API
+        return [ParamBlock.single("log_tau2")]
+
+    def theta0(self) -> Dict[str, torch.Tensor]:
+        # MCMC init in unconstrained space
+        return {"log_tau2": self.mu_log_tau2.detach().clone().reshape(1)}
+
+    def pack(self, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        # pack in the same order as unconstrained_names()
+        return torch.cat([theta["log_tau2"].reshape(-1)], dim=0)
+
+    def unpack(self, theta_vec: torch.Tensor) -> Dict[str, torch.Tensor]:
+        v = theta_vec.reshape(-1)
+        if v.numel() != 1:
+            raise ValueError(f"ClassicCARFilter expects theta_vec of length 1, got {v.numel()}.")
+        return {"log_tau2": v[0:1].clone()}
+
+    # -------------------------
+    # variational pieces
+    # -------------------------
+    def sample_unconstrained(self) -> Dict[str, torch.Tensor]:
+        eps = torch.randn_like(self.mu_log_tau2)
+        log_tau2 = self.mu_log_tau2 + torch.exp(self.log_std_log_tau2) * eps
+        return {"log_tau2": log_tau2.reshape(1)}
+
+    def mean_unconstrained(self) -> Dict[str, torch.Tensor]:
+        return {"log_tau2": self.mu_log_tau2.detach().clone().reshape(1)}
+
+    def mean_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        For run_benchmark logging helper unpack_filter_params_from_means():
+          returns (tau2_mean, a_mean)
+
+        Here 'a_mean' is empty so it won't be misinterpreted as rho0/nu.
+        """
+        tau2_mean = torch.exp(self.mu_log_tau2).reshape(())
+        a_mean = torch.empty((0,), dtype=tau2_mean.dtype, device=tau2_mean.device)
+        return tau2_mean, a_mean
+
+    def _constrain(self, theta: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Convert unconstrained -> constrained parameters.
+        Includes rho0 as FIXED eps_car for convenience in plotting/printing.
+        """
+        log_tau2 = theta["log_tau2"].reshape(())
+        tau2 = torch.exp(log_tau2)
+        rho0 = torch.tensor(self.eps_car, dtype=tau2.dtype, device=tau2.device)
+        return {"tau2": tau2, "rho0": rho0}
+
+    def kl_q_p(self) -> torch.Tensor:
+        # KL(q(log_tau2) || N(0,1))
+        return kl_normal_std(self.mu_log_tau2, self.log_std_log_tau2).sum()
+
+    # -------------------------
+    # spectrum + prior (for MCMC)
+    # -------------------------
+    def spectrum(self, lam: torch.Tensor, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        c = self._constrain(theta)
+        tau2 = c["tau2"]
+        denom = (lam + self.eps_car).clamp_min(1e-12)
+        return (tau2 / denom).reshape(-1)
+
+    @torch.no_grad()
+    def log_prior(self, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        # log p(log_tau2) under standard normal (up to constant is fine)
+        x = theta["log_tau2"].reshape(())
+        return Normal(torch.zeros_like(x), torch.ones_like(x)).log_prob(x)
