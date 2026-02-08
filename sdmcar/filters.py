@@ -994,3 +994,171 @@ class ClassicCARFilterFullVI(nn.Module):
         # log p(log_tau2) under standard normal (up to constant is fine)
         x = theta["log_tau2"].reshape(())
         return Normal(torch.zeros_like(x), torch.ones_like(x)).log_prob(x)
+
+class LerouxCARFilterFullVI(nn.Module):
+    """
+    Leroux / Proper CAR spectral filter:
+
+        Q(rho) = (1-rho) I + rho L
+        Cov eigenvalues:
+            F(λ) = τ² / ((1-rho) + rho * λ)
+
+    Variational posteriors (unconstrained):
+        q(log_tau2) = Normal(mu_log_tau2, exp(log_std_log_tau2)^2)
+        q(rho_raw)  = Normal(mu_rho_raw, exp(log_std_rho_raw)^2)
+
+    Priors (unconstrained):
+        log_tau2 ~ Normal(0,1)
+        rho_raw  ~ Normal(0,1)
+
+    Notes:
+      - rho is constrained to (0, 1) via sigmoid
+      - we multiply by (1-rho_eps) to avoid rho == 1 exactly (numerical safety)
+    """
+    def __init__(
+        self,
+        mu_log_tau2: float = 0.0,
+        log_std_log_tau2: float = -2.3,
+        mu_rho_raw: float = 0.0,
+        log_std_rho_raw: float = -2.3,
+        fixed_rho: float | None = None,
+        rho_eps: float = 1e-4,
+    ):
+        super().__init__()
+
+        self.mu_log_tau2 = nn.Parameter(torch.tensor([mu_log_tau2], dtype=torch.double))
+        self.log_std_log_tau2 = nn.Parameter(torch.tensor([log_std_log_tau2], dtype=torch.double))
+
+        self.mu_rho_raw = nn.Parameter(torch.tensor([mu_rho_raw], dtype=torch.double))
+        self.log_std_rho_raw = nn.Parameter(torch.tensor([log_std_rho_raw], dtype=torch.double))
+
+        self.fixed_rho = fixed_rho
+        self.rho_eps = float(rho_eps)
+
+    # -------------------------
+    # API used by VI + MCMC glue
+    # -------------------------
+
+    def unconstrained_names(self) -> List[str]:
+        names = ["log_tau2"]
+        if self.fixed_rho is None:
+            names.append("rho_raw")
+        return names
+
+    def blocks(self) -> List[ParamBlock]:
+        # default: separate proposals
+        blocks = [ParamBlock.single("log_tau2")]
+        if self.fixed_rho is None:
+            blocks.append(ParamBlock.single("rho_raw"))
+        return blocks
+
+    def theta0(self) -> Dict[str, torch.Tensor]:
+        """
+        MCMC init in unconstrained space.
+        """
+        out = {"log_tau2": self.mu_log_tau2.detach().clone().reshape(-1)}
+        if self.fixed_rho is None:
+            out["rho_raw"] = self.mu_rho_raw.detach().clone().reshape(-1)
+        return out
+
+    def pack(self, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        parts = []
+        for nm in self.unconstrained_names():
+            parts.append(theta[nm].reshape(-1))
+        return torch.cat(parts, dim=0)
+
+    def unpack(self, theta_vec: torch.Tensor) -> Dict[str, torch.Tensor]:
+        theta_vec = theta_vec.reshape(-1)
+        out = {}
+        i = 0
+        out["log_tau2"] = theta_vec[i:i+1]
+        i += 1
+        if self.fixed_rho is None:
+            out["rho_raw"] = theta_vec[i:i+1]
+            i += 1
+        return out
+
+    def sample_unconstrained(self) -> Dict[str, torch.Tensor]:
+        """
+        For VI: sample θ ~ q(θ) in unconstrained space.
+        """
+        std_tau = torch.exp(self.log_std_log_tau2)
+        eps_tau = torch.randn_like(self.mu_log_tau2)
+        log_tau2 = self.mu_log_tau2 + std_tau * eps_tau
+
+        out = {"log_tau2": log_tau2.reshape(-1)}
+
+        if self.fixed_rho is None:
+            std_rho = torch.exp(self.log_std_rho_raw)
+            eps_rho = torch.randn_like(self.mu_rho_raw)
+            rho_raw = self.mu_rho_raw + std_rho * eps_rho
+            out["rho_raw"] = rho_raw.reshape(-1)
+
+        return out
+
+    def mean_unconstrained(self) -> Dict[str, torch.Tensor]:
+        """
+        For “plugin” summaries and MCMC initialization from VI means.
+        """
+        out = {"log_tau2": self.mu_log_tau2.detach().clone().reshape(-1)}
+        if self.fixed_rho is None:
+            out["rho_raw"] = self.mu_rho_raw.detach().clone().reshape(-1)
+        return out
+
+    def _constrain(self, theta: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Map unconstrained θ -> constrained params used by spectrum and reporting.
+        """
+        log_tau2 = theta["log_tau2"].reshape(())
+        tau2 = torch.exp(log_tau2)
+
+        if self.fixed_rho is not None:
+            rho = torch.tensor(self.fixed_rho, dtype=tau2.dtype, device=tau2.device)
+        else:
+            rho_raw = theta["rho_raw"].reshape(())
+            rho = torch.sigmoid(rho_raw) * (1.0 - self.rho_eps)
+
+        return {"tau2": tau2.reshape(()), "rho": rho.reshape(()), "rho0": rho.reshape(())}
+
+    def log_prior(self, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        log p(theta_unconstrained) (standard normal priors).
+        Used by MCMC MH ratio.
+        """
+        lp = Normal(0.0, 1.0).log_prob(theta["log_tau2"].reshape(())).sum()
+        if self.fixed_rho is None:
+            lp = lp + Normal(0.0, 1.0).log_prob(theta["rho_raw"].reshape(())).sum()
+        return lp
+
+    def kl_q_p(self) -> torch.Tensor:
+        """
+        KL(q || p) for the variational posteriors of filter params.
+        """
+        kl = kl_normal_std(self.mu_log_tau2, self.log_std_log_tau2).sum()
+        if self.fixed_rho is None:
+            kl = kl + kl_normal_std(self.mu_rho_raw, self.log_std_rho_raw).sum()
+        return kl
+
+    def spectrum(self, lam: torch.Tensor, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Return F(λ;θ) for vector lam [n].
+        """
+        c = self._constrain(theta)
+        tau2 = c["tau2"]
+        rho = c["rho"]
+
+        denom = (1.0 - rho) + rho * lam
+        denom = denom.clamp_min(1e-12)
+        F_lam = tau2 / denom
+        return F_lam
+
+    # Optional: convenience for your benchmark printing style
+    def mean_params(self):
+        """
+        (tau2_mean, a_mean) style used by some of your benchmark helpers.
+        Here a_mean is [1] containing rho (constrained).
+        """
+        c = self._constrain(self.mean_unconstrained())
+        tau2 = c["tau2"]
+        rho = c["rho"]
+        return tau2.reshape(()), rho.reshape(1)
