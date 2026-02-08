@@ -20,6 +20,7 @@ from sdmcar.graph import build_laplacian_from_knn, laplacian_eigendecomp
 from sdmcar.models import SpectralCAR_FullVI
 from sdmcar.mcmc import MCMCConfig, make_collapsed_mcmc_from_model
 from sdmcar import diagnostics
+from sdmcar.diagnostics import spectrum_error_log_l1
 
 # IMPORTANT: importing benchmarks triggers registrations
 from examples.benchmarks.registry import get_filter_spec, available_filters
@@ -68,43 +69,6 @@ def plot_hist_with_lines(
     plt.savefig(save_path, dpi=200)
     plt.close()
 
-def plot_spectrum_curves(
-    lam: torch.Tensor,
-    curves: dict[str, np.ndarray],
-    title: str,
-    save_path: Path,
-    loglog: bool = False,
-):
-    """
-    Plot spectral variance curves F(lambda).
-
-    lam: torch.Tensor [n]
-    curves: dict[label -> np.ndarray [n]] already aligned with lam
-    """
-    lam_np = lam.detach().cpu().numpy().astype(float)
-    order = np.argsort(lam_np)
-    x = lam_np[order]
-
-    plt.figure(figsize=(6.5, 4.0))
-
-    for label, y in curves.items():
-        y = np.asarray(y, dtype=float)[order]
-
-        if loglog:
-            # avoid log problems; keep shape but clamp for plotting only
-            x_plot = np.clip(x, 1e-12, None)
-            y_plot = np.clip(y, 1e-12, None)
-            plt.loglog(x_plot, y_plot, linewidth=2, label=label)
-        else:
-            plt.plot(x, y, linewidth=2, label=label)
-
-    plt.xlabel(r"eigenvalue $\lambda$")
-    plt.ylabel(r"$F(\lambda)$")
-    plt.title(title)
-    plt.legend(fontsize=8)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=220)
-    plt.close()
 
 
 def resolve_fixed_tokens(fixed: dict, eps_car: float) -> dict:
@@ -119,28 +83,6 @@ def resolve_fixed_tokens(fixed: dict, eps_car: float) -> dict:
             out[k] = v
     return out
 
-
-# def unpack_filter_params_from_means(filter_module):
-#     """
-#     Returns dict with tau2 and (optionally) rho0, nu if mean_params provides them.
-#     This stays generic-ish and won't crash if shapes vary.
-#     """
-#     tau2_m, a_m = filter_module.mean_params()
-#     a_flat = a_m.reshape(-1)
-
-#     rho0_m = None
-#     nu_m = None
-#     if a_flat.numel() == 2:
-#         rho0_m = a_flat[0]
-#         nu_m = a_flat[1]
-#     elif a_flat.numel() == 1:
-#         rho0_m = a_flat[0]
-
-#     return {
-#         "tau2": tau2_m.reshape(()),
-#         "rho0": None if rho0_m is None else rho0_m.reshape(()),
-#         "nu": None if nu_m is None else nu_m.reshape(()),
-#     }
 
 def unpack_filter_params_from_means(filter_module):
     """
@@ -198,35 +140,6 @@ def unpack_filter_params_from_means(filter_module):
     )
 
 
-
-# def decode_theta_chain(out, filter_module):
-#     theta_mat = out["theta"].numpy()
-#     names = out["theta_names"]
-
-#     raw = {names[j]: theta_mat[:, j].copy() for j in range(len(names))}
-
-#     # device/dtype from filter
-#     try:
-#         p0 = next(filter_module.parameters())
-#         device, dtype = p0.device, p0.dtype
-#     except StopIteration:
-#         device, dtype = torch.device("cpu"), torch.double
-
-#     constrained = {}
-#     S = theta_mat.shape[0]
-#     for i in range(S):
-#         theta_dict = {
-#             names[j]: torch.tensor([theta_mat[i, j]], dtype=dtype, device=device)
-#             for j in range(len(names))
-#         }
-#         c = filter_module._constrain(theta_dict)
-#         for k, v in c.items():
-#             if k not in constrained:
-#                 constrained[k] = np.zeros(S, dtype=float)
-#             constrained[k][i] = float(v.reshape(()).detach().cpu().numpy())
-
-#     return raw, constrained
-
 def decode_theta_chain(out, filter_module):
     """
     Returns:
@@ -283,6 +196,7 @@ def run_case(
     *,
     case_spec,
     filter_name: str,
+    F_true: torch.Tensor,
     X: torch.Tensor,
     y: torch.Tensor,
     lam: torch.Tensor,
@@ -406,6 +320,7 @@ def run_case(
 
     rmse_phi_vi = float(torch.sqrt(torch.mean((mean_phi_vi - phi_true.cpu()) ** 2)).item())
 
+
     # -------------------------
     # Run MCMC initialized from VI means
     # -------------------------
@@ -472,45 +387,39 @@ def run_case(
         named = case_spec.transform_chain(out, fixed_resolved=fixed, eps_car=eps_car)
     
 
-    # -------------------------
-    # Spectrum curve plots: F(lambda)
-    # truth vs VI mean vs MCMC mean
-    # -------------------------
-    with torch.no_grad():
-        # truth in your benchmark is always CAR: F_true = tau2_true / (lam + eps_car)
-        F_true = (tau2_true / (lam + eps_car)).detach().cpu().numpy()
+    lam_flat = lam.reshape(-1)
+    _, idx = torch.sort(lam_flat)
 
-        # VI mean curve using mean unconstrained theta
-        theta_vi_mean = model.filter.mean_unconstrained()
-        F_vi = model.filter.spectrum(lam, theta_vi_mean).detach().cpu().numpy()
+    F_true_local = F_true.to(device=lam.device, dtype=lam.dtype).reshape(-1)
 
-        # MCMC mean curve: take mean of packed theta vectors, unpack -> theta dict
-        theta_vec_mean = out["theta"].mean(dim=0).to(device=device, dtype=torch.double).reshape(-1)
-        theta_mcmc_mean = model.filter.unpack(theta_vec_mean)
-        F_mcmc = model.filter.spectrum(lam, theta_mcmc_mean).detach().cpu().numpy()
 
-    plot_spectrum_curves(
+    diagnostics.plot_spectrum_recovery(
         lam=lam,
-        curves={
-            "Truth (CAR)": F_true,
-            "VI mean": F_vi,
-            "MCMC mean": F_mcmc,
-        },
-        title=f"Spectral variance F(λ) — {filter_name}/{case_spec.display_name}",
-        save_path=case_dir / "spectrum_F_linear.png",
-        loglog=False,
+        F_true=F_true,
+        filter_module=model.filter,
+        vi_theta=model.filter.mean_unconstrained(),
+        mcmc_theta=out["theta"].numpy(),
+        mcmc_theta_names=out["theta_names"],
+        title=f"Spectrum recovery — {filter_name}/{case_spec.display_name}",
+        save_path=case_dir / "spectrum_recovery.png",
+        yscale="log",
     )
 
-    plot_spectrum_curves(
+    # -------------------------
+    # Spectrum error metrics
+    # -------------------------
+    spec_err_vi = spectrum_error_log_l1(
         lam=lam,
-        curves={
-            "Truth (CAR)": F_true,
-            "VI mean": F_vi,
-            "MCMC mean": F_mcmc,
-        },
-        title=f"Spectral variance F(λ) (log-log) — {filter_name}/{case_spec.display_name}",
-        save_path=case_dir / "spectrum_F_loglog.png",
-        loglog=True,
+        F_true=F_true_local,
+        model=model,
+    )
+
+    # use packed theta directly (out["theta"] is [S,d] torch)
+    spec_err_mcmc = spectrum_error_log_l1(
+        lam=lam,
+        F_true=F_true_local,
+        filter_module=model.filter,
+        theta_mcmc=out["theta"],   # torch.Tensor [S,d]
     )
 
 
@@ -628,6 +537,8 @@ def run_case(
         "case": case_spec.display_name,
         "rmse_phi_vi": rmse_phi_vi,
         "rmse_phi_mcmc": rmse_phi_mcmc,
+        "spec_err_vi": spec_err_vi,
+        "spec_err_mcmc": spec_err_mcmc,
         "acc_s": acc["s"][2],
         "acc_theta": {k: v[2] for k, v in acc["theta"].items()},
         "mcmc_means": {
@@ -637,6 +548,28 @@ def run_case(
             **({ "nu": float(np.mean(nu_chain)) } if nu_chain is not None else {}),
         },
     }
+
+    # -------------------------
+    # Write per-case metrics JSON
+    # -------------------------
+    import json
+    metrics_path = case_dir / "metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(
+            {
+                "filter": summary["filter"],
+                "case": summary["case"],
+                "rmse_phi_vi": summary["rmse_phi_vi"],
+                "rmse_phi_mcmc": summary["rmse_phi_mcmc"],
+                "spec_err_vi": summary["spec_err_vi"],
+                "spec_err_mcmc": summary["spec_err_mcmc"],
+                "acc_s": summary["acc_s"],
+                "acc_theta": summary["acc_theta"],
+                "mcmc_means": summary["mcmc_means"],
+            },
+            f,
+            indent=2,
+        )
 
     return summary
 
@@ -656,7 +589,29 @@ def main():
     parser.add_argument("--mcmc_burnin", type=int, default=10000)
     parser.add_argument("--mcmc_thin", type=int, default=10)
 
+    parser.add_argument(
+    "--fast",
+    action="store_true",
+    help="Fast mode for CI / smoke tests (fewer VI iters and MCMC steps)",
+)
+
     args = parser.parse_args()
+
+    # -------------------------
+    # Fast mode overrides (CI / smoke tests)
+    # -------------------------
+    if args.fast:
+        print("[FAST MODE] Using reduced iteration counts")
+
+        # VI
+        args.vi_iters = min(args.vi_iters, 600)     # 400–800 sweet spot
+        args.vi_mc = min(args.vi_mc, 5)
+
+        # MCMC
+        args.mcmc_steps = min(args.mcmc_steps, 8000)
+        args.mcmc_burnin = min(args.mcmc_burnin, 2000)
+        args.mcmc_thin = max(args.mcmc_thin, 5)
+
 
     spec = get_filter_spec(args.filter)
     requested = set(args.cases)
@@ -700,6 +655,7 @@ def main():
     tau2_true = 0.4
     eps_car = 1e-3
     F_car = tau2_true / (lam + eps_car)
+    F_true = F_car
 
     z_true = torch.sqrt(F_car) * torch.randn(n, dtype=torch.double, device=device)
     phi_true = U @ z_true
@@ -722,7 +678,7 @@ def main():
         summaries.append(
             run_case(
                 case_spec=spec.cases[case_id],
-                filter_name=spec.filter_name,
+                filter_name=spec.filter_name, F_true=F_true,
                 X=X, y=y, lam=lam, U=U, coords=coords,
                 phi_true=phi_true, beta_true=beta_true,
                 sigma2_true=sigma2_true, tau2_true=tau2_true,
