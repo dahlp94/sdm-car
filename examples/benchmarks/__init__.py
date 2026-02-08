@@ -3,3 +3,5 @@
 from . import matern      # noqa: F401
 from . import invlinear_car  # noqa: F401
 from . import polyrational  # noqa: F401
+from . import classic_car  # noqa: F401
+from . import leroux  # noqa: F401
