@@ -10,11 +10,11 @@ class SpectralCAR_FullVI(nn.Module):
     """
     Collapsed VI for Spectral CAR with a generic spectral filter module.
 
-    - φ is collapsed analytically (never sampled)
-    - q(β) is analytic Gaussian per MC hyperparameter sample
-    - Full VI over (log σ²) and filter hyperparameters via the filter module
+    - phi is collapsed analytically (never sampled)
+    - q(beta) is analytic Gaussian per MC hyperparameter sample
+    - Full VI over (log sigma2) and filter hyperparameters via the filter module
 
-    ELBO ~ E_{q(hyper)} [ log p(y|β,F,σ²) - KL(q(β)||p(β)) ] - KL(q(hyper)||p).
+    ELBO ~ E_{q(hyper)} [ log p(y|beta,F,sigma2) - KL(q(beta)||p(beta)) ] - KL(q(hyper)||p).
     """
     def __init__(self,
                  X,
@@ -32,7 +32,7 @@ class SpectralCAR_FullVI(nn.Module):
                  kl_sigma_mc: int = 8):
         super().__init__()
 
-        # Data & spectrum
+        # Data and spectrum
         self.X = X
         self.y = y
         self.lam = lam
@@ -42,7 +42,7 @@ class SpectralCAR_FullVI(nn.Module):
 
         n, p = X.shape
 
-        # Prior on β: N(m0, V0)
+        # Prior on beta: N(m0, V0)
         device = X.device
         self.m0 = (torch.zeros(p, dtype=torch.double, device=device)
                    if prior_m0 is None else prior_m0)
@@ -54,11 +54,12 @@ class SpectralCAR_FullVI(nn.Module):
         self.X_tilde = self.U.T @ self.X    # [n, p]
         self.y_tilde = self.U.T @ self.y    # [n]
 
-        # Store last β posterior for reporting
+        # Store last beta posterior for reporting
         self.m_beta = torch.zeros(p, dtype=torch.double, device=device)
         self.V_beta = torch.eye(p, dtype=torch.double, device=device)
 
-        # q(log σ²) = N(μ, s²), prior N(0,1)
+        # -------- We have unconstrained parameters here. --------
+        # q(log sigma2) = N(mu_log_sigma2, exp(...)^2), prior N(0,1)
         self.mu_log_sigma2 = nn.Parameter(
             torch.tensor([mu_log_sigma2], dtype=torch.double, device=device)
         )
@@ -75,37 +76,32 @@ class SpectralCAR_FullVI(nn.Module):
         #   "jeffreys_trunc"    : p(s) uniform on [lo,hi] (MC KL)
         self.sigma2_prior = sigma2_prior
         self.sigma2_prior_params = {} if sigma2_prior_params is None else sigma2_prior_params
-        self.kl_sigma_mc = int(kl_sigma_mc)
+        self.kl_sigma_mc = int(kl_sigma_mc) # just as a fail safe
         if self.kl_sigma_mc <= 0:
             raise ValueError("kl_sigma_mc must be positive.")
 
     
     def _beta_update(self, inv_var, return_Xt_invSig_X: bool = False):
         """
-        inv_var: [n] = 1 / (F(λ) + σ²)
+        inv_var: [n] = 1 / (F(lam) + sigma2)
 
         Computes:
-            Vβ = (V0^{-1} + X^T Σ^{-1} X)^{-1}
-            mβ = Vβ (V0^{-1} m0 + X^T Σ^{-1} y)
+            V_beta = (V0^{-1} + X^T Sigma^{-1} X)^{-1}
+            m_beta = V_beta (V0^{-1} m0 + X^T Sigma^{-1} y)
 
         using spectral trick:
-            X^T Σ^{-1} X = X_tilde^T diag(inv_var) X_tilde
-            X^T Σ^{-1} y = X_tilde^T (inv_var * y_tilde)
+            X^T Sigma^{-1} X = X_tilde^T diag(inv_var) X_tilde
+            X^T Sigma^{-1} y = X_tilde^T (inv_var * y_tilde)
 
-        If return_Xt_invSig_X=True, also returns Xt_invSig_X = X^T Σ^{-1} X
+        If return_Xt_invSig_X=True, also returns Xt_invSig_X = X^T Sigma^{-1} X
         for reuse in the ELBO trace term.
         """
-        # X̃^T Σ^{-1} X̃
+        # X_tilde^T Sigma^{-1} X_tilde
         Xt_weighted = inv_var.unsqueeze(1) * self.X_tilde        # [n, p]
         Xt_invSig_X = self.X_tilde.T @ Xt_weighted               # [p, p]
 
-        # X̃^T Σ^{-1} ỹ
+        # X_tilde^T Sigma^{-1} y_tilde
         Xt_invSig_y = self.X_tilde.T @ (inv_var * self.y_tilde)  # [p]
-
-        # V_beta_inv = self.V0_inv + Xt_invSig_X
-        # V_beta = torch.inverse(V_beta_inv)
-        # # better: V_beta = torch.linalg.inv(V_beta_inv)
-        # m_beta = V_beta @ (self.V0_inv @ self.m0 + Xt_invSig_y)
 
         eps = 1e-6
         V_beta_inv = self.V0_inv + Xt_invSig_X
@@ -130,7 +126,7 @@ class SpectralCAR_FullVI(nn.Module):
 
     def _kl_beta(self, m_beta, V_beta):
         """
-        KL(q(β)||p(β)) for Gaussians N(mβ, Vβ) vs N(m0, V0).
+        KL(q(beta)||p(beta)) for Gaussians N(mbeta, Vbeta) vs N(m0, V0).
         """
         p = self.m0.numel()
         term1 = torch.logdet(self.V0) - torch.logdet(V_beta)
@@ -242,9 +238,9 @@ class SpectralCAR_FullVI(nn.Module):
     def elbo(self, num_mc_override: int | None = None):
         """
         Monte-Carlo estimate of ELBO over q(hyperparams):
-            hyperparams = {s=log σ²} ∪ filter hyperparams θ.
+            hyperparams = {s=log sigma2} union filter hyperparams theta.
 
-        Uses paired MC samples (θ^{(k)}, s^{(k)}) ~ q(θ) q(s).
+        Uses paired MC samples (theta^{(k)}, s^{(k)}) ~ q(theta) q(s).
 
         Returns:
             elbo: scalar tensor
@@ -256,7 +252,7 @@ class SpectralCAR_FullVI(nn.Module):
             raise ValueError(f"num_mc must be positive, got {num_mc}.")
 
         # ---- KL(q(s) || p(s)) ----
-        # This term is NOT inside E_{q(θ)q(s)}[...] in the usual ELBO decomposition.
+        # This term is NOT inside E_{q(theta)q(s)}[...] in the usual ELBO decomposition.
         kl_sigma2 = self._kl_sigma2()
 
         mc_loglik = torch.zeros((), dtype=self.y.dtype, device=self.y.device)
@@ -266,21 +262,21 @@ class SpectralCAR_FullVI(nn.Module):
         last_sigma2 = None
 
         for _ in range(num_mc):
-            # ---- Sample s = log σ² from q(s) ----
+            # ---- Sample s = log sigma2 from q(s) ----
             eps_sig = torch.randn_like(self.mu_log_sigma2)
             s = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps_sig
             sigma2 = torch.exp(s).clamp_min(1e-12)  # scalar tensor
             last_sigma2 = sigma2
 
-            # ---- Sample filter hyperparameters θ (unconstrained) from q(filter) ----
+            # ---- Sample filter hyperparameters theta (unconstrained) from q(filter) ----
             theta = self.filter.sample_unconstrained()  # dict[name -> tensor]
 
-            # ---- Build spectral variance diag(F(λ;θ) + σ²) ----
+            # ---- Build spectral variance diag(F(λ;theta) + sigma2) ----
             F_lam = self.filter.spectrum(self.lam, theta)  # [n] # can clamp to 0.0
             var = (F_lam + sigma2).clamp_min(1e-12)    # [n]
             inv_var = 1.0 / var                       # [n]
 
-            # ---- Exact posterior of β given (θ, s) ----
+            # ---- Exact posterior of beta given (theta, s) ----
             m_beta, V_beta, Xt_invSig_X = self._beta_update(inv_var, return_Xt_invSig_X=True)
 
             # ---- Residual in spectral domain ----
@@ -289,13 +285,13 @@ class SpectralCAR_FullVI(nn.Module):
             # ---- Plug-in part of log-likelihood (drop -0.5 n log 2π) ----
             loglik_plugin = -0.5 * torch.sum(torch.log(var) + g**2 * inv_var)
 
-            # ---- Exact variance correction: -0.5 * tr(Vβ X^T Σ^{-1} X) ----
+            # ---- Exact variance correction: -0.5 * tr(Vbeta X^T Sigma^{-1} X) ----
             trace_term = torch.trace(V_beta @ Xt_invSig_X)
 
-            # ---- Exact E_q(beta|θ,s)[log p(y|β,θ,s)] (up to constant) ----
+            # ---- Exact E_q(beta|theta,s)[log p(y|beta,theta,s)] (up to constant) ----
             loglik_exact = loglik_plugin - 0.5 * trace_term
 
-            # ---- KL(q(β|θ,s) || p(β)) ----
+            # ---- KL(q(beta|theta,s) || p(beta)) ----
             kl_beta = self._kl_beta(m_beta, V_beta)
 
             mc_loglik += loglik_exact
@@ -314,7 +310,7 @@ class SpectralCAR_FullVI(nn.Module):
         # ---- Final ELBO ----
         elbo = mc_loglik - mc_kl_beta - kl_filter - kl_sigma2
 
-        # Store last β posterior for inspection/reporting
+        # Store last beta posterior for inspection/reporting
         self.m_beta = last_m_beta.detach()
         self.V_beta = last_V_beta.detach()
 
@@ -336,36 +332,36 @@ class SpectralCAR_FullVI(nn.Module):
         num_mc: int = 32,          # used only if mode=="mc"
     ):
         """
-        Posterior summaries for the spatial effect φ.
+        Posterior summaries for the spatial effect phi.
 
         Model:
-            φ = U z,
-            z | (y, β, θ, s) ~ N( μ_z, diag(v_spec) ),
-            μ_z   = (F / (F + σ²)) ⊙ (Uᵀ r),
-            v_spec = F σ² / (F + σ²),
-            r = y - X E_q[β].
+            phi = U z,
+            z | (y, beta, theta, s) ~ N( mu_z, diag(v_spec) ),
+            mu_z   = (F / (F + sigma2)) (element-wise-multiply) (U^T r),
+            v_spec = F sigma2 / (F + sigma2),
+            r = y - X E_q[beta].
 
         Modes
         -----
         plugin:
             Conditional posterior given mean hyperparameters
-            (θ = E_q[θ], s = E_q[s]).
+            (theta = E_q[theta], s = E_q[s]).
             Fast, deterministic.
 
         mc:
-            Variational marginal posterior integrating over q(θ) q(s)
+            Variational marginal posterior integrating over q(theta) q(s)
             using Monte Carlo and total variance decomposition.
             Slower, uncertainty-aware.
 
         Returns
         -------
         mean_phi : (n,)
-            Posterior mean of φ in node space.
+            Posterior mean of phi in node space.
         var_phi_diag : (n,)
-            Node-wise marginal posterior variance of φ.
+            Node-wise marginal posterior variance of phi.
         """
 
-        # residual using posterior mean of β
+        # residual using posterior mean of beta
         r = self.y - self.X @ self.m_beta
         r_tilde = self.U.T @ r
 
@@ -391,7 +387,7 @@ class SpectralCAR_FullVI(nn.Module):
             return mean_phi, var_phi_diag
 
         # --------------------------------------------------
-        # (B) MC-integrated over q(θ, s)
+        # (B) MC-integrated over q(theta, s)
         # --------------------------------------------------
         elif mode == "mc":
             if num_mc <= 0:
@@ -403,12 +399,12 @@ class SpectralCAR_FullVI(nn.Module):
             mean2_acc = torch.zeros(n, dtype=self.y.dtype, device=self.y.device)
 
             for _ in range(int(num_mc)):
-                # sample s = log σ²
+                # sample s = log sigma2
                 eps = torch.randn_like(self.mu_log_sigma2)
                 s = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps
                 sigma2 = torch.exp(s).clamp_min(1e-12)
 
-                # sample θ
+                # sample theta
                 theta = self.filter.sample_unconstrained()
                 F_lam = self.filter.spectrum(self.lam, theta) # can clamp to 0.0
 
