@@ -23,6 +23,12 @@ def build_invlinear_filter(
         mu_rho0_raw=-7.0,
         log_std_rho0_raw=-2.5,
         fixed_rho0=fixed_rho0,   # IMPORTANT: do not force eps here
+
+        # NEW: prior that favors rho0 = 0.001 (approx.)
+        prior_mu_log_tau2=0,
+        prior_std_log_tau2=1,
+        prior_mu_rho0_raw=-7.0,
+        prior_std_rho0_raw=2.0,
     ).to(device)
 
 
@@ -40,7 +46,7 @@ register(
                 step_theta={
                     # names must match filter_module.unconstrained_names()
                     "log_tau2": 0.25,
-                    "rho0_raw": 0.50,
+                    "rho0_raw": 3.0,
                 },
                 # transform_chain not needed anymore; run_benchmark decodes rho0 via theta_constr
                 transform_chain=None,
