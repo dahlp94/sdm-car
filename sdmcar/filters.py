@@ -6,7 +6,7 @@ import torch.nn as nn
 from dataclasses import dataclass
 from typing import Sequence, Union, Dict, List, Tuple, Optional
 from torch.distributions import Normal
-from .utils import softplus, kl_normal_std
+from .utils import softplus, kl_normal_std, kl_normal_to_normal
 
 
 @dataclass(frozen=True)
@@ -187,10 +187,10 @@ class DiffusionFilterFullVI(BaseSpectralFilter):
     """
     Variational diffusion filter:
 
-        F(λ) = τ^2 * exp(-a λ),   with a = softplus(a_raw) > 0.
+        F(lam) = τ^2 * exp(-a lam),   with a = softplus(a_raw) > 0.
 
     Variational posteriors (full VI):
-        q(log τ^2) = N(μ_τ, s_τ^2)
+        q(log τ^2) = N(mu_tau, s_τ^2)
         q(a_raw)   = N(μ_a, s_a^2)   (softplus transform for positivity of 'a')
 
     Priors (on unconstrained variables):
@@ -223,9 +223,9 @@ class DiffusionFilterFullVI(BaseSpectralFilter):
         Reparameterized samples of (τ^2, a) and the unconstrained variables.
 
         Returns:
-            tau2: scalar τ²
+            tau2: scalar tau2
             a:    scalar a > 0
-            log_tau2: scalar log τ² sample
+            log_tau2: scalar log tau2 sample
             a_raw:    scalar a_raw sample
         """
         eps1 = torch.randn_like(self.mu_log_tau2)
@@ -240,11 +240,11 @@ class DiffusionFilterFullVI(BaseSpectralFilter):
 
     def F(self, lam, tau2, a):
         """
-        Compute F(λ) elementwise for a given sample (τ², a).
+        Compute F(lam) elementwise for a given sample (tau2, a).
 
         Args:
             lam: [n] eigenvalues.
-            tau2: scalar τ².
+            tau2: scalar tau2.
             a: scalar a > 0.
 
         Returns:
@@ -254,7 +254,7 @@ class DiffusionFilterFullVI(BaseSpectralFilter):
 
     def kl_q_p(self):
         """
-        KL( q(log τ²)||N(0,1) ) + KL( q(a_raw)||N(0,1) ).
+        KL( q(log tau2)||N(0,1) ) + KL( q(a_raw)||N(0,1) ).
 
         Returns:
             scalar KL value.
@@ -266,10 +266,10 @@ class DiffusionFilterFullVI(BaseSpectralFilter):
     @torch.no_grad()
     def mean_params(self):
         """
-        Return mean parameters under q: τ²_mean, a_mean.
+        Return mean parameters under q: tau2_mean, a_mean.
 
         Returns:
-            tau2_mean: scalar E_q[τ²]
+            tau2_mean: scalar E_q[tau2]
             a_mean:    scalar E_q[a]
         """
         tau2_mean = torch.exp(self.mu_log_tau2)
@@ -311,20 +311,20 @@ class MaternLikeFilterFullVI(BaseSpectralFilter):
     """
     Variational Matérn-like spectral filter:
 
-        F(λ) = τ² * (λ + ρ₀)^(-ν),
+        F(lam) = tau2 * (lam + rho0)^(-nu),
 
-    with ρ₀ > 0 and ν > 0 enforced via softplus transforms:
+    with rho0 > 0 and nu > 0 enforced via softplus transforms:
 
-        ρ₀ = softplus(ρ0_raw),
-        ν  = softplus(nu_raw).
+        rho0 = softplus(ρ0_raw),
+        nu  = softplus(nu_raw).
 
     Variational posteriors (full VI):
-        q(log τ²)   = N(μ_τ, s_τ²)
+        q(log tau2)   = N(mu_tau, s_tau2)
         q(a_raw)    = N(μ_a, diag(s_a²)), where
                       a_raw = (ρ0_raw, nu_raw),
 
     Priors (on unconstrained variables):
-        log τ²  ~ N(0, 1)
+        log tau2  ~ N(0, 1)
         ρ0_raw  ~ N(0, 1)
         nu_raw  ~ N(0, 1)
     """
@@ -345,7 +345,7 @@ class MaternLikeFilterFullVI(BaseSpectralFilter):
         self.fixed_nu = fixed_nu
         self.fixed_rho0 = fixed_rho0
 
-        # q(log τ²)
+        # q(log tau2)
         self.mu_log_tau2 = nn.Parameter(
             torch.tensor([mu_log_tau2], dtype=torch.double)
         )
@@ -400,12 +400,12 @@ class MaternLikeFilterFullVI(BaseSpectralFilter):
 
     def sample_params(self):
         """
-        Reparameterized samples of (τ², a) and the unconstrained variables.
+        Reparameterized samples of (tau2, a) and the unconstrained variables.
 
         Returns:
-            tau2: scalar τ²
-            a:    length-2 vector (ρ₀, ν), each > 0 (or fixed)
-            log_tau2: scalar log τ² sample
+            tau2: scalar tau2
+            a:    length-2 vector (rho0, nu), each > 0 (or fixed)
+            log_tau2: scalar log tau2 sample
             a_raw:    unconstrained FREE raw vector (len 1 or 2 depending on constraint)
         """
         eps1 = torch.randn_like(self.mu_log_tau2)
@@ -424,12 +424,12 @@ class MaternLikeFilterFullVI(BaseSpectralFilter):
 
     def F(self, lam, tau2, a):
         """
-        Compute F(λ) elementwise for a given sample (τ², ρ₀, ν).
+        Compute F(lam) elementwise for a given sample (tau2, rho0, nu).
 
         Args:
-            lam:  [n] eigenvalues (λ ≥ 0).
-            tau2: scalar τ².
-            a:    length-2 vector (ρ₀, ν), both > 0.
+            lam:  [n] eigenvalues (lam ≥ 0).
+            tau2: scalar tau2.
+            a:    length-2 vector (rho0, nu), both > 0.
 
         Returns:
             F_lam: [n] spectral variances.
@@ -439,7 +439,7 @@ class MaternLikeFilterFullVI(BaseSpectralFilter):
     
     def kl_q_p(self):
         """
-        KL( q(log τ²)||N(0,1) ) + KL( q(a_raw)||N(0,1) ).
+        KL( q(log tau2)||N(0,1) ) + KL( q(a_raw)||N(0,1) ).
 
         Returns:
             scalar KL value.
@@ -455,11 +455,11 @@ class MaternLikeFilterFullVI(BaseSpectralFilter):
     @torch.no_grad()
     def mean_params(self):
         """
-        Return mean parameters under q: τ²_mean, a_mean.
+        Return mean parameters under q: tau2_mean, a_mean.
 
         Returns:
-            tau2_mean: scalar E_q[τ²]
-            a_mean:    length-2 vector E_q[(ρ₀, ν)]
+            tau2_mean: scalar E_q[tau2]
+            a_mean:    length-2 vector E_q[(rho0, nu)]
         """
         tau2_mean = torch.exp(self.mu_log_tau2)
         if self.mu_a_raw is None:
@@ -555,19 +555,19 @@ class InverseLinearCARFilterFullVI(BaseSpectralFilter):
     """
     Variational inverse-linear (CAR-exact) spectral covariance filter:
 
-        F(λ) = τ² / (λ + ρ₀)
+        F(lam) = tau2 / (lam + rho0)
 
-    with τ² > 0 and ρ₀ > 0 enforced by:
-        τ² = exp(log_tau2)
-        ρ₀ = softplus(rho0_raw)
+    with tau2 > 0 and rho0 > 0 enforced by:
+        tau2 = exp(log_tau2)
+        rho0 = softplus(rho0_raw)
 
     Variational posteriors:
-        q(log τ²)     = N(μ_τ, s_τ²)
-        q(rho0_raw)   = N(μ_ρ, s_ρ²)
+        q(log tau2)     = N(mu_tau, s_tau2)
+        q(rho0_raw)   = N(mu_rho, s_rho2)
 
     Priors (on unconstrained variables):
-        log τ²   ~ N(0, 1)
-        rho0_raw ~ N(0, 1)
+        log tau2   ~ N(0, 1)
+        rho0_raw ~ N(mean, var)
     """
 
     def __init__(
@@ -577,11 +577,23 @@ class InverseLinearCARFilterFullVI(BaseSpectralFilter):
         mu_rho0_raw: float = 0.0,
         log_std_rho0_raw: float = -2.3,
         fixed_rho0: float | None = None,
+        
+        # NEW: explicit priors in unconstrained space
+        prior_mu_log_tau2: float = 0.0,
+        prior_std_log_tau2: float = 1.0,
+        prior_mu_rho0_raw: float = 0.0,
+        prior_std_rho0_raw: float = 1.0,
     ):
         super().__init__()
         self.fixed_rho0 = fixed_rho0
 
-        # q(log τ²)
+        # store priors
+        self.prior_mu_log_tau2 = float(prior_mu_log_tau2)
+        self.prior_std_log_tau2 = float(prior_std_log_tau2)
+        self.prior_mu_rho0_raw = float(prior_mu_rho0_raw)
+        self.prior_std_rho0_raw = float(prior_std_rho0_raw)
+
+        # q(log tau2)
         self.mu_log_tau2 = nn.Parameter(torch.tensor([mu_log_tau2], dtype=torch.double))
         self.log_std_log_tau2 = nn.Parameter(torch.tensor([log_std_log_tau2], dtype=torch.double))
 
@@ -598,9 +610,9 @@ class InverseLinearCARFilterFullVI(BaseSpectralFilter):
         Reparameterized samples.
 
         Returns:
-            tau2: scalar τ²
-            rho0: scalar ρ₀
-            log_tau2: scalar log τ² sample
+            tau2: scalar tau2
+            rho0: scalar rho0
+            log_tau2: scalar log tau2 sample
             rho0_raw: scalar rho0_raw sample (or empty tensor if fixed)
         """
         eps_tau = torch.randn_like(self.mu_log_tau2)
@@ -619,26 +631,54 @@ class InverseLinearCARFilterFullVI(BaseSpectralFilter):
 
     def F(self, lam: torch.Tensor, tau2: torch.Tensor, rho0: torch.Tensor) -> torch.Tensor:
         """
-        Compute F(λ) elementwise.
+        Compute F(lam) elementwise.
 
         Args:
-            lam:  [n] eigenvalues (λ ≥ 0)
-            tau2: scalar τ²
-            rho0: scalar ρ₀
+            lam:  [n] eigenvalues (lam ≥ 0)
+            tau2: scalar tau2
+            rho0: scalar rho0
 
         Returns:
             F_lam: [n] spectral variances
         """
         return tau2 / (lam + rho0)
-
+    
     def kl_q_p(self) -> torch.Tensor:
         """
-        KL(q(log τ²)||N(0,1)) + KL(q(rho0_raw)||N(0,1)) (if rho0 not fixed).
+        KL(q(log tau2) || p(log tau2)) + KL(q(rho0_raw) || p(rho0_raw)).
+
+        Priors are Normal(prior_mu_*, prior_std_*).
         """
-        kl = kl_normal_std(self.mu_log_tau2, self.log_std_log_tau2).sum()
+        kl = kl_normal_to_normal(
+            self.mu_log_tau2, self.log_std_log_tau2,
+            mu_p=self.prior_mu_log_tau2,
+            std_p=self.prior_std_log_tau2,
+        ).sum()
+
         if self.fixed_rho0 is None:
-            kl = kl + kl_normal_std(self.mu_rho0_raw, self.log_std_rho0_raw).sum()
+            kl = kl + kl_normal_to_normal(
+                self.mu_rho0_raw, self.log_std_rho0_raw,
+                mu_p=self.prior_mu_rho0_raw,
+                std_p=self.prior_std_rho0_raw,
+            ).sum()
+
         return kl
+    
+    def log_prior(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        log p(theta_unconstrained) under Normal priors.
+        Used by MCMC MH ratio.
+        """
+        lp = Normal(self.prior_mu_log_tau2, self.prior_std_log_tau2).log_prob(
+            theta["log_tau2"].reshape(())
+        ).sum()
+
+        if self.fixed_rho0 is None:
+            lp = lp + Normal(self.prior_mu_rho0_raw, self.prior_std_rho0_raw).log_prob(
+                theta["rho0_raw"].reshape(())
+            ).sum()
+
+        return lp
 
     @torch.no_grad()
     def mean_params(self):
@@ -778,7 +818,7 @@ class PolyPosCoeffFilterFullVI(_BasePosCoeffPolyRationalVI):
     """
     Polynomial spectral filter with nonnegative coefficients:
 
-      F(λ) = τ² * sum_{k=0..K} a_k x^k,  x = λ / max(λ)
+      F(lam) = tau2 * sum_{k=0..K} a_k x^k,  x = lam / max(lam)
 
     Unconstrained:
       log_tau2, a0_raw..aK_raw
@@ -820,10 +860,10 @@ class RationalPosCoeffFilterFullVI(_BasePosCoeffPolyRationalVI):
     """
     Rational spectral filter:
 
-      F(λ) = τ² * P(x) / (Q(x) + eps),
+      F(lam) = tau2 * P(x) / (Q(x) + eps),
       P(x) = sum_{k=0..K} a_k x^k,  a_k>=0
       Q(x) = sum_{m=0..M} b_m x^m,  b_m>=0
-      x = λ/max(λ)
+      x = lam/max(lam)
 
     Unconstrained:
       log_tau2, a*_raw, b*_raw
@@ -888,7 +928,7 @@ class ClassicCARFilterFullVI(nn.Module):
     """
     Classic CAR spectral variance:
 
-        F(λ) = τ^2 / (λ + eps_car)
+        F(lam) = τ^2 / (lam + eps_car)
 
     eps_car is FIXED (not learned).
     Variational posterior:
@@ -1001,7 +1041,7 @@ class LerouxCARFilterFullVI(nn.Module):
 
         Q(rho) = (1-rho) I + rho L
         Cov eigenvalues:
-            F(λ) = τ² / ((1-rho) + rho * λ)
+            F(lam) = tau2 / ((1-rho) + rho * lam)
 
     Variational posteriors (unconstrained):
         q(log_tau2) = Normal(mu_log_tau2, exp(log_std_log_tau2)^2)
@@ -1141,7 +1181,7 @@ class LerouxCARFilterFullVI(nn.Module):
 
     def spectrum(self, lam: torch.Tensor, theta: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Return F(λ;θ) for vector lam [n].
+        Return F(lam;θ) for vector lam [n].
         """
         c = self._constrain(theta)
         tau2 = c["tau2"]
