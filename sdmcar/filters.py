@@ -818,7 +818,12 @@ class PolyPosCoeffFilterFullVI(_BasePosCoeffPolyRationalVI):
     """
     Polynomial spectral filter with nonnegative coefficients:
 
-      F(lam) = tau2 * sum_{k=0..K} a_k x^k,  x = lam / max(lam)
+      F(lam) = tau2 * sum_{k=0..K} a_k P_k(x), x = lam / max(lam)
+      
+      where φ_k(x) depends on `mode`:
+
+      mode="increasing"  -> P_k(x) = x^k
+      mode="decreasing"  -> P_k(x) = (1 - x)^k
 
     Unconstrained:
       log_tau2, a0_raw..aK_raw
@@ -827,8 +832,20 @@ class PolyPosCoeffFilterFullVI(_BasePosCoeffPolyRationalVI):
       tau2 = exp(log_tau2)
       a_k = softplus(a_k_raw) >= 0
     """
-    def __init__(self, degree: int = 3, mu_log_tau2: float = 0.0, log_std0: float = -2.3):
+    def __init__(
+        self,
+        degree: int = 3,
+        mu_log_tau2: float = 0.0,
+        log_std0: float = -2.3,
+        mode: str = "increasing",
+    ):
         self.degree = int(degree)
+
+        mode = mode.lower()
+        if mode not in {"increasing", "decreasing"}:
+            raise ValueError("mode must be 'increasing' or 'decreasing'")
+        self.mode = mode
+
         names = ["log_tau2"] + [f"a{k}_raw" for k in range(self.degree + 1)]
         mu0 = {"log_tau2": float(mu_log_tau2)}
         super().__init__(names=names, mu0=mu0, log_std0=log_std0)
@@ -849,10 +866,19 @@ class PolyPosCoeffFilterFullVI(_BasePosCoeffPolyRationalVI):
         c = self._constrain(theta)
         tau2 = c["tau2"]
         a = c["a"]  # [K+1]
+
         lam_max = lam.max().clamp_min(1e-12)
         x = (lam / lam_max).clamp(0.0, 1.0)
+
+        # Switch basis here
+        if self.mode == "increasing":
+            basis_var = x
+        else:  # decreasing
+            basis_var = 1.0 - x
+
         coeffs = [a[k].reshape(()) for k in range(a.numel())]
-        P = _poly_eval(x, coeffs).clamp_min(0.0)
+        P = _poly_eval(basis_var, coeffs).clamp_min(0.0)
+
         return (tau2 * P).reshape(-1)
 
 

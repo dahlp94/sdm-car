@@ -93,18 +93,17 @@ def spectrum_mcmc_mean(filter_module, lam: torch.Tensor, theta_chain: torch.Tens
 
     S = theta_chain.shape[0]
     acc = torch.zeros_like(lam)
+    count = 0
 
     for i in range(0, S, batch):
         chunk = theta_chain[i:i+batch].to(device=device, dtype=dtype)
-        # compute F for each draw in chunk
-        Fs = []
         for j in range(chunk.shape[0]):
             theta = filter_module.unpack(chunk[j])
-            F = filter_module.spectrum(lam, theta)
-            Fs.append(F)
-        acc = acc + torch.stack(Fs, dim=0).mean(dim=0)
+            acc += filter_module.spectrum(lam, theta)
+            count += 1
 
-    return acc / math.ceil(S / batch)
+    return acc / max(count, 1)
+
 
 
 def plot_spectrum_curves(lam_np: np.ndarray, curves: dict[str, np.ndarray], save_path: Path, *, ylog: bool):
@@ -282,6 +281,10 @@ def run_fit(
         "rmse_logF_mcmc": rmse_logF_mcmc,
     }
 
+# Ran these:
+# python -m examples.run_misspec_demo --truth floor --filters car --cases baseline
+# python -m examples.run_misspec_demo --truth floor --filters rational --cases flex_22
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -343,6 +346,13 @@ def main():
     # Prior on beta
     sigma2_beta = 10.0
     prior_V0 = sigma2_beta * torch.eye(X.shape[1], dtype=torch.double, device=device)
+
+    # print("\nAVAILABLE FILTERS/CASES:")
+    # for f in available_filters():
+    #     spec = get_filter_spec(f)
+    #     print(f"  {f}: {list(spec.cases.keys())}")
+    # print()
+
 
     # --------------------------------------------
     # 3) Fit selected filters/cases

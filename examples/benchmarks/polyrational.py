@@ -16,6 +16,7 @@ def build_poly(*, tau2_true: float, eps_car: float, device: torch.device, degree
         degree=degree,
         mu_log_tau2=math.log(tau2_true),
         log_std0=-2.3,
+        **kwargs,
     ).to(device)
 
 
@@ -41,10 +42,10 @@ register(FilterSpec(
         "deg5": CaseSpec(
             case_id="deg5",
             display_name="poly_deg5",
-            fixed={"degree": 5},
+            fixed={"degree": 5, "mode": "decreasing"},
             build_filter=build_poly,
             step_s=0.12,
-            step_theta=lambda f: {"log_tau2": 0.20, **{nm: 0.10 for nm in f.unconstrained_names() if nm.startswith("a")}},
+            step_theta=lambda f: {"log_tau2": 0.20, **{nm: 0.36 for nm in f.unconstrained_names() if nm.startswith("a")}},
         ),
     }
 ))
@@ -100,7 +101,7 @@ register(FilterSpec(
             fixed={"deg_num": 2, "deg_den": 2, "joint_ab": True},
             build_filter=build_rational,
             step_s=0.12,
-            step_theta=lambda f: {"log_tau2": 0.20, **{nm: 0.06 for nm in f.unconstrained_names() if nm != "log_tau2"}},
+            step_theta=lambda f: {"log_tau2": 0.20, **{nm: 0.24 for nm in f.unconstrained_names() if nm != "log_tau2"}},
         ),
     }
 ))
