@@ -121,7 +121,32 @@ class SpectralCAR_FullVI(nn.Module):
         if return_Xt_invSig_X:
             return m_beta, V_beta, Xt_invSig_X
         else:
-            return m_beta, V_beta    
+            return m_beta, V_beta   
+
+    @torch.no_grad()
+    def beta_posterior_plugin(self):
+        """
+        Analytic Gaussian posterior of beta under *plugin* hyperparameters:
+            theta = filter.mean_unconstrained()
+            sigma2 = exp(mu_log_sigma2)   (plugin)
+
+        Returns:
+            m_beta_plugin : [p]
+            V_beta_plugin : [p,p]
+            sigma2_plugin : scalar tensor
+            F_lam_plugin  : [n]
+        """
+        theta_mean = self.filter.mean_unconstrained()
+
+        # plugin sigma^2 (consistent with your current plugin usage)
+        sigma2 = torch.exp(self.mu_log_sigma2).clamp_min(1e-12)
+
+        F_lam = self.filter.spectrum(self.lam, theta_mean)  # [n]
+        var = (F_lam + sigma2).clamp_min(1e-12)
+        inv_var = 1.0 / var
+
+        m_beta, V_beta = self._beta_update(inv_var, return_Xt_invSig_X=False)
+        return m_beta.detach(), V_beta.detach(), sigma2.detach(), F_lam.detach() 
     
 
     def _kl_beta(self, m_beta, V_beta):
@@ -326,69 +351,43 @@ class SpectralCAR_FullVI(nn.Module):
 
     
     @torch.no_grad()
-    def posterior_phi(
-        self,
-        mode: str = "plugin",      # "plugin" or "mc"
-        num_mc: int = 32,          # used only if mode=="mc"
-    ):
+    def posterior_phi(self, mode: str = "plugin", num_mc: int = 32):
         """
-        Posterior summaries for the spatial effect phi.
-
-        Model:
-            phi = U z,
-            z | (y, beta, theta, s) ~ N( mu_z, diag(v_spec) ),
-            mu_z   = (F / (F + sigma2)) (element-wise-multiply) (U^T r),
-            v_spec = F sigma2 / (F + sigma2),
-            r = y - X E_q[beta].
-
-        Modes
-        -----
-        plugin:
-            Conditional posterior given mean hyperparameters
-            (theta = E_q[theta], s = E_q[s]).
-            Fast, deterministic.
-
-        mc:
-            Variational marginal posterior integrating over q(theta) q(s)
-            using Monte Carlo and total variance decomposition.
-            Slower, uncertainty-aware.
-
-        Returns
-        -------
-        mean_phi : (n,)
-            Posterior mean of phi in node space.
-        var_phi_diag : (n,)
-            Node-wise marginal posterior variance of phi.
+        Returns:
+            mean_phi : [n]
+            var_phi_diag : [n]
         """
 
-        # residual using posterior mean of beta
-        r = self.y - self.X @ self.m_beta
-        r_tilde = self.U.T @ r
-
-        # --------------------------------------------------
-        # (A) Plug-in hyperparameters
-        # --------------------------------------------------
+        # ---------------------------
+        # (A) plugin
+        # ---------------------------
         if mode == "plugin":
             theta_mean = self.filter.mean_unconstrained()
-            sigma2 = torch.exp(self.mu_log_sigma2).clamp_min(1e-12)
-            F_lam = self.filter.spectrum(self.lam, theta_mean) # can clamp to 0.0
 
+            # plugin sigma2: lognormal mean (ok)
+            std_s = torch.exp(self.log_std_log_sigma2)
+            sigma2 = torch.exp(self.mu_log_sigma2 + 0.5 * std_s**2).clamp_min(1e-12)
+
+            F_lam = self.filter.spectrum(self.lam, theta_mean).clamp_min(0.0)
             denom = (F_lam + sigma2).clamp_min(1e-12)
-            w = F_lam / denom
+            inv_var = 1.0 / denom
 
-            # spectral posterior
+            # plugin-consistent beta
+            m_beta_plugin, _ = self._beta_update(inv_var, return_Xt_invSig_X=False)
+
+            r_tilde = self.U.T @ (self.y - self.X @ m_beta_plugin)
+
+            w = F_lam / denom
             mu_z = w * r_tilde
             v_spec = F_lam * sigma2 / denom
 
-            # node space
             mean_phi = self.U @ mu_z
             var_phi_diag = (self.U ** 2) @ v_spec
-
             return mean_phi, var_phi_diag
 
-        # --------------------------------------------------
-        # (B) MC-integrated over q(theta, s)
-        # --------------------------------------------------
+        # ---------------------------
+        # (B) mc over q(theta) q(s)
+        # ---------------------------
         elif mode == "mc":
             if num_mc <= 0:
                 raise ValueError("num_mc must be positive for mode='mc'.")
@@ -406,12 +405,17 @@ class SpectralCAR_FullVI(nn.Module):
 
                 # sample theta
                 theta = self.filter.sample_unconstrained()
-                F_lam = self.filter.spectrum(self.lam, theta) # can clamp to 0.0
+                F_lam = self.filter.spectrum(self.lam, theta).clamp_min(0.0)
 
                 denom = (F_lam + sigma2).clamp_min(1e-12)
-                w = F_lam / denom
+                inv_var = 1.0 / denom
 
-                mu_z = w * r_tilde
+                # draw-consistent beta for this (theta, s)
+                m_beta_k, _ = self._beta_update(inv_var, return_Xt_invSig_X=False)
+                r_tilde_k = self.U.T @ (self.y - self.X @ m_beta_k)
+
+                w = F_lam / denom
+                mu_z = w * r_tilde_k
                 v_spec = F_lam * sigma2 / denom
 
                 mean_phi_k = self.U @ mu_z
@@ -422,16 +426,9 @@ class SpectralCAR_FullVI(nn.Module):
                 var_within_acc += var_phi_k
 
             K = float(num_mc)
-
-            # total variance decomposition
             mean_phi = mean_acc / K
-            var_phi_diag = (
-                var_within_acc / K
-                + (mean2_acc / K - mean_phi ** 2)
-            )
-
+            var_phi_diag = var_within_acc / K + (mean2_acc / K - mean_phi ** 2)
             return mean_phi, var_phi_diag
 
         else:
             raise ValueError("mode must be one of {'plugin', 'mc'}.")
-
