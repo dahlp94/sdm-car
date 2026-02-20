@@ -19,7 +19,7 @@ def build_classic_car(*, tau2_true: float, eps_car: float, device: torch.device,
 
 register(
     FilterSpec(
-        filter_name="car",
+        filter_name="classic_car",
         cases={
             "baseline": CaseSpec(
                 case_id="baseline",
