@@ -234,6 +234,7 @@ def run_case(
         tau2_true=tau2_true,
         eps_car=eps_car,
         device=device,
+        lam_max=float(lam.max().item()),
         **fixed,
     )
 
@@ -368,6 +369,41 @@ def run_case(
 
     theta_raw, theta_constr = decode_theta_chain(out, model.filter)
 
+    # integrating ridge diagnostics
+    from sdmcar.diagnostics import ridge_report, plot_corr_heatmap, spectrum_draw_sd
+
+    theta_draws = out["theta"].detach().cpu().numpy()
+    theta_names = out["theta_names"]
+
+    # filter-aware highlights, but safe if missing
+    highlight_pairs = [
+        ("rho0_raw", "nu_raw"),
+        ("log_tau2", "rho0_raw"),
+        ("log_tau2", "nu_raw"),
+        ("rho_raw", "log_tau2"),   # Leroux case
+    ]
+
+    rep = ridge_report(theta_draws, theta_names, topk=10, highlight_pairs=highlight_pairs)
+
+    print("\nPosterior correlation ridge summary:")
+    print(f"  max |corr| = {rep['max_abs_corr']:.3f}")
+    print(f"  mean |corr| = {rep['mean_abs_corr']:.3f}")
+    for a, b, corr, abs_corr in rep["top_pairs"]:
+        print(f"  {a:>14s} vs {b:<14s} corr={corr:+.3f} |corr|={abs_corr:.3f}")
+
+    if rep["highlights"]:
+        print("  highlighted:")
+        for a, b, corr in rep["highlights"]:
+            print(f"    {a} vs {b}: corr={corr:+.3f}")
+
+    plot_corr_heatmap(
+        rep["R"], rep["names"],
+        title=f"Posterior corr — {filter_name}/{case_spec.display_name}",
+        save_path=str(case_dir / "posterior_corr_heatmap.png"),
+        max_vars=18,
+    )
+
+
     # these exist for most of your current filters
     tau2_chain = theta_constr.get("tau2", None)  # np.ndarray [S] or None
     rho0_chain = theta_constr.get("rho0", None)
@@ -380,6 +416,16 @@ def run_case(
     phi_mean_mcmc = np.mean(phi_mean_chain, axis=0)
     rmse_phi_mcmc = float(np.sqrt(np.mean((phi_mean_mcmc - phi_true.cpu().numpy()) ** 2)))
     print(f"MCMC RMSE(phi_mean, phi_true) = {rmse_phi_mcmc:.4f}")
+
+    mean_sd_logF, sd_curve = spectrum_draw_sd(
+        lam,
+        model.filter,
+        out["theta"],
+        out["theta_names"],
+    )
+
+    print(f"Functional ridge (mean SD log F) = {mean_sd_logF:.4f}")
+
 
     # family-specific param transforms
     named = {}
@@ -547,6 +593,12 @@ def run_case(
             **({ "rho0": float(np.mean(rho0_chain)) } if rho0_chain is not None else {}),
             **({ "nu": float(np.mean(nu_chain)) } if nu_chain is not None else {}),
         },
+        "ridge": {
+            "max_abs_corr": rep["max_abs_corr"],
+            "mean_abs_corr": rep["mean_abs_corr"],
+            "top_pairs": rep["top_pairs"][:10],
+            "highlights": rep["highlights"],
+        },
     }
 
     # -------------------------
@@ -595,6 +647,10 @@ def main():
     help="Fast mode for CI / smoke tests (fewer VI iters and MCMC steps)",
 )
 
+    # print("--- I am here ---")
+    # print()
+    # print(available_filters())
+    # print()
     args = parser.parse_args()
 
     # -------------------------
@@ -657,7 +713,7 @@ def main():
     F_car = tau2_true / (lam + eps_car)
     F_true = F_car
 
-    z_true = torch.sqrt(F_car) * torch.randn(n, dtype=torch.double, device=device)
+    z_true = torch.sqrt(F_true) * torch.randn(n, dtype=torch.double, device=device)
     phi_true = U @ z_true
 
     x_coord = coords[:, 0]
