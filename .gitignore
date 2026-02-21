@@ -5,3 +5,10 @@ __pycache__/
 *.png
 *.json
 *.csv
+
+data/raw/
+data/processed/
+data/graph/
+data/eigs/
+results/
+figures/
