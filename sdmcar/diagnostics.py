@@ -310,3 +310,211 @@ def spectrum_error_log_l1(
     )
 
     return float(log_diff.mean().cpu().item())
+
+def posterior_corr_matrix(
+    theta_draws: np.ndarray,
+    theta_names: list[str],
+    *,
+    drop: set[str] | None = None,
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Compute posterior correlation matrix for MCMC draws.
+
+    Args:
+        theta_draws: [S, d] array of unconstrained draws.
+        theta_names: list of length d, names for columns.
+        drop: optional set of names to remove (e.g., {"const"}).
+
+    Returns:
+        R: [d', d'] correlation matrix
+        names: filtered names corresponding to R
+    """
+    if theta_draws.ndim != 2:
+        raise ValueError(f"theta_draws must be 2D [S,d], got shape {theta_draws.shape}")
+    _, d = theta_draws.shape # S is unused
+    if len(theta_names) != d:
+        raise ValueError(f"theta_names length {len(theta_names)} != d {d}")
+
+    keep_idx = list(range(d))
+    if drop:
+        keep_idx = [j for j, nm in enumerate(theta_names) if nm not in drop]
+
+    X = theta_draws[:, keep_idx].astype(np.float64)
+    names = [theta_names[j] for j in keep_idx]
+
+    # Guard against constant columns
+    std = X.std(axis=0, ddof=1)
+    good = std > 1e-12
+    if not np.all(good):
+        # bad_names = [names[i] for i in range(len(names)) if not good[i]]
+        # remove constant cols
+        X = X[:, good]
+        names = [nm for nm, ok in zip(names, good) if ok]
+
+    # corrcoef expects variables in rows if rowvar=True; we want columns as vars
+    R = np.corrcoef(X, rowvar=False)
+    return R, names
+
+
+def ridge_strength_summary(R: np.ndarray, names: list[str], *, topk: int = 5) -> dict:
+    """
+    Simple ridge strength metrics from correlation matrix.
+    Robust to d=0 / d=1 cases where np.corrcoef can return a scalar.
+    """
+    R = np.asarray(R)
+
+    # ---- handle scalar correlation (single parameter) ----
+    # np.corrcoef(x) with x shape (S,) returns scalar 1.0 (ndim=0)
+    if R.ndim == 0:
+        R = R.reshape(1, 1)
+
+    # ---- handle empty / degenerate cases ----
+    d = R.shape[0] if R.ndim >= 2 else 0
+    if d <= 1:
+        return {
+            "max_abs_corr": 0.0,
+            "mean_abs_corr": 0.0,
+            "top_pairs": [],
+        }
+
+    if R.shape != (d, d):
+        raise ValueError(f"R must be square, got shape {R.shape}")
+
+    # off-diagonal absolute correlations
+    absR = np.abs(R.copy())
+    np.fill_diagonal(absR, 0.0)
+
+    # top-k pairs
+    iu = np.triu_indices(d, k=1)
+    vals = absR[iu]
+    order = np.argsort(vals)[::-1]
+    topk = min(topk, len(vals))
+
+    top_pairs = []
+    for idx in order[:topk]:
+        i = iu[0][idx]
+        j = iu[1][idx]
+        top_pairs.append((names[i], names[j], float(R[i, j]), float(absR[i, j])))
+
+    return {
+        "max_abs_corr": float(vals.max()) if len(vals) else 0.0,
+        "mean_abs_corr": float(vals.mean()) if len(vals) else 0.0,
+        "top_pairs": top_pairs,
+    }
+
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def plot_corr_heatmap(
+    R: np.ndarray,
+    names: list[str],
+    *,
+    title: str,
+    save_path: str,
+    max_vars: int = 18,
+):
+    """
+    Plot correlation heatmap for a correlation matrix R.
+    Robust to the single-parameter case where R can be a scalar.
+    """
+    R = np.asarray(R)
+
+    # Handle scalar corrcoef output (single variable)
+    if R.ndim == 0:
+        R = R.reshape(1, 1)
+
+    d = R.shape[0] if R.ndim >= 2 else 0
+    if d <= 1:
+        # nothing meaningful to plot; still write a tiny figure so pipeline doesn't break
+        plt.figure(figsize=(4, 2.2))
+        plt.title(title + " (d<=1)")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=200)
+        plt.close()
+        return
+
+    if R.shape != (d, d):
+        raise ValueError(f"R must be square, got shape {R.shape}")
+
+    # Optionally truncate to max_vars
+    if d > max_vars:
+        R = R[:max_vars, :max_vars]
+        names = names[:max_vars]
+        d = max_vars
+
+    plt.figure(figsize=(0.45 * d + 3, 0.45 * d + 2))
+    plt.imshow(R, vmin=-1.0, vmax=1.0)
+    plt.colorbar(fraction=0.046, pad=0.04)
+    plt.xticks(range(d), names, rotation=90, fontsize=8)
+    plt.yticks(range(d), names, fontsize=8)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+
+def ridge_report(
+    theta_draws: np.ndarray,
+    theta_names: list[str],
+    *,
+    drop: set[str] | None = None,
+    topk: int = 8,
+    highlight_pairs: list[tuple[str, str]] | None = None,
+) -> dict:
+    """
+    Convenience wrapper: correlation matrix + top pairs + optional highlighted pairs.
+    """
+    R, names = posterior_corr_matrix(theta_draws, theta_names, drop=drop)
+    summ = ridge_strength_summary(R, names, topk=topk)
+
+    highlights = []
+    if highlight_pairs:
+        name_to_idx = {nm: i for i, nm in enumerate(names)}
+        for a, b in highlight_pairs:
+            if a in name_to_idx and b in name_to_idx:
+                i, j = name_to_idx[a], name_to_idx[b]
+                highlights.append((a, b, float(R[i, j])))
+
+    summ["R"] = R
+    summ["names"] = names
+    summ["highlights"] = highlights
+    return summ
+
+
+def spectrum_draw_sd(
+    lam: torch.Tensor,
+    filter_module,
+    theta_draws: torch.Tensor,
+    theta_names: list[str],
+):
+    """
+    Computes SD of log F(λ) across MCMC draws.
+
+    Returns:
+        mean_sd_logF : scalar
+        sd_curve     : np.ndarray shape [n]
+    """
+    device = lam.device
+    dtype = lam.dtype
+
+    S, d = theta_draws.shape
+    n = lam.numel()
+
+    logF = torch.zeros(S, n, dtype=dtype, device=device)
+
+    for i in range(S):
+        # For each draw do:
+        theta_dict = {
+            theta_names[j]: theta_draws[i, j].reshape(1)
+            for j in range(d)
+        }
+        # Build spectral variance for that draw
+        F = filter_module.spectrum(lam, theta_dict).clamp_min(1e-12)
+        logF[i] = torch.log(F)
+
+    sd_curve = logF.std(dim=0)
+    mean_sd = sd_curve.mean()
+
+    return float(mean_sd.item()), sd_curve.detach().cpu().numpy()
