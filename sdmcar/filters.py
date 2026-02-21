@@ -182,7 +182,316 @@ class BaseSpectralFilter(nn.Module):
     def spectrum(self, lam: torch.Tensor, theta: dict[str, torch.Tensor]) -> torch.Tensor:
         return self.spectrum_from_unconstrained(lam, theta)
 
+# -----------------------------
+# Log-spline spectral filter
+# -----------------------------
 
+def _make_open_uniform_knots(t_min: float, t_max: float, n_internal: int, degree: int, device, dtype):
+    """
+    Open-uniform knot vector with boundary multiplicity (degree+1).
+    Total knots = (degree+1) + n_internal + (degree+1).
+    """
+    if t_max <= t_min:
+        raise ValueError(f"Need t_max > t_min, got {t_min} >= {t_max}")
+    if n_internal < 0:
+        raise ValueError("n_internal must be >= 0")
+    if degree < 0:
+        raise ValueError("degree must be >= 0")
+
+    left = torch.full((degree + 1,), float(t_min), device=device, dtype=dtype)
+    right = torch.full((degree + 1,), float(t_max), device=device, dtype=dtype)
+
+    if n_internal == 0:
+        internal = torch.empty((0,), device=device, dtype=dtype)
+    else:
+        internal = torch.linspace(float(t_min), float(t_max), steps=n_internal + 2, device=device, dtype=dtype)[1:-1]
+
+    return torch.cat([left, internal, right], dim=0)
+
+
+def _bspline_basis_1d(t: torch.Tensor, knots: torch.Tensor, degree: int) -> torch.Tensor:
+    """
+    Cox–de Boor recursion for B-spline basis values.
+
+    Args:
+        t:     [n] evaluation points
+        knots: [K] knot vector (nondecreasing)
+        degree: spline degree (e.g. 3 for cubic)
+
+    Returns:
+        B: [n, J] basis matrix, where J = len(knots) - degree - 1
+    """
+    # J basis functions
+    K = knots.numel()
+    J = K - degree - 1
+    if J <= 0:
+        raise ValueError("Invalid knots/degree: need len(knots) > degree+1")
+
+    n = t.numel()
+    t = t.reshape(-1)
+
+    # degree 0 basis
+    # N_{i,0}(t) = 1 if knots[i] <= t < knots[i+1], else 0
+    B = torch.zeros((n, J), dtype=t.dtype, device=t.device)
+    for i in range(J):
+        left = knots[i]
+        right = knots[i + 1]
+        B[:, i] = ((t >= left) & (t < right)).to(t.dtype)
+
+    # include the right boundary at the very end (so last basis is 1 at t==t_max)
+    t_max = knots[-1]
+    B[t == t_max, :] = 0.0
+    B[t == t_max, -1] = 1.0
+
+    # elevate degree
+    for k in range(1, degree + 1):
+        B_new = torch.zeros_like(B)
+        for i in range(J):
+            denom1 = knots[i + k] - knots[i]
+            denom2 = knots[i + k + 1] - knots[i + 1]
+
+            term1 = 0.0
+            if float(denom1) != 0.0:
+                term1 = (t - knots[i]) / denom1 * B[:, i]
+
+            term2 = 0.0
+            if i + 1 < J and float(denom2) != 0.0:
+                term2 = (knots[i + k + 1] - t) / denom2 * B[:, i + 1]
+
+            B_new[:, i] = term1 + term2
+
+        B = B_new
+
+    return B
+
+
+class LogSplineFilterFullVI(BaseSpectralFilter):
+    """
+    Log-spline spectral filter (high ROI flexible shape model):
+
+        log F(λ) = log τ^2 + s( log(λ + ρ0) ) - s( log(ρ0) )
+        F(λ)     = exp( log F(λ) )
+
+    - s(.) is a B-spline expansion on t = log(λ + ρ0).
+    - The subtraction s(log(ρ0)) anchors the spline so τ^2 keeps a stable meaning
+      (roughly the marginal scale at the lowest frequency).
+
+    Unconstrained variables:
+        log_tau2
+        (optional) rho0_raw   where rho0 = softplus(rho0_raw) > 0
+        w_0, ..., w_{J-1}     spline coefficients (unconstrained)
+
+    Variational family:
+        diagonal Gaussians over all unconstrained coords.
+
+    Priors (default via BaseSpectralFilter.log_prior / VI KL):
+        standard normal on all unconstrained coords.
+    """
+
+    def __init__(
+        self,
+        *,
+        lam_max: float,
+        eps_car: float,
+        degree: int = 3,
+        n_internal_knots: int = 8,
+        mu_log_tau2: float = 0.0,
+        log_std0: float = -2.3,
+        learn_rho0: bool = False,
+        mu_rho0_raw: float = -6.0,
+        log_std_rho0_raw: float = -2.3,
+        prior_mu_w: float = 0.0,
+        prior_std_w: float = 0.5,
+    ):
+        super().__init__()
+        if eps_car <= 0:
+            raise ValueError("eps_car must be > 0")
+        if lam_max <= 0:
+            raise ValueError("lam_max must be > 0")
+
+        self.prior_mu_w = float(prior_mu_w)
+        self.prior_std_w = float(prior_std_w)
+        if self.prior_std_w <= 0:
+            raise ValueError("prior_std_w must be > 0")
+
+        self.degree = int(degree)
+        self.n_internal_knots = int(n_internal_knots)
+        self.eps_car = float(eps_car)
+        self.lam_max = float(lam_max)
+        self.learn_rho0 = bool(learn_rho0)
+
+        # Define spline domain using eps_car as the reference rho0.
+        # This keeps knots fixed (important for stable optimization/MH).
+        t_min = math.log(self.eps_car)
+        t_max = math.log(self.lam_max + self.eps_car)
+
+        # knots buffer
+        # NOTE: device/dtype will follow parameters; we rebuild knots on the fly in _basis()
+        self._t_min = float(t_min)
+        self._t_max = float(t_max)
+
+        # Number of basis functions J = len(knots) - degree - 1
+        # len(knots) = 2*(degree+1) + n_internal_knots
+        self.J = (2 * (self.degree + 1) + self.n_internal_knots) - self.degree - 1
+
+        # ---- variational parameters ----
+        self.mu_log_tau2 = nn.Parameter(torch.tensor([mu_log_tau2], dtype=torch.double))
+        self.log_std_log_tau2 = nn.Parameter(torch.tensor([log_std0], dtype=torch.double))
+
+        if self.learn_rho0:
+            self.mu_rho0_raw = nn.Parameter(torch.tensor([mu_rho0_raw], dtype=torch.double))
+            self.log_std_rho0_raw = nn.Parameter(torch.tensor([log_std_rho0_raw], dtype=torch.double))
+        else:
+            self.mu_rho0_raw = None
+            self.log_std_rho0_raw = None
+
+        # spline weights
+        self.mu_w = nn.Parameter(torch.zeros(self.J, dtype=torch.double))
+        self.log_std_w = nn.Parameter(torch.full((self.J,), float(log_std0), dtype=torch.double))
+
+    def _knots(self, device, dtype) -> torch.Tensor:
+        return _make_open_uniform_knots(
+            self._t_min, self._t_max, self.n_internal_knots, self.degree, device=device, dtype=dtype
+        )
+
+    def _basis(self, t: torch.Tensor) -> torch.Tensor:
+        knots = self._knots(device=t.device, dtype=t.dtype)
+        return _bspline_basis_1d(t, knots, self.degree)  # [n, J]
+
+    # ---------- BaseSpectralFilter API ----------
+
+    def unconstrained_names(self) -> list[str]:
+        names = ["log_tau2"]
+        if self.learn_rho0:
+            names.append("rho0_raw")
+        names += [f"w{i}" for i in range(self.J)]
+        return names
+
+    def blocks(self) -> list[ParamBlock]:
+        blocks = [ParamBlock.single("log_tau2")]
+        if self.learn_rho0:
+            blocks.append(ParamBlock.single("rho0_raw"))
+        blocks.append(ParamBlock(name="w", param_names=tuple([f"w{i}" for i in range(self.J)])))
+        return blocks
+
+    def sample_unconstrained(self) -> dict[str, torch.Tensor]:
+        out = {}
+
+        # log_tau2
+        eps = torch.randn_like(self.mu_log_tau2)
+        out["log_tau2"] = (self.mu_log_tau2 + torch.exp(self.log_std_log_tau2) * eps).reshape(1)
+
+        # rho0_raw
+        if self.learn_rho0:
+            epsr = torch.randn_like(self.mu_rho0_raw)
+            out["rho0_raw"] = (self.mu_rho0_raw + torch.exp(self.log_std_rho0_raw) * epsr).reshape(1)
+
+        # w
+        epsw = torch.randn_like(self.mu_w)
+        w = self.mu_w + torch.exp(self.log_std_w) * epsw
+        for i in range(self.J):
+            out[f"w{i}"] = w[i:i+1]
+
+        return out
+
+    @torch.no_grad()
+    def mean_unconstrained(self) -> dict[str, torch.Tensor]:
+        out = {"log_tau2": self.mu_log_tau2.detach().reshape(1)}
+        if self.learn_rho0:
+            out["rho0_raw"] = self.mu_rho0_raw.detach().reshape(1)
+        w = self.mu_w.detach()
+        for i in range(self.J):
+            out[f"w{i}"] = w[i:i+1]
+        return out
+    def log_prior(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        log p(theta_unconstrained) used by MCMC MH ratio.
+
+        Priors:
+        log_tau2 ~ N(0,1)
+        rho0_raw ~ N(0,1)  (if learn_rho0)
+        w_i      ~ N(prior_mu_w, prior_std_w^2)
+        """
+        # dtype/device anchor
+        anchor = theta["log_tau2"]
+        dtype, device = anchor.dtype, anchor.device
+
+        lp = torch.zeros((), dtype=dtype, device=device)
+
+        # log_tau2 prior
+        lp = lp + Normal(0.0, 1.0).log_prob(theta["log_tau2"].reshape(())).sum()
+
+        # rho0_raw prior (if learned)
+        if self.learn_rho0:
+            lp = lp + Normal(0.0, 1.0).log_prob(theta["rho0_raw"].reshape(())).sum()
+
+        # w prior
+        mu = torch.tensor(self.prior_mu_w, dtype=dtype, device=device)
+        std = torch.tensor(self.prior_std_w, dtype=dtype, device=device)
+        Nw = Normal(mu, std)
+
+        w_vec = torch.stack([theta[f"w{i}"].reshape(()) for i in range(self.J)], dim=0)
+        lp = lp + Nw.log_prob(w_vec).sum()
+
+        return lp
+
+    def kl_q_p(self) -> torch.Tensor:
+        # log_tau2 prior stays standard normal
+        kl = kl_normal_std(self.mu_log_tau2, self.log_std_log_tau2).sum()
+
+        # rho0_raw prior stays standard normal (unless you later customize it)
+        if self.learn_rho0:
+            kl = kl + kl_normal_std(self.mu_rho0_raw, self.log_std_rho0_raw).sum()
+
+        # NEW: w prior is Normal(prior_mu_w, prior_std_w^2)
+        kl = kl + kl_normal_to_normal(
+            self.mu_w, self.log_std_w,
+            mu_p=self.prior_mu_w,
+            std_p=self.prior_std_w,
+        ).sum()
+
+        return kl
+
+    def _constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        log_tau2 = theta["log_tau2"].reshape(())
+        tau2 = torch.exp(log_tau2)
+
+        if self.learn_rho0:
+            rho0 = softplus(theta["rho0_raw"].reshape(()))
+        else:
+            rho0 = torch.tensor(self.eps_car, dtype=log_tau2.dtype, device=log_tau2.device)
+
+        w = torch.stack([theta[f"w{i}"].reshape(()) for i in range(self.J)], dim=0)  # [J]
+        return {"tau2": tau2, "rho0": rho0, "w": w}
+
+    def spectrum_from_unconstrained(self, lam: torch.Tensor, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        c = self._constrain(theta)
+        tau2, rho0, w = c["tau2"], c["rho0"], c["w"]
+
+        # t = log(lam + rho0)
+        t = torch.log((lam + rho0).clamp_min(1e-12))
+        B = self._basis(t)  # [n, J]
+        s = B @ w           # [n]
+
+        # anchor at lam=0 => t0 = log(rho0)
+        t0 = torch.log(rho0.clamp_min(1e-12)).reshape(1)
+        B0 = self._basis(t0)        # [1, J]
+        s0 = (B0 @ w).reshape(())   # scalar
+
+        logF = torch.log(tau2.clamp_min(1e-12)) + (s - s0)
+        F = torch.exp(logF).clamp_min(1e-12)
+        return F.reshape(-1)
+
+    @torch.no_grad()
+    def mean_params(self):
+        """
+        For your printing helpers: returns (tau2_mean, a_mean).
+        We'll return a_mean = [rho0] (constrained), like invlinear/matern style.
+        """
+        theta = self.mean_unconstrained()
+        c = self._constrain(theta)
+        return c["tau2"].reshape(()), c["rho0"].reshape(1)
+    
 class DiffusionFilterFullVI(BaseSpectralFilter):
     """
     Variational diffusion filter:
