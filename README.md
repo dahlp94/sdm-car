@@ -98,13 +98,25 @@ All filters are implemented under a unified interface and support **both VI and 
 | Polynomial / Rational | Low-order polynomial or rational functions of $\lambda$    | Structured parametric flexibility      |
 | Log-spline            | $\tau^2(\lambda+\rho_0)^{-1} \exp\{s(\lambda)\}$            | Semi-nonparametric spectral correction |
 
-Each filter specifies:
+Where:
+
+* $s(\lambda)$ in **Log-spline** is a B-spline expansion over $[0, \lambda_{\max}]$.
+* Polynomial/Rational filters allow low-degree flexible approximations to unknown spectra.
+* Leroux provides a proper CAR with bounded spectrum.
+* Classic CAR fixes the ridge parameter to a known $\varepsilon_{\text{car}}$.
+
+---
+
+### Unified design
+
+Each filter family defines:
 
 * unconstrained parameterization,
 * positivity-preserving transforms,
 * KL divergence to priors (for VI),
-* block structure for MCMC proposals.
-
+* block structure for MCMC proposals,
+* `pack()` / `unpack()` API for sampler compatibility,
+* compatibility with the benchmark registry system.
 ---
 
 ## 5. Inference methods
