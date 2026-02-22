@@ -173,6 +173,7 @@ def run_fit(
     filter_module = case_spec.build_filter(
         tau2_true=tau2_init,
         eps_car=eps_car,
+        lam_max=float(lam.max().detach().cpu()),
         device=device,
         **case_spec.fixed,
     )
