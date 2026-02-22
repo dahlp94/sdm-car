@@ -249,6 +249,7 @@ def build_filter_from_registry(
     device: torch.device,
     eps_car: float,
     tau2_true: float,
+    lam_max: float,
 ) -> torch.nn.Module:
     """
     Build filter module via FilterSpec/CaseSpec registry.
@@ -267,6 +268,7 @@ def build_filter_from_registry(
         device=device,
         tau2_true=float(tau2_true),
         eps_car=float(eps_car),
+        lam_max=float(lam_max),
         **fixed_resolved,
     )
 
@@ -710,6 +712,7 @@ def main():
             device=device,
             eps_car=args.eps_car,
             tau2_true=args.tau2_true,
+            lam_max=float(lam.max().detach().cpu()),
         )
 
         model = fit_model_once(
