@@ -17,6 +17,39 @@ All inference—VI or MCMC, across any filter family—is executed through a sin
 
 ---
 
+## Design decisions and tradeoffs
+
+SDM-CAR was designed around several practical constraints:
+
+### Scalability vs Expressiveness
+Dense Gaussian process models scale as $O(n^3)$ and are impractical for large spatial graphs. Classical CAR models are computationally efficient but structurally rigid.
+
+**Decision:** Represent spatial covariance in the graph spectral domain so that:
+- covariance is diagonal in the eigenbasis,
+- inference reduces to elementwise operations,
+- flexibility is introduced via $F(\lambda)$ instead of dense matrices.
+
+---
+
+### Flexibility vs Identifiability
+Highly flexible spectral parameterizations can introduce ridges and non-identifiability.
+
+**Decision:** 
+- enforce positivity through constrained parameterizations,
+- structure MCMC proposals in parameter blocks,
+- implement ridge diagnostics and spectrum error metrics,
+- benchmark VI against collapsed MCMC.
+
+---
+
+### Approximate vs Exact Inference
+Variational inference is fast but may underestimate uncertainty. MCMC is accurate but computationally heavier.
+
+**Decision:**
+- implement both collapsed VI and collapsed MCMC,
+- ensure they operate on identical abstractions,
+- directly quantify discrepancies between them.
+
 ## 1. Overview
 
 Conditional Autoregressive (CAR) models are widely used for spatially indexed data, but rely on fixed neighborhood-based precision structures that limit expressiveness and adaptability.
@@ -278,7 +311,7 @@ This repository is intended for:
 * development of structured covariance models on graphs,
 * reproducible comparison of CAR and CAR-generalized models.
 
-It is **not** optimized as a production library.
+It is not optimized as a production library. Instead, it is structured to demonstrate architectural decisions, inference tradeoffs, and robustness under misspecification—core concerns in research and advanced ML system design.
 
 ---
 
