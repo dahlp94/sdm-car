@@ -57,7 +57,7 @@ Conditional Autoregressive (CAR) models are widely used for spatially indexed da
 SDM-CAR replaces fixed CAR precision matrices with **parametric spectral filters of a graph Laplacian**, yielding a flexible covariance model of the form
 
 $$
-\Sigma_\phi = U ,\mathrm{diag}!\big(F(\lambda;\theta)\big), U^\top,
+\Sigma_\phi = U \mathrm{diag}\big(F(\lambda;\theta)\big) U^\top,
 $$
 
 where $L = U \mathrm{diag}(\lambda) U^\top$ is the Laplacian of a user-defined graph and $F(\lambda;\theta) \ge 0$ is a learnable spectral filter.
@@ -112,9 +112,8 @@ Planned future directions include:
 * learned or data-driven graph structures,
 * sparse eigensolvers for large-scale graphs,
 * structured priors over graph spectra.
-
 These extensions would further demonstrate the generality of the spectral framework beyond grid-based spatial settings.
----
+
 
 ## 2. Model formulation
 
