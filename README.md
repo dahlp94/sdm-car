@@ -89,11 +89,14 @@ This guarantees that SDM-CAR strictly contains classical CAR as a special case a
 
 All filters are implemented under a unified interface and support **both VI and MCMC**.
 
-| Filter family      | Spectrum $F(\lambda)$              | Interpretation       |
-| ------------------ | ---------------------------------- | -------------------- |
-| Inverse-linear CAR | $\tau^2 / (\lambda + \rho_0)$      | Exact CAR            |
-| Matérn-like        | $\tau^2 (\lambda + \rho_0)^{-\nu}$ | Learnable smoothness |
-| Diffusion          | $\tau^2 \exp(-a\lambda)$           | Heat-kernel behavior |
+| Filter family         | Spectrum $F(\lambda)$                                      | Interpretation                         |
+| --------------------- | ----------------------------------------------------------- | -------------------------------------- |
+| Classic CAR           | $\tau^2 / (\lambda + \varepsilon_{\text{car}})$            | Classical intrinsic CAR (fixed ridge)  |
+| Inverse-linear CAR    | $\tau^2 / (\lambda + \rho_0)$                               | Proper CAR with learnable ridge        |
+| Leroux CAR            | $\tau^2 / \big((1-\rho) + \rho \lambda\big)$                | Convex blend of IID and CAR            |
+| Matérn-like           | $\tau^2 (\lambda + \rho_0)^{-\nu}$                          | Learnable smoothness exponent          |
+| Polynomial / Rational | Low-order polynomial or rational functions of $\lambda$    | Structured parametric flexibility      |
+| Log-spline            | $\tau^2(\lambda+\rho_0)^{-1} \exp\{s(\lambda)\}$            | Semi-nonparametric spectral correction |
 
 Each filter specifies:
 
