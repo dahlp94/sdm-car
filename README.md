@@ -52,17 +52,68 @@ Variational inference is fast but may underestimate uncertainty. MCMC is accurat
 
 ## 1. Overview
 
-Conditional Autoregressive (CAR) models are widely used for spatially indexed data, but rely on fixed neighborhood-based precision structures that limit expressiveness and adaptability.
+Conditional Autoregressive (CAR) models are widely used for spatially indexed data, but they rely on fixed neighborhood-based precision structures that restrict flexibility and impose strong structural assumptions.
 
-SDM-CAR replaces fixed CAR precision matrices with **parametric spectral filters of the graph Laplacian**, yielding:
+SDM-CAR replaces fixed CAR precision matrices with **parametric spectral filters of a graph Laplacian**, yielding a flexible covariance model of the form
 
-* a strict generalization of CAR models,
-* interpretable parameters controlling variance, range, and smoothness,
-* exact CAR recovery as a special case,
-* scalable inference via spectral diagonalization.
+$$
+\Sigma_\phi = U ,\mathrm{diag}!\big(F(\lambda;\theta)\big), U^\top,
+$$
 
-Both **collapsed variational inference** and **collapsed MCMC** are implemented under a shared abstraction, enabling principled comparison between approximate and exact inference.
+where $L = U \mathrm{diag}(\lambda) U^\top$ is the Laplacian of a user-defined graph and $F(\lambda;\theta) \ge 0$ is a learnable spectral filter.
 
+This formulation:
+
+* strictly generalizes classical CAR models,
+* provides interpretable parameters controlling variance, range, and smoothness,
+* recovers CAR exactly as a special case,
+* separates **graph construction** from **covariance modeling**,
+* enables scalable inference via spectral diagonalization.
+
+Importantly, SDM-CAR is **graph-based rather than distance-based**.
+Spatial dependence is defined relative to the spectrum of an arbitrary graph Laplacian — not directly as a function of Euclidean distance. This allows the framework to operate on any domain where a meaningful graph structure can be defined.
+
+Both **collapsed variational inference (VI)** and **collapsed Metropolis-within-Gibbs MCMC** are implemented under a shared abstraction, enabling principled comparison between approximate and exact inference.
+
+---
+
+### Graph construction in this repository
+
+The current implementation supports:
+
+* k-nearest-neighbor (kNN) graph construction on regular grids,
+* weighted Laplacian construction,
+* full eigendecomposition for spectral diagonalization,
+* filter-agnostic inference over arbitrary Laplacians.
+
+All experiments in this repository are conducted on grid-based graphs constructed via kNN, demonstrating that:
+
+* SDM-CAR does not require explicit covariance kernels of the form $k(|x_i - x_j|)$,
+* spatial smoothness is controlled entirely in the spectral domain,
+* model flexibility arises from $F(\lambda;\theta)$ rather than fixed precision templates.
+
+---
+
+### Future work
+
+Because SDM-CAR depends only on the graph Laplacian, the framework naturally extends to:
+
+* irregular spatial lattices (e.g., administrative region adjacency graphs),
+* transportation or road networks,
+* social and communication networks,
+* feature-similarity graphs (e.g., kNN in embedding space),
+* community-structured or modular graphs,
+* non-Euclidean domains such as brain connectivity networks.
+
+Planned future directions include:
+
+* experiments on non-geometric graph constructions,
+* robustness analysis under graph rewiring,
+* learned or data-driven graph structures,
+* sparse eigensolvers for large-scale graphs,
+* structured priors over graph spectra.
+
+These extensions would further demonstrate the generality of the spectral framework beyond grid-based spatial settings.
 ---
 
 ## 2. Model formulation
