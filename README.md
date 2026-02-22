@@ -1,16 +1,19 @@
-# **SDM-CAR: Spectral Density–Modulated Conditional Autoregressive Models**
+# SDM-CAR: Spectral-Density–Modulated Conditional Autoregressive Models  
+### Designing Flexible and Scalable Spatial Gaussian Models
 
-This repository contains the reference implementation for **Spectral Density–Modulated Conditional Autoregressive (SDM-CAR) models**, a flexible class of spatial Gaussian regression models that generalize classical CAR priors through **learned spectral covariance filters**.
+Spatial models often force a tradeoff between interpretability (classical CAR), flexibility (Gaussian processes), and computational scalability.
 
-The framework is designed to support:
+SDM-CAR is a modular framework designed to make these tradeoffs explicit and controllable. Rather than fixing a neighborhood-based precision matrix, the framework parameterizes spatial dependence in the graph spectral domain, allowing controlled movement between rigid CAR models and flexible, nonparametric spectral priors—while retaining scalable inference.
+
+The system supports:
 
 * exact recovery of classical CAR models,
-* interpretable spectral hyperparameters,
-* **collapsed variational inference (VI)** for fast approximation,
-* **collapsed Metropolis-within-Gibbs MCMC** for gold-standard validation,
-* and a fully modular experimental pipeline.
+* progressively more flexible spectral families,
+* collapsed variational inference (VI) for fast experimentation,
+* collapsed Metropolis-within-Gibbs MCMC for validation,
+* and a filter-agnostic experimental pipeline for fair comparison.
 
-All inference—VI or MCMC, any filter family—is executed through a **single, filter-agnostic runner**.
+All inference—VI or MCMC, across any filter family—is executed through a single, filter-agnostic runner.
 
 ---
 
