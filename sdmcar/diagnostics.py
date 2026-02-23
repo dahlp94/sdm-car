@@ -107,7 +107,7 @@ def plot_beta_intervals(model, save_path: str | None = None):
 
 
 # -------------------------
-# New: Spectrum recovery
+# Spectrum recovery
 # -------------------------
 
 @torch.no_grad()
@@ -116,12 +116,21 @@ def _mcmc_spectrum_summary(
     lam_sorted: torch.Tensor,                 # [n]
     filter_module,
     theta_mat: np.ndarray,                    # [S,d] (unconstrained packed)
-    theta_names: list[str],                   # len d
+    theta_names: list[str],                   # len d (kept for validation)
     max_draws: int = 2000,
     band: bool = True,
+    # NEW:
+    band_space: str = "log",                  # "log" (default) or "linear"
+    q_lo: float = 0.025,
+    q_hi: float = 0.975,
+    clamp_min: float = 1e-12,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Returns (mean, lo, hi) for F(lam) over MCMC theta draws.
+
+    band_space:
+      - "log": compute quantiles of log F, then exponentiate back to F-space.
+      - "linear": compute quantiles of F directly.
     """
     if theta_mat.ndim != 2:
         raise ValueError(f"theta_mat must be [S,d], got {theta_mat.shape}")
@@ -136,13 +145,12 @@ def _mcmc_spectrum_summary(
         S = theta_mat.shape[0]
 
     device, dtype = lam_sorted.device, lam_sorted.dtype
-    
     theta_t = torch.as_tensor(theta_mat, device=device, dtype=dtype)  # [S,d]
 
     F_draws = []
     for i in range(S):
-        theta_dict = filter_module.unpack(theta_t[i])   # <-- correct shapes/keys
-        Fi = filter_module.spectrum(lam_sorted, theta_dict).reshape(-1)
+        theta_dict = filter_module.unpack(theta_t[i])   # dict (unconstrained)
+        Fi = filter_module.spectrum(lam_sorted, theta_dict).reshape(-1).clamp_min(clamp_min)
         F_draws.append(Fi)
 
     F_draws = torch.stack(F_draws, dim=0)  # [S, n]
@@ -151,8 +159,91 @@ def _mcmc_spectrum_summary(
     if not band:
         return mean, None, None
 
-    lo = torch.quantile(F_draws, 0.025, dim=0)
-    hi = torch.quantile(F_draws, 0.975, dim=0)
+    band_space = str(band_space).lower().strip()
+    if band_space not in {"log", "linear"}:
+        raise ValueError("band_space must be one of {'log','linear'}")
+
+    if band_space == "linear":
+        lo = torch.quantile(F_draws, q_lo, dim=0)
+        hi = torch.quantile(F_draws, q_hi, dim=0)
+        return mean, lo, hi
+
+    # log-space band (default)
+    logF = torch.log(F_draws)
+    lo = torch.exp(torch.quantile(logF, q_lo, dim=0))
+    hi = torch.exp(torch.quantile(logF, q_hi, dim=0))
+    return mean, lo, hi
+
+@torch.no_grad()
+def _vi_spectrum_summary(
+    *,
+    lam_sorted: torch.Tensor,                 # [n]
+    filter_module,
+    vi_theta_mean: Optional[Dict[str, torch.Tensor]] = None,
+    num_draws: int = 2000,
+    band: bool = True,
+    # NEW:
+    band_space: str = "log",                  # "log" (default) or "linear"
+    q_lo: float = 0.025,
+    q_hi: float = 0.975,
+    clamp_min: float = 1e-12,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Returns (mean, lo, hi) for F(lam) under VI (q(theta)).
+
+    mean:
+      - if vi_theta_mean provided: plugin curve F(lam; E_q[theta]) (your current VI line)
+      - else: MC mean across draws from q(theta)
+
+    band_space:
+      - "log": quantiles in log-space then exp back (default)
+      - "linear": quantiles in linear F-space
+    """
+    device, dtype = lam_sorted.device, lam_sorted.dtype
+
+    # plugin mean curve (optional)
+    F_plugin = None
+    if vi_theta_mean is not None:
+        theta_mean = {k: v.to(device=device, dtype=dtype).reshape(-1) for k, v in vi_theta_mean.items()}
+        F_plugin = filter_module.spectrum(lam_sorted, theta_mean).reshape(-1).clamp_min(clamp_min)
+
+    if (not band) and (F_plugin is not None):
+        return F_plugin, None, None
+
+    if not hasattr(filter_module, "sample_unconstrained"):
+        raise AttributeError("filter_module must implement sample_unconstrained() for VI bands.")
+
+    S = int(num_draws)
+    if S <= 0:
+        raise ValueError("num_draws must be positive.")
+
+    F_draws = []
+    for _ in range(S):
+        theta = filter_module.sample_unconstrained()
+        theta = {k: v.to(device=device, dtype=dtype).reshape(-1) for k, v in theta.items()}
+        Fi = filter_module.spectrum(lam_sorted, theta).reshape(-1).clamp_min(clamp_min)
+        F_draws.append(Fi)
+
+    F_draws = torch.stack(F_draws, dim=0)  # [S,n]
+    mean_mc = F_draws.mean(dim=0)
+    mean = F_plugin if (F_plugin is not None) else mean_mc
+
+    if not band:
+        return mean, None, None
+
+    band_space = str(band_space).lower().strip()
+    if band_space not in {"log", "linear"}:
+        raise ValueError("band_space must be one of {'log','linear'}")
+
+    if band_space == "linear":
+        lo = torch.quantile(F_draws, q_lo, dim=0)
+        hi = torch.quantile(F_draws, q_hi, dim=0)
+        return mean, lo, hi
+
+    # log-space band (default)
+    logF = torch.log(F_draws)
+    lo = torch.exp(torch.quantile(logF, q_lo, dim=0))
+    hi = torch.exp(torch.quantile(logF, q_hi, dim=0))
     return mean, lo, hi
 
 
@@ -160,17 +251,28 @@ def _mcmc_spectrum_summary(
 def plot_spectrum_recovery(
     *,
     lam: torch.Tensor,  # [n]
-    F_true: torch.Tensor,  # [n] aligned with lam (same order)
+    F_true: torch.Tensor,  # [n]
     filter_module,
     vi_theta: Optional[Dict[str, torch.Tensor]] = None,
     mcmc_theta: Optional[np.ndarray] = None,
-    mcmc_theta_names: Optional[list[str]] = None,  # can keep for now, or remove later
+    mcmc_theta_names: Optional[list[str]] = None,
     title: str = "Spectrum recovery",
     save_path: str | Path = "spectrum_recovery.png",
     xscale: str = "linear",
     yscale: str = "log",
     mcmc_band: bool = True,
     mcmc_max_draws: int = 2000,
+
+    # VI
+    vi_band: bool = True,
+    vi_num_draws: int = 2000,
+
+    # band policy
+    band_space_default: str = "log",       # default: log bands
+    vi_band_space: Optional[str] = None,   # if None -> use band_space_default
+    mcmc_band_space: Optional[str] = None, # if None -> use band_space_default
+    band_q_lo: float = 0.025,
+    band_q_hi: float = 0.975,
 ) -> Dict[str, Any]:
 
     save_path = Path(save_path)
@@ -180,17 +282,31 @@ def plot_spectrum_recovery(
     lam_sorted, idx = torch.sort(lam)
     device, dtype = lam_sorted.device, lam_sorted.dtype
 
-    # True spectrum: just sort the provided F_true using idx
+    # True spectrum (sorted)
     F_true = F_true.to(device=device, dtype=dtype).reshape(-1)
     F_true_sorted = F_true[idx].reshape(-1)
 
-    # VI plugin
-    F_vi = None
-    if vi_theta is not None:
-        vi_theta_ = {k: v.to(device=device, dtype=dtype).reshape(-1) for k, v in vi_theta.items()}
-        F_vi = filter_module.spectrum(lam_sorted, vi_theta_).reshape(-1)
+    # pick band spaces
+    vi_space = band_space_default if vi_band_space is None else vi_band_space
+    mcmc_space = band_space_default if mcmc_band_space is None else mcmc_band_space
 
-    # MCMC
+    # ---- VI summary ----
+    F_vi = None
+    F_vi_lo = None
+    F_vi_hi = None
+    if (vi_theta is not None) or vi_band:
+        F_vi, F_vi_lo, F_vi_hi = _vi_spectrum_summary(
+            lam_sorted=lam_sorted,
+            filter_module=filter_module,
+            vi_theta_mean=vi_theta,
+            num_draws=vi_num_draws,
+            band=vi_band,
+            band_space=vi_space,
+            q_lo=band_q_lo,
+            q_hi=band_q_hi,
+        )
+
+    # ---- MCMC summary ----
     F_mcmc_mean = None
     F_mcmc_lo = None
     F_mcmc_hi = None
@@ -204,15 +320,27 @@ def plot_spectrum_recovery(
             theta_names=mcmc_theta_names,
             max_draws=mcmc_max_draws,
             band=mcmc_band,
+            band_space=mcmc_space,
+            q_lo=band_q_lo,
+            q_hi=band_q_hi,
         )
 
-    # Plot
+    # ---- Plot ----
     xs = lam_sorted.detach().cpu().numpy()
     plt.figure(figsize=(7, 4))
-    plt.plot(xs, F_true_sorted.detach().cpu().numpy(), linewidth=2, linestyle="--", label="True F(λ)")
+
+    plt.plot(xs, F_true_sorted.detach().cpu().numpy(), linewidth=2.2, linestyle="-", label="True F(λ)")
 
     if F_vi is not None:
         plt.plot(xs, F_vi.detach().cpu().numpy(), linewidth=2, label="VI mean F(λ)")
+        if (F_vi_lo is not None) and (F_vi_hi is not None):
+            plt.fill_between(
+                xs,
+                F_vi_lo.detach().cpu().numpy(),
+                F_vi_hi.detach().cpu().numpy(),
+                alpha=0.2,
+                label=f"VI 95% band ({vi_space})",
+            )
 
     if F_mcmc_mean is not None:
         plt.plot(xs, F_mcmc_mean.detach().cpu().numpy(), linewidth=2, label="MCMC mean F(λ)")
@@ -222,7 +350,7 @@ def plot_spectrum_recovery(
                 F_mcmc_lo.detach().cpu().numpy(),
                 F_mcmc_hi.detach().cpu().numpy(),
                 alpha=0.2,
-                label="MCMC 95% band",
+                label=f"MCMC 95% band ({mcmc_space})",
             )
 
     plt.title(title)
@@ -240,11 +368,15 @@ def plot_spectrum_recovery(
         "lam_sorted": lam_sorted.detach().cpu(),
         "F_true": F_true_sorted.detach().cpu(),
         "F_vi": None if F_vi is None else F_vi.detach().cpu(),
+        "F_vi_lo": None if F_vi_lo is None else F_vi_lo.detach().cpu(),
+        "F_vi_hi": None if F_vi_hi is None else F_vi_hi.detach().cpu(),
         "F_mcmc_mean": None if F_mcmc_mean is None else F_mcmc_mean.detach().cpu(),
         "F_mcmc_lo": None if F_mcmc_lo is None else F_mcmc_lo.detach().cpu(),
         "F_mcmc_hi": None if F_mcmc_hi is None else F_mcmc_hi.detach().cpu(),
+        "band_space_default": band_space_default,
+        "vi_band_space": vi_space,
+        "mcmc_band_space": mcmc_space,
     }
-
 
 @torch.no_grad()
 def spectrum_error_log_l1(
