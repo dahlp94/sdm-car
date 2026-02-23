@@ -336,18 +336,77 @@ The runner is **filter-agnostic** and **case-agnostic**.
 
 ## 8. Outputs and reproducibility
 
-All figures and summaries are written to:
+All experimental results are written automatically to structured directories under:
+
+```text
+examples/figures/
+```
+
+The exact subdirectory depends on the experiment type:
+
+```text
+examples/figures/
+├── benchmarks/<filter>/<case>/
+├── misspec/truth_<type>/<filter>/<case>/
+└── surface_block_missing/
+```
+
+### Benchmark experiments
 
 ```text
 examples/figures/benchmarks/<filter>/<case>/
 ```
 
-This ensures:
+Contain:
+
+* spectrum recovery plots (linear + log scale),
+* posterior mean surface comparisons,
+* VI–MCMC diagnostics,
+* parameter summaries.
+
+---
+
+### Spectral misspecification experiments
+
+```text
+examples/figures/misspec/truth_<type>/<filter>/<case>/
+```
+
+Contain:
+
+* true vs estimated spectra,
+* log-spectrum RMSE comparisons,
+* VI–MCMC performance summaries.
+
+---
+
+### Block-missing surface experiments
+
+```text
+examples/figures/surface_block_missing/
+```
+
+Contain:
+
+* latent surface visualizations,
+* observed surface with structured missing blocks,
+* imputed surfaces across outer iterations,
+* MSE and correlation summaries across missing regions,
+* metadata files recording experiment settings.
+
+---
+
+### Reproducibility guarantees
+
+This structure ensures:
 
 * no manual bookkeeping,
-* deterministic results given a seed,
-* clean separation between code and results,
-* direct VI–MCMC comparison for validation.
+* deterministic results given a fixed random seed,
+* clean separation between modeling code and experiment outputs,
+* direct VI–MCMC comparison for validation,
+* consistent evaluation across filters and experimental regimes.
+
+All experiment scripts are filter-agnostic and registry-driven, allowing systematic comparison without modifying inference code.
 
 ---
 
