@@ -56,19 +56,45 @@ def plot_hist_with_lines(
     save_path: Path,
     true_val: float | None = None,
     vi_val: float | None = None,
+    show_mcmc_mean: bool = True,   # NEW
 ):
     plt.figure(figsize=(5, 3))
     plt.hist(x, bins=40, density=True, alpha=0.85)
+
+    # MCMC mean
+    if show_mcmc_mean:
+        mcmc_mean = float(np.mean(x))
+        plt.axvline(
+            mcmc_mean,
+            linestyle=":",
+            linewidth=2,
+            color="black",
+            label="MCMC mean",
+        )
+
+    # True value
     if true_val is not None:
-        plt.axvline(true_val, linestyle="--", linewidth=2, label="true")
+        plt.axvline(
+            true_val,
+            linestyle="--",
+            linewidth=2,
+            label="true",
+        )
+
+    # VI mean
     if vi_val is not None:
-        plt.axvline(vi_val, linestyle="-", linewidth=2, label="VI mean")
+        plt.axvline(
+            vi_val,
+            linestyle="-",
+            linewidth=2,
+            label="VI mean",
+        )
+
     plt.title(title)
     plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(save_path, dpi=200)
     plt.close()
-
 
 
 def resolve_fixed_tokens(fixed: dict, eps_car: float) -> dict:
@@ -333,6 +359,7 @@ def run_case(
         step_theta=case_spec.get_step_theta(model.filter),
         seed=0,
         device=device,
+        print_every=5000,
     )
 
     sampler = make_collapsed_mcmc_from_model(model, config=cfg)
@@ -448,7 +475,8 @@ def run_case(
         mcmc_theta_names=out["theta_names"],
         title=f"Spectrum recovery — {filter_name}/{case_spec.display_name}",
         save_path=case_dir / "spectrum_recovery.png",
-        yscale="log",
+        vi_band=True,
+        mcmc_band=True,
     )
 
     # -------------------------
