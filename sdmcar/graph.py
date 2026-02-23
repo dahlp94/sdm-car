@@ -77,7 +77,7 @@ def build_laplacian_from_radius(
 
 def laplacian_eigendecomp(L):
     """
-    Symmetric eigendecomposition L = U diag(λ) U^T.
+    Symmetric eigendecomposition L = U diag(lam) U^T.
 
     Args:
         L: [n, n] symmetric Laplacian.
