@@ -5,8 +5,8 @@
 #
 # We sample the *collapsed* posterior (phi integrated out):
 #
-#   y | beta, hypers ~ N(X beta,  Σ(hypers))
-#   Σ(hypers) = U diag(F(λ; theta) + σ²) U^T
+#   y | beta, hypers ~ N(X beta,  sigma(hypers))
+#   sigma(hypers) = U diag(F(λ; theta) + sigma²) U^T
 #
 # State:
 #   beta                  (p,)
@@ -46,6 +46,8 @@ class MCMCConfig:
     step_theta: Dict[str, float] = field(default_factory=dict)
 
     seed: Optional[int] = None
+    # logging
+    print_every: int = 0   # 0 disables; e.g. 2000 prints every 2000 steps
 
     # numerical stability
     var_jitter: float = 1e-12         # clamp for marginal spectral variances
@@ -420,6 +422,26 @@ class CollapsedSpectralCARMCMC:
             # 3) MH theta blocks
             theta = self.mh_update_theta(beta, s, theta)
 
+            # progress printing
+            pe = int(getattr(self.cfg, "print_every", 0))
+            if pe > 0 and (step % pe == 0):
+                acc_s = self.acc_s / max(1, self.tried_s)
+
+                theta_rates = []
+                for bname in self.acc_theta.keys() | self.tried_theta.keys():
+                    a = self.acc_theta.get(bname, 0)
+                    t = self.tried_theta.get(bname, 0)
+                    theta_rates.append((bname, a / max(1, t)))
+                theta_rates.sort(key=lambda x: x[0])
+
+                theta_str = ", ".join([f"{k}={v:.3f}" for k, v in theta_rates])
+                sigma2_cur = float(torch.exp(self._as_scalar(s)).detach().cpu().item())
+
+                print(
+                    f"[MCMC {step:05d}/{self.cfg.num_steps}] "
+                    f"acc_s={acc_s:.3f} | acc_theta[{theta_str}] | sigma2={sigma2_cur:.4f}"
+                )
+
             # store
             if step > self.cfg.burnin and ((step - self.cfg.burnin) % self.cfg.thin == 0):
                 keep_steps.append(step)
@@ -481,7 +503,7 @@ def make_collapsed_mcmc_from_model(
         lam=model.lam.detach(),
         m0=model.m0.detach(),
         V0=model.V0.detach(),
-        filter_module=model.filter,   # <--- key change
+        filter_module=model.filter,
         sigma_prior=sigma_prior,
         sigma_prior_params=sigma_prior_params,
         config=config,
