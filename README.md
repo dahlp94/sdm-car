@@ -242,15 +242,25 @@ sdm-car/
 │   └── utils.py                # Shared utilities (transforms, KLs, helpers)
 │
 ├── examples/
-│   ├── run_benchmark.py        # Single universal experiment runner
+│   ├── run_benchmark.py            # Universal benchmark runner (VI + MCMC comparison)
+│   ├── run_misspec_demo.py         # Spectral misspecification experiments
+│   ├── run_surface_block_missing.py# Block-missing surface reconstruction experiments
+│   │
 │   └── benchmarks/
-│       ├── base.py             # CaseSpec / FilterSpec abstractions
-│       ├── registry.py         # Global filter registry
-│       ├── matern.py           # Matérn-like SDM-CAR filter family
-│       ├── invlinear_car.py    # Exact CAR baseline (inverse-linear spectrum)
-│       └── __init__.py         # Auto-registration of benchmark modules
+│       ├── base.py                 # CaseSpec / FilterSpec abstractions
+│       ├── registry.py             # Global filter registry
+│       ├── matern.py               # Matérn-like SDM-CAR filter family
+│       ├── invlinear_car.py        # Proper CAR (inverse-linear spectrum)
+│       ├── classic_car.py          # Intrinsic CAR with fixed ridge ε
+│       ├── leroux.py               # Leroux CAR (convex blend of IID and CAR)
+│       ├── polyrational.py         # Polynomial / rational spectral filters
+│       ├── logspline.py            # Log-spline semi-nonparametric spectral filter
+│       └── __init__.py             # Auto-registration of benchmark modules
 │
-├── examples/figures/benchmarks # Auto-generated figures and summaries
+├── examples/figures/
+│   ├── benchmarks/                 # VI vs MCMC spectrum recovery results
+│   ├── misspec/                    # Misspecified-truth experiments
+│   └── surface_block_missing/      # Block-missing imputation outputs├── examples/figures/benchmarks # Auto-generated figures and summaries
 │
 └── README.md
 ```
