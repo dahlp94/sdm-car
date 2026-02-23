@@ -24,11 +24,16 @@ def build_invlinear_filter(
         log_std_rho0_raw=-2.5,
         fixed_rho0=fixed_rho0,   # IMPORTANT: do not force eps here
 
-        # NEW: prior that favors rho0 = 0.001 (approx.)
+        # prior that favors rho0 = 0.001 (approx.)
         prior_mu_log_tau2=0,
         prior_std_log_tau2=1,
         prior_mu_rho0_raw=-7.0,
-        prior_std_rho0_raw=2.0,
+        prior_std_rho0_raw=0.5,
+        
+        #prior_std_rho0_raw=2.0,
+        # With a weakly informative prior anchored near eps, ρ0 becomes 
+        # stable and interpretable; with a very diffuse prior, ρ0 is weakly 
+        # identified and drifts.
     ).to(device)
 
 
