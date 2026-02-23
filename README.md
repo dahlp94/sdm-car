@@ -267,15 +267,15 @@ sdm-car/
 
 ---
 
-## 7. Design philosophy
+# 7. Design philosophy
 
-### 7.1 `sdmcar/`: model- and inference-level code only
+## 7.1 `sdmcar/`: model- and inference-level code only
 
 Everything under `sdmcar/` is **experiment-agnostic** and mirrors the mathematical structure of the model.
 
 * **`graph.py`**
   Constructs spatial graphs, Laplacians, and eigendecompositions.
-  This is the only place where spatial geometry enters the model.
+  This is the only place where spatial structure enters the model.
 
 * **`filters.py`**
   Defines spectral covariance families $F(\lambda;\theta)$.
@@ -291,13 +291,13 @@ Everything under `sdmcar/` is **experiment-agnostic** and mirrors the mathematic
 * **`diagnostics.py`**
   Posterior diagnostics and visualization utilities.
 
-Nothing in `sdmcar/` is aware of specific experiments or ablations.
+Nothing in `sdmcar/` is aware of specific experiments, benchmarks, ablations, or datasets.
 
 ---
 
-### 7.2 `examples/benchmarks/`: declarative experiment definitions
+## 7.2 `examples/benchmarks/`: declarative filter and case definitions
 
-All experiments are defined **declaratively**, without inference logic.
+All filter families and experimental configurations are defined **declaratively**, without embedding inference logic.
 
 * **`base.py`**
 
@@ -307,22 +307,28 @@ All experiments are defined **declaratively**, without inference logic.
 * **`registry.py`**
   Maintains a global registry mapping filter names to `FilterSpec`s, enabling dynamic discovery from the command line.
 
-* **`matern.py`, `invlinear_car.py`, …**
+* **`matern.py`, `invlinear_car.py`, `leroux.py`, `polyrational.py`, `classic_car.py`, `logspline.py`**
   Each file defines a filter family, its valid cases, and registers itself automatically on import.
 
-Adding a new experiment never requires modifying the runner.
+Adding a new filter family or ablation case does **not** require modifying inference code or experiment runners.
 
 ---
 
-### 7.3 `examples/run_benchmark.py`: single execution entry point
+## 7.3 Experiment runners (execution layer)
 
-All experiments are run via:
+All experiments are executed through filter-agnostic entry points under `examples/`.
+
+---
+
+### 7.3.1 `run_benchmark.py`: correctly specified CAR recovery
+
+Run via:
 
 ```bash
 python -m examples.run_benchmark --filter <name> --cases <ids>
 ```
 
-The runner:
+This runner:
 
 1. builds a spatial graph and Laplacian,
 2. generates synthetic data under a CAR ground truth,
@@ -330,8 +336,83 @@ The runner:
 4. initializes and runs collapsed MCMC from the VI solution,
 5. produces diagnostics, plots, and summaries.
 
+This setting evaluates:
+
+* parameter recovery,
+* spectrum recovery,
+* VI–MCMC agreement.
+
 The runner is **filter-agnostic** and **case-agnostic**.
 
+---
+
+### 7.3.2 `run_misspec_demo.py`: spectral misspecification analysis
+
+Run via:
+
+```bash
+python -m examples.run_misspec_demo --truth <type> --filters <names>
+```
+
+This experiment:
+
+1. constructs a graph Laplacian,
+2. generates data under a deliberately misspecified spectrum $F_{\text{true}}(\lambda)$,
+3. fits multiple filter families,
+4. compares log-spectrum RMSE and surface recovery error,
+5. benchmarks VI against MCMC under misspecification.
+
+This evaluates:
+
+* robustness to model misspecification,
+* ability of flexible filters (e.g. log-spline, rational) to capture non-CAR structure,
+* stability of approximate inference.
+
+---
+
+### 7.3.3 `run_surface_block_missing.py`: structured missingness and imputation
+
+Run via:
+
+```bash
+python -m examples.run_surface_block_missing --filter <name> --case <id>
+```
+
+This runner:
+
+1. generates deterministic latent surfaces (e.g. $f_1, f_2$),
+2. constructs a graph Laplacian over the full grid,
+3. removes structured blocks of observations,
+4. performs iterative VI-based reconstruction,
+5. optionally performs conditional Gaussian imputation,
+6. evaluates MSE and correlation on held-out regions.
+
+This setting evaluates:
+
+* spatial extrapolation capability,
+* robustness to structured missing data,
+* sensitivity to graph construction and filter family,
+* performance across different missing block locations.
+
+---
+
+## 7.4 Architectural principle
+
+The repository cleanly separates:
+
+| Layer                  | Responsibility                 |
+| ---------------------- | ------------------------------ |
+| `sdmcar/`              | Mathematical model + inference |
+| `examples/benchmarks/` | Declarative filter definitions |
+| `examples/run_*.py`    | Experimental protocols         |
+| `examples/figures/`    | Generated outputs              |
+
+This separation ensures:
+
+* inference code is reusable across experiments,
+* filters are interchangeable,
+* experiments are reproducible,
+* extensions (new graphs, new filters, new protocols) do not require rewriting core logic.
 ---
 
 ## 8. Outputs and reproducibility
