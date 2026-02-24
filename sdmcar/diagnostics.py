@@ -650,3 +650,171 @@ def spectrum_draw_sd(
     mean_sd = sd_curve.mean()
 
     return float(mean_sd.item()), sd_curve.detach().cpu().numpy()
+
+@torch.no_grad()
+def collapsed_loglik_eig(
+    *,
+    y: torch.Tensor,          # [n]
+    X: torch.Tensor,          # [n,p]
+    beta: torch.Tensor,       # [p]
+    U: torch.Tensor,          # [n,n]
+    lam: torch.Tensor,        # [n]
+    filter_module,
+    theta_unconstrained: dict[str, torch.Tensor],
+    sigma2: torch.Tensor,     # scalar tensor
+) -> torch.Tensor:
+    r = y - X @ beta
+    r_tilde = U.T @ r
+    F = filter_module.spectrum(lam, theta_unconstrained).reshape(-1).clamp_min(1e-12)
+    d = (F + sigma2.reshape(())).clamp_min(1e-12)
+    n = y.numel()
+    logdet = torch.log(d).sum()
+    quad = (r_tilde * r_tilde / d).sum()
+    return -0.5 * (n * math.log(2.0 * math.pi) + logdet + quad)
+
+
+@torch.no_grad()
+def rmse(y: torch.Tensor, yhat: torch.Tensor) -> float:
+    return float(torch.sqrt(torch.mean((yhat - y) ** 2)).item())
+
+
+@torch.no_grad()
+def predictive_report(
+    *,
+    model,                     # SpectralCAR_FullVI
+    out: dict,                 # MCMC output dict from sampler.run(...)
+    num_mc_vi: int = 128,      # VI MC draws for metrics
+    max_draws_mcmc: int = 1000 # cap for MCMC LPD for speed
+) -> dict:
+    """
+    Compute predictive metrics for both VI and MCMC in one place.
+
+    Returns dict with:
+      rmse_y_vi_plugin, lpd_vi_plugin,
+      rmse_y_vi_mc,     lpd_vi_mc,
+      rmse_y_mcmc,      lpd_mcmc
+    """
+
+    y = model.y
+    X = model.X
+    U = model.U
+    lam = model.lam
+    filt = model.filter
+
+    # -------------------------
+    # VI: plugin
+    # -------------------------
+    theta_mean = filt.mean_unconstrained()
+
+    # match your posterior_phi(plugin): lognormal mean for sigma^2
+    std_s = torch.exp(model.log_std_log_sigma2)
+    sigma2_plugin = torch.exp(model.mu_log_sigma2 + 0.5 * std_s**2).clamp_min(1e-12)
+
+    F = filt.spectrum(lam, theta_mean).clamp_min(0.0)
+    denom = (F + sigma2_plugin).clamp_min(1e-12)
+    inv_var = 1.0 / denom
+
+    m_beta_plugin, _ = model._beta_update(inv_var, return_Xt_invSig_X=False)
+
+    r_tilde = U.T @ (y - X @ m_beta_plugin)
+    w = F / denom
+    mu_z = w * r_tilde
+    mean_phi_plugin = U @ mu_z
+
+    yhat_vi_plugin = X @ m_beta_plugin + mean_phi_plugin
+    rmse_y_vi_plugin = rmse(y, yhat_vi_plugin)
+
+    ll_vi_plugin = collapsed_loglik_eig(
+        y=y, X=X, beta=m_beta_plugin, U=U, lam=lam,
+        filter_module=filt, theta_unconstrained=theta_mean, sigma2=sigma2_plugin
+    )
+    lpd_vi_plugin = float(ll_vi_plugin.item() / y.numel())
+
+    # -------------------------
+    # VI: MC over q(theta) q(s)
+    # -------------------------
+    K = int(num_mc_vi)
+    mu_acc = torch.zeros_like(y)
+    ll_list = []
+
+    for _ in range(K):
+        eps = torch.randn_like(model.mu_log_sigma2)
+        s = model.mu_log_sigma2 + torch.exp(model.log_std_log_sigma2) * eps
+        sigma2 = torch.exp(s).clamp_min(1e-12)
+
+        theta = filt.sample_unconstrained()
+        Fk = filt.spectrum(lam, theta).clamp_min(0.0)
+
+        denom_k = (Fk + sigma2).clamp_min(1e-12)
+        inv_var_k = 1.0 / denom_k
+
+        m_beta_k, _ = model._beta_update(inv_var_k, return_Xt_invSig_X=False)
+
+        r_tilde_k = U.T @ (y - X @ m_beta_k)
+        w_k = Fk / denom_k
+        mu_z_k = w_k * r_tilde_k
+        mean_phi_k = U @ mu_z_k
+
+        mu_acc += (X @ m_beta_k + mean_phi_k)
+
+        ll_k = collapsed_loglik_eig(
+            y=y, X=X, beta=m_beta_k, U=U, lam=lam,
+            filter_module=filt, theta_unconstrained=theta, sigma2=sigma2
+        )
+        ll_list.append(ll_k)
+
+    yhat_vi_mc = mu_acc / float(K)
+    rmse_y_vi_mc = rmse(y, yhat_vi_mc)
+
+    ll_stack = torch.stack(ll_list)  # [K]
+    lpd_vi_mc = float((torch.logsumexp(ll_stack, dim=0) - math.log(K)).item() / y.numel())
+
+    # -------------------------
+    # MCMC: predictive RMSE (posterior mean predictor)
+    # -------------------------
+    beta_chain = out["beta"].detach()        # [S,p]
+    phi_mean_chain = out["phi_mean"].detach()  # [S,n]
+    beta_mean = beta_chain.mean(dim=0)
+    phi_mean = phi_mean_chain.mean(dim=0)
+    yhat_mcmc = X @ beta_mean + phi_mean
+    rmse_y_mcmc = rmse(y, yhat_mcmc)
+
+    # -------------------------
+    # MCMC: LPD via log-mean-exp over draws
+    # -------------------------
+    theta_chain = out["theta"].detach()     # [S,d]
+    theta_names = out["theta_names"]
+    s_chain = out["s"].detach().reshape(-1)  # [S]
+    S = beta_chain.shape[0]
+
+    if max_draws_mcmc is not None and S > int(max_draws_mcmc):
+        idx = torch.linspace(0, S - 1, steps=int(max_draws_mcmc), device=beta_chain.device).long()
+        beta_chain = beta_chain[idx]
+        theta_chain = theta_chain[idx]
+        s_chain = s_chain[idx]
+        S = beta_chain.shape[0]
+
+    ll_mcmc = []
+    d = theta_chain.shape[1]
+    for i in range(S):
+        theta_dict = {theta_names[j]: theta_chain[i, j].reshape(1) for j in range(d)}
+        sigma2_i = torch.exp(s_chain[i]).clamp_min(1e-12)
+        ll_i = collapsed_loglik_eig(
+            y=y, X=X, beta=beta_chain[i], U=U, lam=lam,
+            filter_module=filt, theta_unconstrained=theta_dict, sigma2=sigma2_i
+        )
+        ll_mcmc.append(ll_i)
+
+    ll_mcmc = torch.stack(ll_mcmc)  # [S]
+    lpd_mcmc = float((torch.logsumexp(ll_mcmc, dim=0) - math.log(S)).item() / y.numel())
+
+    return {
+        "rmse_y_vi_plugin": rmse_y_vi_plugin,
+        "lpd_vi_plugin": lpd_vi_plugin,
+        "rmse_y_vi_mc": rmse_y_vi_mc,
+        "lpd_vi_mc": lpd_vi_mc,
+        "rmse_y_mcmc": rmse_y_mcmc,
+        "lpd_mcmc": lpd_mcmc,
+        "num_mc_vi": int(num_mc_vi),
+        "max_draws_mcmc": int(max_draws_mcmc),
+    }
