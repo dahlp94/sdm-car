@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from .utils import kl_normal_std
+from .diagnostics import collapsed_loglik_eig, rmse
 
 class SpectralCAR_FullVI(nn.Module):
     """
@@ -432,3 +433,107 @@ class SpectralCAR_FullVI(nn.Module):
 
         else:
             raise ValueError("mode must be one of {'plugin', 'mc'}.")
+    
+    @torch.no_grad()
+    def predictive_metrics(self, mode: str = "plugin", num_mc: int = 64):
+        """
+        Returns predictive metrics under VI:
+          - rmse_y: RMSE of posterior predictive mean E_q[y|y] vs observed y
+          - lpd:    per-observation log predictive density (log score)
+
+        mode:
+          - "plugin": evaluate at plugin (theta_mean, sigma2_plugin, beta posterior given those)
+          - "mc":     log-mean-exp over draws (theta,s) ~ q and analytic beta|theta,s
+        """
+
+        y = self.y
+        X = self.X
+        U = self.U
+        lam = self.lam
+
+        # -------------------------
+        # (A) plugin
+        # -------------------------
+        if mode == "plugin":
+            theta = self.filter.mean_unconstrained()
+
+            # keep consistent with your posterior_phi(plugin):
+            std_s = torch.exp(self.log_std_log_sigma2)
+            sigma2 = torch.exp(self.mu_log_sigma2 + 0.5 * std_s**2).clamp_min(1e-12)
+
+            F = self.filter.spectrum(lam, theta).clamp_min(0.0)
+            denom = (F + sigma2).clamp_min(1e-12)
+            inv_var = 1.0 / denom
+
+            # beta posterior for these plugin hypers
+            m_beta, _ = self._beta_update(inv_var, return_Xt_invSig_X=False)
+
+            # posterior mean of phi for these plugin hypers
+            r_tilde = U.T @ (y - X @ m_beta)
+            w = F / denom
+            mu_z = w * r_tilde
+            mean_phi = U @ mu_z
+
+            yhat = X @ m_beta + mean_phi
+            rmse_y = rmse(y, yhat)
+
+            ll = collapsed_loglik_eig(
+                y=y, X=X, beta=m_beta, U=U, lam=lam,
+                filter_module=self.filter, theta_unconstrained=theta, sigma2=sigma2
+            )
+            lpd = float(ll.item() / y.numel())
+            return {"rmse_y": rmse_y, "lpd": lpd}
+
+        # -------------------------
+        # (B) MC over q(theta) q(s)
+        # -------------------------
+        elif mode == "mc":
+            if num_mc <= 0:
+                raise ValueError("num_mc must be positive for mode='mc'.")
+
+            n = y.numel()
+            K = int(num_mc)
+
+            mu_acc = torch.zeros_like(y)
+            ll_list = []
+
+            for _ in range(K):
+                # sample s = log sigma2
+                eps = torch.randn_like(self.mu_log_sigma2)
+                s = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps
+                sigma2 = torch.exp(s).clamp_min(1e-12)
+
+                # sample theta
+                theta = self.filter.sample_unconstrained()
+                F = self.filter.spectrum(lam, theta).clamp_min(0.0)
+
+                denom = (F + sigma2).clamp_min(1e-12)
+                inv_var = 1.0 / denom
+
+                # draw-consistent beta posterior mean
+                m_beta, _ = self._beta_update(inv_var, return_Xt_invSig_X=False)
+
+                # draw-consistent phi posterior mean
+                r_tilde = U.T @ (y - X @ m_beta)
+                w = F / denom
+                mu_z = w * r_tilde
+                mean_phi = U @ mu_z
+
+                mu_acc += (X @ m_beta + mean_phi)
+
+                # collapsed loglik for log-score
+                ll = collapsed_loglik_eig(
+                    y=y, X=X, beta=m_beta, U=U, lam=lam,
+                    filter_module=self.filter, theta_unconstrained=theta, sigma2=sigma2
+                )
+                ll_list.append(ll)
+
+            yhat = mu_acc / float(K)
+            rmse_y = rmse(y, yhat)
+
+            ll_stack = torch.stack(ll_list)  # [K]
+            lpd = float((torch.logsumexp(ll_stack, dim=0) - math.log(K)).item() / n)
+            return {"rmse_y": rmse_y, "lpd": lpd}
+
+        else:
+            raise ValueError("mode must be one of {'plugin','mc'}.")
