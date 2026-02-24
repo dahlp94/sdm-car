@@ -56,6 +56,7 @@ def plot_hist_with_lines(
     save_path: Path,
     true_val: float | None = None,
     vi_val: float | None = None,
+    vi_label: str = "VI",
     show_mcmc_mean: bool = True,   # NEW
 ):
     plt.figure(figsize=(5, 3))
@@ -87,7 +88,7 @@ def plot_hist_with_lines(
             vi_val,
             linestyle="-",
             linewidth=2,
-            label="VI mean",
+            label=vi_label,
         )
 
     plt.title(title)
@@ -172,7 +173,7 @@ def decode_theta_chain(out, filter_module):
       raw: dict[name -> np.ndarray shape [S]]
       constrained: dict[key -> np.ndarray shape [S] or [S,d]]
     """
-    theta_mat = out["theta"].numpy()   # [S, d_theta]
+    theta_mat = out["theta"].detach().cpu().numpy()   # [S, d_theta]
     names = out["theta_names"]
 
     raw = {names[j]: theta_mat[:, j].copy() for j in range(len(names))}
@@ -302,7 +303,11 @@ def run_case(
                 rho0_m = means["rho0"]
                 nu_m = means["nu"]
 
-                sigma2_m = torch.exp(model.mu_log_sigma2).item()
+                mu_s  = model.mu_log_sigma2.detach()                 # [1]
+                std_s = torch.exp(model.log_std_log_sigma2.detach()) # [1]
+
+                sigma2_median = torch.exp(mu_s).item()
+                sigma2_mean   = torch.exp(mu_s + 0.5 * std_s**2).item()
                 beta_m = model.m_beta.detach().cpu().numpy()
 
             nu_str = "NA" if nu_m is None else f"{nu_m.item():.3f}"
@@ -315,7 +320,7 @@ def run_case(
                 f"KLfilt={stats['kl_filter'].item():.2f} "
                 f"KLsig={stats['kl_sigma2'].item():.2f} "
                 f"tau2={tau2_m.item():.3f} rho0={rho0_str} nu={nu_str} "
-                f"sigma2={sigma2_m:.4f} beta={beta_m}"
+                f"sigma2_med={sigma2_median:.4f} sigma2_mean={sigma2_mean:.4f} beta={beta_m}"
             )
 
     # save VI ELBO
@@ -328,21 +333,54 @@ def run_case(
     plt.savefig(case_dir / "vi_elbo_train.png", dpi=200)
     plt.close()
 
-    # VI summaries
+    # -------------------------
+    # VI summaries (plugin + MC)
+    # -------------------------
     with torch.no_grad():
-        beta_vi = model.m_beta.detach().cpu()
+
+        # ---- Plugin beta posterior ----
+        m_beta_plugin, V_beta_plugin, sigma2_plugin, F_plugin = model.beta_posterior_plugin()
+
+        beta_vi_plugin = m_beta_plugin.detach().cpu()
+
+        mu_s  = model.mu_log_sigma2.detach()
+        std_s = torch.exp(model.log_std_log_sigma2.detach())
+
+        sigma2_vi_median = float(torch.exp(mu_s).item())
+        sigma2_vi_mean   = float(torch.exp(mu_s + 0.5 * std_s**2).item())
+
+        sigma2_vi_plugin_median = float(sigma2_plugin.item())
+        sigma2_vi_plugin_mean   = sigma2_vi_mean  # from mu_s,std_s above
+
+        # ---- VI-MC beta mean (marginal over q(theta,s)) ----
+        K_beta = 128  # you can tune this
+        beta_acc = torch.zeros_like(m_beta_plugin)
+
+        for _ in range(K_beta):
+            # sample s
+            eps = torch.randn_like(model.mu_log_sigma2)
+            s = model.mu_log_sigma2 + torch.exp(model.log_std_log_sigma2) * eps
+            sigma2 = torch.exp(s).clamp_min(1e-12)
+
+            # sample theta
+            theta = model.filter.sample_unconstrained()
+            F = model.filter.spectrum(model.lam, theta).clamp_min(0.0)
+            denom = (F + sigma2).clamp_min(1e-12)
+            inv_var = 1.0 / denom
+
+            m_beta_k, _ = model._beta_update(inv_var, return_Xt_invSig_X=False)
+            beta_acc += m_beta_k
+
+        beta_vi_mc = (beta_acc / float(K_beta)).detach().cpu()
+
+        # ---- Filter means (plugin) ----
         means = unpack_filter_params_from_means(model.filter)
         tau2_vi = means["tau2"]
         rho0_vi = means["rho0"]
         nu_vi = means["nu"]
-        sigma2_vi = torch.exp(model.mu_log_sigma2).item()
 
-        # phi
-        try:
-            mean_phi_vi, _ = model.posterior_phi(mode="mc", num_mc=64)
-        except TypeError:
-            mean_phi_vi, _ = model.posterior_phi(use_q_means=True)
-
+        # ---- Phi (VI marginal over q) ----
+        mean_phi_vi, _ = model.posterior_phi(mode="mc", num_mc=64)
         mean_phi_vi = mean_phi_vi.detach().cpu()
 
     rmse_phi_vi = float(torch.sqrt(torch.mean((mean_phi_vi - phi_true.cpu()) ** 2)).item())
@@ -388,10 +426,33 @@ def run_case(
     for k, v in acc["theta"].items():
         print(f"    {k}: {v}")
 
+    
+    # --------------------------------------------
+    # Predictive metrics (VI plugin + VI MC + MCMC)
+    # --------------------------------------------
+    pred = diagnostics.predictive_report(
+        model=model,
+        out=out,
+        num_mc_vi=128,       # VI predictive MC draws
+        max_draws_mcmc=1000, # cap LPD draws for speed
+    )
+
+    print("\nPredictive metrics:")
+    print(
+        f"  RMSE_y: VI(plugin)={pred['rmse_y_vi_plugin']:.4f} | "
+        f"VI(mc)={pred['rmse_y_vi_mc']:.4f} | "
+        f"MCMC={pred['rmse_y_mcmc']:.4f}"
+    )
+    print(
+        f"  LPD/obs: VI(plugin)={pred['lpd_vi_plugin']:.4f} | "
+        f"VI(mc)={pred['lpd_vi_mc']:.4f} | "
+        f"MCMC={pred['lpd_mcmc']:.4f}"
+    )
+
 
     # chains extraction
-    beta_chain = out["beta"].numpy()
-    s_chain = out["s"].numpy().reshape(-1)
+    beta_chain = out["beta"].detach().cpu().numpy()
+    s_chain = out["s"].detach().cpu().numpy().reshape(-1)
     sigma2_chain = np.exp(s_chain)
 
     theta_raw, theta_constr = decode_theta_chain(out, model.filter)
@@ -439,7 +500,7 @@ def run_case(
 
 
 
-    phi_mean_chain = out["phi_mean"].numpy()  # [S,n]
+    phi_mean_chain = out["phi_mean"].detach().cpu().numpy()  # [S,n]
     phi_mean_mcmc = np.mean(phi_mean_chain, axis=0)
     rmse_phi_mcmc = float(np.sqrt(np.mean((phi_mean_mcmc - phi_true.cpu().numpy()) ** 2)))
     print(f"MCMC RMSE(phi_mean, phi_true) = {rmse_phi_mcmc:.4f}")
@@ -460,18 +521,18 @@ def run_case(
         named = case_spec.transform_chain(out, fixed_resolved=fixed, eps_car=eps_car)
     
 
-    lam_flat = lam.reshape(-1)
-    _, idx = torch.sort(lam_flat)
+    # lam_flat = lam.reshape(-1)
+    # _, idx = torch.sort(lam_flat)
 
-    F_true_local = F_true.to(device=lam.device, dtype=lam.dtype).reshape(-1)
+    F_true_local = F_true.detach().to(device=lam.device, dtype=lam.dtype).reshape(-1)
 
 
     diagnostics.plot_spectrum_recovery(
         lam=lam,
-        F_true=F_true,
+        F_true=F_true_local,
         filter_module=model.filter,
         vi_theta=model.filter.mean_unconstrained(),
-        mcmc_theta=out["theta"].numpy(),
+        mcmc_theta=out["theta"].detach().cpu().numpy(),
         mcmc_theta_names=out["theta_names"],
         title=f"Spectrum recovery — {filter_name}/{case_spec.display_name}",
         save_path=case_dir / "spectrum_recovery.png",
@@ -507,13 +568,18 @@ def run_case(
         m, sd, lo, hi = summarize_chain(beta_chain[:, j])
         print(
             f" beta[{j}]  true={beta_true[j].item():.6g}  "
-            f"VI={beta_vi[j].item():.6g}  "
+            f"VI(plugin)={beta_vi_plugin[j].item():.6g}  "
+            f"VI(mc)={beta_vi_mc[j].item():.6g}  "
             f"MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]"
         )
 
     # sigma2
     m, sd, lo, hi = summarize_chain(sigma2_chain)
-    print(f"  sigma2  true={sigma2_true:.6g}  VI={sigma2_vi:.6g}  MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]")
+    print(
+        f"  sigma2  true={sigma2_true:.6g}  "
+        f"VI_med={sigma2_vi_median:.6g}  VI_mean={sigma2_vi_mean:.6g}  "
+        f"MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]"
+    )
 
     # tau2
     if tau2_chain is not None:
@@ -553,12 +619,30 @@ def run_case(
         plot_trace(nu_chain, f"{filter_name}/{case_spec.display_name}: trace nu", case_dir / "trace_nu.png")
 
 
-    plot_hist_with_lines(beta_chain[:, 0], f"{filter_name}/{case_spec.display_name}: posterior beta[0]",
-                         case_dir / "hist_beta0.png", true_val=float(beta_true[0].item()), vi_val=float(beta_vi[0].item()))
-    plot_hist_with_lines(beta_chain[:, 1], f"{filter_name}/{case_spec.display_name}: posterior beta[1]",
-                         case_dir / "hist_beta1.png", true_val=float(beta_true[1].item()), vi_val=float(beta_vi[1].item()))
-    plot_hist_with_lines(sigma2_chain, f"{filter_name}/{case_spec.display_name}: posterior sigma2",
-                         case_dir / "hist_sigma2.png", true_val=float(sigma2_true), vi_val=float(sigma2_vi))
+    plot_hist_with_lines(
+        beta_chain[:, 0],
+        f"{filter_name}/{case_spec.display_name}: posterior beta[0]",
+        case_dir / "hist_beta0.png",
+        true_val=float(beta_true[0].item()),
+        vi_val=float(beta_vi_plugin[0].item()),
+    )
+
+    plot_hist_with_lines(
+        beta_chain[:, 1],
+        f"{filter_name}/{case_spec.display_name}: posterior beta[1]",
+        case_dir / "hist_beta1.png",
+        true_val=float(beta_true[1].item()),
+        vi_val=float(beta_vi_plugin[1].item()),
+    )
+
+    plot_hist_with_lines(
+        sigma2_chain,
+        f"{filter_name}/{case_spec.display_name}: posterior sigma2",
+        case_dir / "hist_sigma2.png",
+        true_val=float(sigma2_true),
+        vi_val=float(sigma2_vi_mean),
+        vi_label="VI mean (marginal)"
+    )
     
     # tau2 (only if present)
     if tau2_chain is not None:
@@ -629,6 +713,9 @@ def run_case(
         },
     }
 
+    # Add predictive metrics in the summary.
+    summary.update(pred)
+
     # -------------------------
     # Write per-case metrics JSON
     # -------------------------
@@ -646,6 +733,12 @@ def run_case(
                 "acc_s": summary["acc_s"],
                 "acc_theta": summary["acc_theta"],
                 "mcmc_means": summary["mcmc_means"],
+                "rmse_y_vi_plugin": summary["rmse_y_vi_plugin"],
+                "rmse_y_vi_mc": summary["rmse_y_vi_mc"],
+                "lpd_vi_plugin": summary["lpd_vi_plugin"],
+                "lpd_vi_mc": summary["lpd_vi_mc"],
+                "rmse_y_mcmc": summary["rmse_y_mcmc"],
+                "lpd_mcmc": summary["lpd_mcmc"],
             },
             f,
             indent=2,
