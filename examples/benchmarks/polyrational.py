@@ -11,7 +11,7 @@ from .registry import register
 # -------------------------
 # POLY
 # -------------------------
-def build_poly(*, tau2_true: float, eps_car: float, device: torch.device, degree: int = 3, **kwargs):
+def build_poly(*, tau2_true: float, eps_car: float, device: torch.device, degree: int = 3, lam_max: float | None = None, **kwargs):
     return PolyPosCoeffFilterFullVI(
         degree=degree,
         mu_log_tau2=math.log(tau2_true),
