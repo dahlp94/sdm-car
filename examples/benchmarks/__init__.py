@@ -6,3 +6,4 @@ from . import polyrational
 from . import classic_car
 from . import leroux
 from . import logspline
+from . import multiscale_bump
