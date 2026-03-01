@@ -1537,3 +1537,275 @@ class LerouxCARFilterFullVI(nn.Module):
         tau2 = c["tau2"]
         rho = c["rho"]
         return tau2.reshape(()), rho.reshape(1)
+
+class MultiScaleBumpFilterFullVI(BaseSpectralFilter):
+    """
+    Multiscale mixture-of-bumps spectral filter (VI + MCMC compatible):
+
+        F(lam) = tau2 * sum_{k=1..K} w_k * exp( a_k - 0.5 * ((log(lam + eps_car)-m_k)/s_k)^2 )
+
+    Key design choices (VI-stability):
+      - global scale parameter tau2 (like other filters)
+      - bump centers m_k constrained to the valid log-frequency domain
+          t = log(lam + eps) ∈ [log(eps), log(lam_max + eps)]
+        via m_k = lo + (hi-lo) * sigmoid(m_raw)
+
+    Unconstrained variables (scalar):
+        log_tau2
+        a{k}_raw       : log-amplitude offsets (relative to tau2)
+        m{k}_raw       : center in log-frequency (unconstrained -> sigmoid -> domain)
+        log_s{k}_raw   : width (constrained via softplus + s_min)
+        alpha{k}_raw   : mixture logits (weights via softmax)
+
+    Variational family:
+        diagonal Gaussians over all unconstrained coords.
+
+    Priors (unconstrained space):
+        iid Normal(prior_mu, prior_std^2) over all unconstrained scalars.
+    """
+
+    def __init__(
+        self,
+        *,
+        lam_max: float,
+        eps_car: float,
+        K: int = 2,
+        s_min: float = 0.05,
+        log_std0: float = -2.3,
+        # initialization
+        mu_log_tau2: float = 0.0,
+        mu0_a: float = -1.0,
+        mu0_m: Optional[List[float]] = None,
+        mu0_log_s: float = -1.0,
+        mu0_alpha: float = 0.0,
+        # prior in unconstrained space
+        prior_mu: float = 0.0,
+        prior_std: float = 1.0,
+    ):
+        super().__init__()
+        if eps_car <= 0:
+            raise ValueError("eps_car must be > 0")
+        if lam_max <= 0:
+            raise ValueError("lam_max must be > 0")
+        if K <= 0:
+            raise ValueError("K must be >= 1")
+        if s_min <= 0:
+            raise ValueError("s_min must be > 0")
+        if prior_std <= 0:
+            raise ValueError("prior_std must be > 0")
+
+        self.lam_max = float(lam_max)
+        self.eps_car = float(eps_car)
+        self.K = int(K)
+        self.s_min = float(s_min)
+
+        self.prior_mu = float(prior_mu)
+        self.prior_std = float(prior_std)
+
+        # valid t-domain for centers
+        self._t_lo = float(math.log(self.eps_car))
+        self._t_hi = float(math.log(self.lam_max + self.eps_car))
+
+        # centers init across t-domain if not provided (NOTE: these are CONSTRAINED targets)
+        if mu0_m is None:
+            lo, hi = self._t_lo, self._t_hi
+            if self.K == 1:
+                mu0_m = [(lo + hi) / 2.0]
+            else:
+                mu0_m = [lo + (hi - lo) * k / (self.K - 1) for k in range(self.K)]
+        if len(mu0_m) != self.K:
+            raise ValueError(f"mu0_m must have length K={self.K}, got {len(mu0_m)}")
+
+        # Convert constrained initial centers (in [lo,hi]) to raw logits so that
+        # sigmoid(m_raw) maps back to those values.
+        # p = (m - lo)/(hi-lo), then m_raw = logit(p)
+        denom = max(self._t_hi - self._t_lo, 1e-12)
+        p = [min(max((float(m) - self._t_lo) / denom, 1e-6), 1 - 1e-6) for m in mu0_m]
+        mu0_m_raw = [math.log(pi / (1.0 - pi)) for pi in p]
+
+        # ---- variational parameters ----
+
+        # global scale
+        self.mu_log_tau2 = nn.Parameter(torch.tensor([mu_log_tau2], dtype=torch.double))
+        self.log_std_log_tau2 = nn.Parameter(torch.tensor([log_std0], dtype=torch.double))
+
+        # a offsets
+        self.mu_a = nn.Parameter(torch.tensor([mu0_a] * self.K, dtype=torch.double))
+        self.log_std_a = nn.Parameter(torch.tensor([log_std0] * self.K, dtype=torch.double))
+
+        # m_raw (unconstrained) corresponding to constrained centers
+        self.mu_m = nn.Parameter(torch.tensor(mu0_m_raw, dtype=torch.double))
+        self.log_std_m = nn.Parameter(torch.tensor([log_std0] * self.K, dtype=torch.double))
+
+        # log_s_raw
+        self.mu_log_s = nn.Parameter(torch.tensor([mu0_log_s] * self.K, dtype=torch.double))
+        self.log_std_log_s = nn.Parameter(torch.tensor([log_std0] * self.K, dtype=torch.double))
+
+        # alpha logits
+        self.mu_alpha = nn.Parameter(torch.tensor([mu0_alpha] * self.K, dtype=torch.double))
+        self.log_std_alpha = nn.Parameter(torch.tensor([log_std0] * self.K, dtype=torch.double))
+
+    # ---------- BaseSpectralFilter API ----------
+
+    def unconstrained_names(self) -> list[str]:
+        names: list[str] = ["log_tau2"]
+        for k in range(self.K):
+            names.append(f"a{k}_raw")
+        for k in range(self.K):
+            names.append(f"m{k}_raw")
+        for k in range(self.K):
+            names.append(f"log_s{k}_raw")
+        for k in range(self.K):
+            names.append(f"alpha{k}_raw")
+        return names
+
+    def blocks(self) -> list[ParamBlock]:
+        return [
+            ParamBlock.single("log_tau2"),
+            ParamBlock(name="a_raw", param_names=tuple(f"a{k}_raw" for k in range(self.K))),
+            ParamBlock(name="m_raw", param_names=tuple(f"m{k}_raw" for k in range(self.K))),
+            ParamBlock(name="log_s_raw", param_names=tuple(f"log_s{k}_raw" for k in range(self.K))),
+            ParamBlock(name="alpha_raw", param_names=tuple(f"alpha{k}_raw" for k in range(self.K))),
+        ]
+
+    def log_prior(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        log p(theta_unconstrained) used by MCMC MH ratio.
+
+        iid Normal(prior_mu, prior_std^2) over all unconstrained scalars.
+        """
+        # dtype/device anchor
+        anchor = theta["log_tau2"]
+        dtype, device = anchor.dtype, anchor.device
+
+        mu = torch.tensor(self.prior_mu, dtype=dtype, device=device)
+        std = torch.tensor(self.prior_std, dtype=dtype, device=device)
+        Np = Normal(mu, std)
+
+        v = self.pack(theta).reshape(-1)
+        return Np.log_prob(v).sum()
+
+    def _constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        K = self.K
+
+        log_tau2 = theta["log_tau2"].reshape(())
+        tau2 = torch.exp(log_tau2)
+
+        a = torch.stack([theta[f"a{k}_raw"].reshape(()) for k in range(K)], dim=0)  # [K]
+
+        # centers constrained to t-domain
+        lo = self._t_lo
+        hi = self._t_hi
+        m_raw = torch.stack([theta[f"m{k}_raw"].reshape(()) for k in range(K)], dim=0)  # [K]
+        m = lo + (hi - lo) * torch.sigmoid(m_raw)
+
+        log_s_raw = torch.stack([theta[f"log_s{k}_raw"].reshape(()) for k in range(K)], dim=0)  # [K]
+        alpha = torch.stack([theta[f"alpha{k}_raw"].reshape(()) for k in range(K)], dim=0)      # [K]
+
+        s = softplus(log_s_raw) + self.s_min
+        w = torch.softmax(alpha, dim=0)
+
+        return {"tau2": tau2, "a": a, "m": m, "s": s, "w": w}
+
+    def spectrum_from_unconstrained(self, lam: torch.Tensor, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        lam = lam.clamp_min(0.0)
+        t = torch.log(lam + float(self.eps_car))  # [n]
+
+        c = self._constrain(theta)
+        tau2 = c["tau2"]
+        a, m, s, w = c["a"], c["m"], c["s"], c["w"]  # [K],[K],[K],[K]
+
+        z = (t[None, :] - m[:, None]) / s[:, None]       # [K,n]
+        bumps = torch.exp(a[:, None] - 0.5 * (z ** 2))   # [K,n]
+        F = tau2 * (w[:, None] * bumps).sum(dim=0)       # [n]
+
+        return F.clamp_min(1e-12).reshape(-1)
+
+    # ---------- VI hooks ----------
+
+    def sample_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {}
+
+        # log_tau2
+        eps = torch.randn_like(self.mu_log_tau2)
+        log_tau2 = self.mu_log_tau2 + torch.exp(self.log_std_log_tau2) * eps
+        out["log_tau2"] = log_tau2.reshape(1)
+
+        # a
+        eps = torch.randn_like(self.mu_a)
+        a = self.mu_a + torch.exp(self.log_std_a) * eps
+
+        # m_raw
+        eps = torch.randn_like(self.mu_m)
+        m = self.mu_m + torch.exp(self.log_std_m) * eps
+
+        # log_s
+        eps = torch.randn_like(self.mu_log_s)
+        log_s = self.mu_log_s + torch.exp(self.log_std_log_s) * eps
+
+        # alpha
+        eps = torch.randn_like(self.mu_alpha)
+        alpha = self.mu_alpha + torch.exp(self.log_std_alpha) * eps
+
+        for k in range(self.K):
+            out[f"a{k}_raw"] = a[k:k+1]
+            out[f"m{k}_raw"] = m[k:k+1]
+            out[f"log_s{k}_raw"] = log_s[k:k+1]
+            out[f"alpha{k}_raw"] = alpha[k:k+1]
+
+        return out
+
+    @torch.no_grad()
+    def mean_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: Dict[str, torch.Tensor] = {"log_tau2": self.mu_log_tau2.detach().reshape(1)}
+        for k in range(self.K):
+            out[f"a{k}_raw"] = self.mu_a[k:k+1].detach()
+            out[f"m{k}_raw"] = self.mu_m[k:k+1].detach()
+            out[f"log_s{k}_raw"] = self.mu_log_s[k:k+1].detach()
+            out[f"alpha{k}_raw"] = self.mu_alpha[k:k+1].detach()
+        return out
+
+    def kl_q_p(self) -> torch.Tensor:
+        """
+        KL(q || p) in unconstrained space.
+        Priors: Normal(prior_mu, prior_std^2).
+        """
+        kl = torch.zeros((), dtype=self.mu_a.dtype, device=self.mu_a.device)
+
+        kl = kl + kl_normal_to_normal(
+            self.mu_log_tau2, self.log_std_log_tau2,
+            mu_p=self.prior_mu, std_p=self.prior_std
+        ).sum()
+
+        kl = kl + kl_normal_to_normal(self.mu_a, self.log_std_a, mu_p=self.prior_mu, std_p=self.prior_std).sum()
+        kl = kl + kl_normal_to_normal(self.mu_m, self.log_std_m, mu_p=self.prior_mu, std_p=self.prior_std).sum()
+        kl = kl + kl_normal_to_normal(self.mu_log_s, self.log_std_log_s, mu_p=self.prior_mu, std_p=self.prior_std).sum()
+        kl = kl + kl_normal_to_normal(self.mu_alpha, self.log_std_alpha, mu_p=self.prior_mu, std_p=self.prior_std).sum()
+
+        return kl
+
+    @torch.no_grad()
+    def mean_params(self):
+        """
+        Optional helper for printing: return (tau2_mean, a_mean).
+        We'll return tau2 and an empty 'a_mean' to avoid confusion with other filters.
+        """
+        tau2 = torch.exp(self.mu_log_tau2.detach()).reshape(())
+        a_mean = torch.empty((0,), dtype=tau2.dtype, device=tau2.device)
+        return tau2, a_mean
+
+    @torch.no_grad()
+    def spectrum_components(self, lam: torch.Tensor, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Return per-band contributions: tau2 * w_k * bump_k(lam), shape [K, n].
+        """
+        lam = lam.clamp_min(0.0)
+        t = torch.log(lam + float(self.eps_car))  # [n]
+
+        c = self._constrain(theta)
+        tau2 = c["tau2"]
+        a, m, s, w = c["a"], c["m"], c["s"], c["w"]
+
+        z = (t[None, :] - m[:, None]) / s[:, None]
+        bumps = torch.exp(a[:, None] - 0.5 * (z ** 2))  # [K,n]
+        return (tau2 * w[:, None] * bumps).clamp_min(1e-12)
