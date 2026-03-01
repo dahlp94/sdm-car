@@ -94,6 +94,13 @@ def truth_spectrum(lam: torch.Tensor, kind: str, *, eps_car: float) -> torch.Ten
         bump = 1.0 + b * torch.exp(-0.5 * ((lam - mu) / max(sig, 1e-12)) ** 2)
         F = (tau / (lam + eps_car)) * bump
         return F.clamp_min(1e-12)
+    
+    if kind == "bandpass":
+        mu = 0.35 * float(lam.max().detach().cpu())
+        sig = 0.08 * float(lam.max().detach().cpu())
+        A = 0.25
+        F = A * torch.exp(-0.5 * ((lam - mu) / max(sig, 1e-12)) ** 2)
+        return F.clamp_min(1e-12)
 
     raise ValueError(f"Unknown truth kind '{kind}'. Choose from: mix2, floor, bump.")
 
@@ -101,10 +108,25 @@ def truth_spectrum(lam: torch.Tensor, kind: str, *, eps_car: float) -> torch.Ten
 # -------------------------
 # Spectrum diagnostics
 # -------------------------
+# @torch.no_grad()
+# def spectrum_vi_mean(filter_module, lam: torch.Tensor) -> torch.Tensor:
+#     theta_mean = filter_module.mean_unconstrained()
+#     return filter_module.spectrum(lam, theta_mean)
+
+# -------------------------
+# Spectrum diagnostics
+# -------------------------
 @torch.no_grad()
-def spectrum_vi_mean(filter_module, lam: torch.Tensor) -> torch.Tensor:
-    theta_mean = filter_module.mean_unconstrained()
-    return filter_module.spectrum(lam, theta_mean)
+def spectrum_vi_mc_mean(filter_module, lam: torch.Tensor, *, S: int = 256) -> torch.Tensor:
+    """
+    Monte Carlo estimate of E_q[F(lam;theta)] under the VI posterior q(theta).
+    This is the right quantity for nonlinear filters (mixtures, splines, etc.).
+    """
+    acc = torch.zeros_like(lam)
+    for _ in range(S):
+        th = filter_module.sample_unconstrained()
+        acc += filter_module.spectrum(lam, th)
+    return acc / float(S)
 
 
 @torch.no_grad()
@@ -266,7 +288,9 @@ def run_fit(
         phi_vi, _ = model.posterior_phi(mode="mc", num_mc=64)
         rmse_phi_vi = float(torch.sqrt(torch.mean((phi_vi.detach().cpu() - phi_true.cpu()) ** 2)).item())
 
-        F_vi = spectrum_vi_mean(model.filter, lam).detach()
+        # F_vi = spectrum_vi_mean(model.filter, lam).detach()
+        # rmse_logF_vi = rmse_log_spectrum(F_vi, F_true)
+        F_vi = spectrum_vi_mc_mean(model.filter, lam, S=256).detach()
         rmse_logF_vi = rmse_log_spectrum(F_vi, F_true)
 
     # define "mcmc outputs" so VI-only works cleanly
@@ -326,7 +350,7 @@ def run_fit(
         lam_np = lam.detach().cpu().numpy()
         curves = {
             "truth": F_true.detach().cpu().numpy(),
-            f"{label} (VI)": F_vi_cpu.numpy(),
+            f"{label} (VI)M": F_vi_cpu.numpy(),
         }
         if F_mcmc_cpu is not None:
             curves[f"{label} (MCMC)"] = F_mcmc_cpu.numpy()
@@ -418,7 +442,7 @@ def _sort_key(r: FitResult) -> float:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--truth", required=True, choices=["mix2", "floor", "bump"])
+    p.add_argument("--truth", required=True, choices=["mix2", "floor", "bump", "bandpass"])
 
     # Legacy mode (optional now)
     p.add_argument(
