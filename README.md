@@ -182,7 +182,7 @@ All filters are implemented under a unified interface and support **both VI and 
 | Leroux CAR            | $\tau^2 / \big((1-\rho) + \rho \lambda\big)$                | Convex blend of IID and CAR            |
 | Matérn-like           | $\tau^2 (\lambda + \rho_0)^{-\nu}$                          | Learnable smoothness exponent          |
 | Polynomial / Rational | Low-order polynomial or rational functions of $\lambda$    | Structured parametric flexibility      |
-| Multiscale bump mixture | $\tau^2 \sum_{k=1}^{K} w_k \exp\!\left(a_k - \tfrac12 \left(\frac{\log(\lambda+\varepsilon_{\text{car}})-m_k}{s_k}\right)^2\right)$ | Mixture of localized spectral bumps (multi-scale spatial structure) |
+| Multiscale bump mixture | $\tau^2 \sum_{k=1}^{K} w_k \exp \left(a_k - \tfrac12 \left(\frac{\log(\lambda+\varepsilon_{\text{car}})-m_k}{s_k}\right)^2\right)$ | Mixture of localized spectral bumps (multi-scale spatial structure) |
 | Log-spline            | $\tau^2(\lambda+\rho_0)^{-1} \exp\{s(\lambda)\}$            | Semi-nonparametric spectral correction |
 
 Where:
