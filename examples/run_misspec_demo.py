@@ -56,24 +56,54 @@ class FitResult:
     rmse_phi_mcmc: Optional[float]
     rmse_logF_vi: float
     rmse_logF_mcmc: Optional[float]
-
+    pll_vi: Optional[float] = None  # store predictive metrics
+    pll_mcmc: Optional[float] = None    # store predictive metrics
 
 # -------------------------
 # Truth spectra (misspec)
 # -------------------------
 def truth_spectrum(lam: torch.Tensor, kind: str, *, eps_car: float) -> torch.Tensor:
     """
-    Return F_true(lam) [n] for misspecified truth.
+    Return a synthetic “misspecified truth” spectral variance F_true(lam)
+    for evaluating SDM-CAR against classical CAR-type models.
 
-    Recommended kinds:
-      - mix2 : CAR-like + diffusion tail (two-scale)
-      - floor: CAR-like + flat floor
-      - bump : CAR-like with mid-frequency bump
+    All options produce strictly positive spectra (clamped to 1e-12).
+
+    Available kinds:
+
+    - mix2
+        Two-scale spectrum: CAR-like low-frequency power plus
+        an exponential diffusion tail.
+        F(lam) = τ₁/(lam+eps) + τ₂ exp(-alam)
+
+    - floor
+        CAR-like spectrum with a constant floor (violates pure CAR form).
+        F(lam) = τ/(lam+eps) + c
+
+    - bump
+        CAR backbone with multiplicative mid-frequency bump.
+        F(lam) = τ/(lam+eps) · (1 + b · exp(-(lam-mu)² / (2sigma2)))
+
+    - bandpass
+        Pure band-pass spectrum (energy concentrated in a mid-frequency band).
+        F(lam) = A · exp(-(lam-mu)² / (2sigma2))
+
+    - steep
+        Stronger high-frequency decay than classical CAR.
+        F(lam) = τ/(lam+eps)²
+
+    - bimodal
+        Two separated band-pass peaks (bimodal spectral density).
+        F(lam) = bump1(lam) + bump2(lam)
+
+    These cases are designed to test scenarios where classical CAR
+    (monotone 1/(lam+rho) structure) may be misspecified.
     """
     lam = lam.clamp_min(0.0)
     kind = kind.lower()
 
     if kind == "mix2":
+        # CAR-like + diffusion tail (two-scale)
         tau1 = 0.20
         tau2 = 0.25
         a = 8.0
@@ -81,28 +111,59 @@ def truth_spectrum(lam: torch.Tensor, kind: str, *, eps_car: float) -> torch.Ten
         return F.clamp_min(1e-12)
 
     if kind == "floor":
+        # CAR-like + flat floor
         tau = 0.20
         c = 0.03
         F = (tau / (lam + eps_car)) + c
         return F.clamp_min(1e-12)
 
     if kind == "bump":
+        # CAR-like with mid-frequency bump
         tau = 0.18
-        mu = 0.35 * float(lam.max().detach().cpu())
-        sig = 0.12 * float(lam.max().detach().cpu())
+        lam_max = float(lam.max().detach().cpu())
+        mu = 0.35 * lam_max
+        sig = 0.12 * lam_max
         b = 0.9
         bump = 1.0 + b * torch.exp(-0.5 * ((lam - mu) / max(sig, 1e-12)) ** 2)
         F = (tau / (lam + eps_car)) * bump
         return F.clamp_min(1e-12)
-    
+
     if kind == "bandpass":
-        mu = 0.35 * float(lam.max().detach().cpu())
-        sig = 0.08 * float(lam.max().detach().cpu())
+        # Pure band-pass bump (Gaussian in linear lam)
+        lam_max = float(lam.max().detach().cpu())
+        mu = 0.35 * lam_max
+        sig = 0.08 * lam_max
         A = 0.25
         F = A * torch.exp(-0.5 * ((lam - mu) / max(sig, 1e-12)) ** 2)
         return F.clamp_min(1e-12)
 
-    raise ValueError(f"Unknown truth kind '{kind}'. Choose from: mix2, floor, bump.")
+    if kind == "steep":
+        # Stronger high-frequency suppression than classic CAR
+        tau = 0.25
+        F = tau / (lam + eps_car) ** 2
+        return F.clamp_min(1e-12)
+
+    if kind == "bimodal":
+        # Two separated band-pass bumps
+        lam_max = float(lam.max().detach().cpu())
+
+        mu1 = 0.15 * lam_max
+        mu2 = 0.55 * lam_max
+
+        sig1 = 0.06 * lam_max
+        sig2 = 0.08 * lam_max
+
+        A1 = 0.20
+        A2 = 0.18
+
+        bump1 = A1 * torch.exp(-0.5 * ((lam - mu1) / max(sig1, 1e-12)) ** 2)
+        bump2 = A2 * torch.exp(-0.5 * ((lam - mu2) / max(sig2, 1e-12)) ** 2)
+
+        F = bump1 + bump2
+        return F.clamp_min(1e-12)
+
+    choices = ["mix2", "floor", "bump", "bandpass", "steep", "bimodal"]
+    raise ValueError(f"Unknown truth kind '{kind}'. Choose from: {', '.join(choices)}.")
 
 
 # -------------------------
@@ -207,6 +268,411 @@ def rmse_log_spectrum(F_hat: torch.Tensor, F_true: torch.Tensor) -> float:
     return float(torch.sqrt(torch.mean((a - b) ** 2)).detach().cpu().item())
 
 
+def make_split(n: int, test_frac: float, seed: int):
+    rng = np.random.RandomState(seed)
+    idx = np.arange(n)
+    rng.shuffle(idx)
+    n_test = int(test_frac * n)
+    n_test = max(1, min(n - 1, n_test))
+    test_idx = np.sort(idx[:n_test])
+    train_idx = np.sort(idx[n_test:])
+    return train_idx, test_idx
+
+def _k_blocks_from_spectrum(
+    U: torch.Tensor,
+    F: torch.Tensor,
+    sigma2: float,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+):
+    """
+    Build covariance blocks for y = X beta + phi + eps,
+    where phi ~ N(0, U diag(F) U^T), eps ~ N(0, sigma2 I).
+
+    Returns:
+      K_tt, K_st, K_ss
+    """
+    device = U.device
+    dtype = U.dtype
+
+    tr = torch.as_tensor(train_idx, device=device)
+    te = torch.as_tensor(test_idx, device=device)
+
+    Utr = U[tr, :]  # [n_tr, n]
+    Ute = U[te, :]  # [n_te, n]
+
+    F_row = F.clamp_min(1e-12).reshape(1, -1)
+
+    # K_tt = Utr diag(F) Utr^T + sigma2 I
+    K_tt = (Utr * F_row) @ Utr.T
+
+    # K_st = Ute diag(F) Utr^T
+    K_st = (Ute * F_row) @ Utr.T
+
+    # K_ss = Ute diag(F) Ute^T + sigma2 I
+    K_ss = (Ute * F_row) @ Ute.T
+
+    K_tt = K_tt + sigma2 * torch.eye(K_tt.shape[0], device=device, dtype=dtype)
+    K_ss = K_ss + sigma2 * torch.eye(K_ss.shape[0], device=device, dtype=dtype)
+
+    return K_tt, K_st, K_ss
+
+
+def conditional_predictive_loglik(
+    *,
+    y: torch.Tensor,
+    X: torch.Tensor,
+    beta: torch.Tensor,     # [p]
+    U: torch.Tensor,
+    F: torch.Tensor,        # [n]
+    sigma2: float,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+) -> float:
+    """
+    Compute log p(y_test | y_train, beta, sigma2, F) under the exact Gaussian conditional.
+
+    Returns a scalar float (CPU).
+    """
+    device = y.device
+    dtype = y.dtype
+
+    tr = torch.as_tensor(train_idx, device=device)
+    te = torch.as_tensor(test_idx, device=device)
+
+    y_tr = y[tr]
+    y_te = y[te]
+    X_tr = X[tr, :]
+    X_te = X[te, :]
+
+    mu_tr = X_tr @ beta
+    mu_te = X_te @ beta
+    r_tr = y_tr - mu_tr  # residuals
+
+    K_tt, K_st, K_ss = _k_blocks_from_spectrum(U, F, sigma2, train_idx, test_idx)
+
+    # Solve K_tt^{-1} r_tr and K_tt^{-1} K_ts via Cholesky
+    L = torch.linalg.cholesky(K_tt)
+
+    # alpha = K_tt^{-1} r_tr
+    alpha = torch.cholesky_solve(r_tr.reshape(-1, 1), L).reshape(-1)
+
+    # Conditional mean: mu_te + K_st K_tt^{-1} r_tr
+    cond_mean = mu_te + (K_st @ alpha)
+
+    # Conditional cov: K_ss - K_st K_tt^{-1} K_ts
+    # First solve V = K_tt^{-1} K_ts, where K_ts = K_st^T
+    V = torch.cholesky_solve(K_st.T, L)  # [n_tr, n_te]
+    cond_cov = K_ss - (K_st @ V)
+
+    # MVN logpdf: -0.5*( (y-m)^T C^{-1} (y-m) + logdet(C) + n log(2π) )
+    e = (y_te - cond_mean).reshape(-1, 1)
+
+    # Stabilize (tiny jitter)
+    jitter = 1e-8
+    cond_cov = cond_cov + jitter * torch.eye(cond_cov.shape[0], device=device, dtype=dtype)
+
+    Lc = torch.linalg.cholesky(cond_cov)
+    sol = torch.cholesky_solve(e, Lc)  # C^{-1} e
+    quad = float((e.T @ sol).reshape(()).detach().cpu())
+    logdet = float((2.0 * torch.log(torch.diag(Lc))).sum().detach().cpu())
+    n_te = cond_cov.shape[0]
+
+    ll = -0.5 * (quad + logdet + n_te * math.log(2.0 * math.pi))
+    return float(ll)
+
+@torch.no_grad()
+def predictive_loglik_vi_heldout(
+    *,
+    model: SpectralCAR_FullVI,
+    y: torch.Tensor,
+    X: torch.Tensor,
+    U: torch.Tensor,
+    lam: torch.Tensor,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    S: int = 16,
+    use_plugin_beta: bool = True,
+    sample_sigma2: bool = False,
+) -> float:
+    """
+    Monte Carlo estimate of held-out predictive log-likelihood:
+        log p(y_test | y_train) under VI posterior.
+
+    We MC over theta ~ q(theta). Optionally MC over s=log sigma2 ~ q(s).
+    For stability, we typically use plugin beta (posterior mean under plugin hypers).
+    """
+    # plugin beta mean is stable and consistent with our collapsed approach
+    m_beta_plugin, _, sigma2_plugin, _ = model.beta_posterior_plugin()
+    beta = m_beta_plugin.reshape(-1)
+
+    logliks = []
+
+    for _ in range(int(S)):
+        # sample theta from q(theta)
+        theta = model.filter.sample_unconstrained()
+        F = model.filter.spectrum(lam, theta).clamp_min(1e-12)
+
+        # choose sigma2
+        if sample_sigma2:
+            eps = torch.randn_like(model.mu_log_sigma2)
+            s = model.mu_log_sigma2 + torch.exp(model.log_std_log_sigma2) * eps
+            sigma2 = float(torch.exp(s).clamp_min(1e-12).detach().cpu())
+        else:
+            sigma2 = float(sigma2_plugin.detach().cpu())
+
+        # optionally: draw-consistent beta (more expensive, more variance)
+        if not use_plugin_beta:
+            denom = (F + torch.tensor(sigma2, device=F.device, dtype=F.dtype)).clamp_min(1e-12)
+            inv_var = 1.0 / denom
+            beta, _ = model._beta_update(inv_var, return_Xt_invSig_X=False)
+            beta = beta.reshape(-1)
+
+        ll = conditional_predictive_loglik(
+            y=y, X=X, beta=beta, U=U, F=F, sigma2=sigma2,
+            train_idx=train_idx, test_idx=test_idx,
+        )
+        logliks.append(ll)
+
+    # log-mean-exp to approximate p(y_test|y_train) = E_q[ p(y_test|y_train,theta,s) ]
+    a = max(logliks)
+    pll = a + math.log(sum(math.exp(v - a) for v in logliks) / float(len(logliks)))
+    return float(pll)
+
+@torch.no_grad()
+def predictive_loglik_mcmc_heldout(
+    *,
+    model: SpectralCAR_FullVI,
+    theta_chain: torch.Tensor,         # [T, d]
+    s_chain: Optional[torch.Tensor],   # [T] log sigma2, if available
+    y: torch.Tensor,
+    X: torch.Tensor,
+    U: torch.Tensor,
+    lam: torch.Tensor,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    S: int = 16,
+) -> float:
+    """
+    Held-out predictive log-likelihood using MCMC draws.
+    Uses plugin beta (from VI model) for stability and to avoid storing beta chain.
+    """
+    # stable beta
+    beta, _, sigma2_plugin, _ = model.beta_posterior_plugin()
+    beta = beta.reshape(-1)
+
+    T = theta_chain.shape[0]
+    if T <= S:
+        picks = np.arange(T)
+    else:
+        picks = np.linspace(0, T - 1, S).astype(int)
+
+    logliks = []
+    for i in picks:
+        theta = model.filter.unpack(theta_chain[i])
+        F = model.filter.spectrum(lam, theta).clamp_min(1e-12)
+
+        if s_chain is not None:
+            sigma2 = float(torch.exp(s_chain[i]).clamp_min(1e-12).detach().cpu())
+        else:
+            sigma2 = float(sigma2_plugin.detach().cpu())
+
+        ll = conditional_predictive_loglik(
+            y=y, X=X, beta=beta, U=U, F=F, sigma2=sigma2,
+            train_idx=train_idx, test_idx=test_idx,
+        )
+        logliks.append(ll)
+
+    a = max(logliks)
+    pll = a + math.log(sum(math.exp(v - a) for v in logliks) / float(len(logliks)))
+    return float(pll)
+
+@torch.no_grad()
+def phi_posterior_mean_from_train(
+    *,
+    U_train: torch.Tensor,   # [n_tr, n]
+    U_full: torch.Tensor,    # [n, n]
+    X_train: torch.Tensor,   # [n_tr, p]
+    y_train: torch.Tensor,   # [n_tr]
+    beta: torch.Tensor,      # [p]
+    lam: torch.Tensor,       # [n]
+    F: torch.Tensor,         # [n]
+    sigma2: float,
+) -> torch.Tensor:
+    """
+    Posterior mean of full phi = U_full mu_z,
+    where mu_z is computed from training observations only.
+
+    z | y_train ~ N(mu_z, diag(v_spec)) with:
+      mu_z = (F/(F+sigma2)) ⊙ (U_train^T r_train)
+      r_train = y_train - X_train beta
+    """
+    r_tr = y_train - X_train @ beta
+    Ut_r = U_train.T @ r_tr                          # [n]
+    shrink = (F / (F + sigma2)).clamp(0.0, 1.0)      # [n]
+    mu_z = shrink * Ut_r                             # [n]
+    phi_full = U_full @ mu_z                         # [n]
+    return phi_full
+
+@torch.no_grad()
+def compute_phi_vi_full(
+    *,
+    model: SpectralCAR_FullVI,
+    lam: torch.Tensor,
+    U_train: torch.Tensor,
+    U_full: torch.Tensor,
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    mode: str = "plugin",      # "plugin" or "posterior"
+    S: int = 64,               # only used for "posterior"
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """
+    Returns:
+      phi_full: [n] full-domain posterior mean of phi under VI (depending on mode)
+      F_used  : [n] spectrum summary used (E_q[F] for plugin; average of draws for posterior)
+      sigma2  : float (plugin sigma2)
+    """
+    beta_mean, _, sigma2_plugin, _ = model.beta_posterior_plugin()
+    beta_mean = beta_mean.reshape(-1)
+    sigma2 = float(sigma2_plugin.detach().cpu())
+
+    if mode == "plugin":
+        # E_q[F]
+        F_used = spectrum_vi_mc_mean(model.filter, lam, S=256).detach()
+        phi = phi_full_from_train(
+            U_train=U_train, U_full=U_full,
+            X_train=X_train, y_train=y_train,
+            beta=beta_mean, F=F_used.to(lam.device), sigma2=sigma2,
+        )
+        return phi, F_used.detach(), sigma2
+
+    if mode == "posterior":
+        # Average phi over theta ~ q(theta)
+        acc_phi = torch.zeros(U_full.shape[0], device=lam.device, dtype=lam.dtype)
+        acc_F = torch.zeros_like(lam)
+
+        for _ in range(int(S)):
+            th = model.filter.sample_unconstrained()
+            F = model.filter.spectrum(lam, th).clamp_min(1e-12)
+            phi = phi_full_from_train(
+                U_train=U_train, U_full=U_full,
+                X_train=X_train, y_train=y_train,
+                beta=beta_mean, F=F, sigma2=sigma2,
+            )
+            acc_phi += phi
+            acc_F += F
+
+        phi = acc_phi / float(S)
+        F_used = acc_F / float(S)
+        return phi.detach(), F_used.detach(), sigma2
+
+    raise ValueError(f"Unknown VI phi mode '{mode}'. Choose from: plugin, posterior.")
+
+@torch.no_grad()
+def compute_phi_mcmc_full(
+    *,
+    model: SpectralCAR_FullVI,
+    lam: torch.Tensor,
+    theta_chain: torch.Tensor,          # [T, d]
+    s_chain: Optional[torch.Tensor],    # [T] or None (log sigma2)
+    U_train: torch.Tensor,
+    U_full: torch.Tensor,
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    mode: str = "plugin",               # "plugin" or "posterior"
+    max_draws: int = 256,               # cap draws for posterior mode
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """
+    Returns:
+      phi_full: [n]
+      F_used  : [n]  (mean spectrum over draws for both modes)
+      sigma2  : float (plugin sigma2 unless s_chain provided & mode=='posterior' uses per-draw)
+    """
+    # plugin beta/sigma2 from the TRAIN-fit model (clean, stable)
+    beta_mean, _, sigma2_plugin, _ = model.beta_posterior_plugin()
+    beta_mean = beta_mean.reshape(-1)
+    sigma2_plug = float(sigma2_plugin.detach().cpu())
+
+    # mean spectrum over chain (useful to report regardless)
+    F_mean = spectrum_mcmc_mean(model.filter, lam, theta_chain).detach()
+
+    if mode == "plugin":
+        phi = phi_full_from_train(
+            U_train=U_train, U_full=U_full,
+            X_train=X_train, y_train=y_train,
+            beta=beta_mean, F=F_mean.to(lam.device), sigma2=sigma2_plug,
+        )
+        return phi.detach(), F_mean.detach(), sigma2_plug
+
+    if mode == "posterior":
+        T = theta_chain.shape[0]
+        S = min(int(max_draws), int(T))
+        if T <= S:
+            picks = np.arange(T)
+        else:
+            picks = np.linspace(0, T - 1, S).astype(int)
+
+        acc_phi = torch.zeros(U_full.shape[0], device=lam.device, dtype=lam.dtype)
+        acc_F = torch.zeros_like(lam)
+
+        for i in picks:
+            theta_i = model.filter.unpack(theta_chain[i])
+            F_i = model.filter.spectrum(lam, theta_i).clamp_min(1e-12)
+
+            if s_chain is not None:
+                sigma2_i = float(torch.exp(s_chain[i]).clamp_min(1e-12).detach().cpu())
+            else:
+                sigma2_i = sigma2_plug
+
+            phi_i = phi_full_from_train(
+                U_train=U_train, U_full=U_full,
+                X_train=X_train, y_train=y_train,
+                beta=beta_mean, F=F_i, sigma2=sigma2_i,
+            )
+
+            acc_phi += phi_i
+            acc_F += F_i
+
+        phi = acc_phi / float(len(picks))
+        F_used = acc_F / float(len(picks))
+        # return sigma2_plug just as a reference (actual used may vary if s_chain exists)
+        return phi.detach(), F_used.detach(), sigma2_plug
+
+    raise ValueError(f"Unknown MCMC phi mode '{mode}'. Choose from: plugin, posterior.")
+
+@torch.no_grad()
+def phi_full_from_train(
+    *,
+    U_train: torch.Tensor,   # [n_tr, n]
+    U_full: torch.Tensor,    # [n, n]
+    X_train: torch.Tensor,   # [n_tr, p]
+    y_train: torch.Tensor,   # [n_tr]
+    beta: torch.Tensor,      # [p]
+    F: torch.Tensor,         # [n]
+    sigma2: float,
+) -> torch.Tensor:
+    """
+    Posterior mean of full phi given TRAIN observations only and fixed (beta, F, sigma2).
+
+    Model:
+        phi = U_full z
+        z ~ N(0, diag(F))
+        y_train = X_train beta + U_train z + eps, eps ~ N(0, sigma2 I)
+
+    Then:
+        mu_z = (F / (F + sigma2)) ⊙ (U_train^T r_train)
+        r_train = y_train - X_train beta
+
+        E[phi | y_train, beta, F, sigma2] = U_full mu_z
+    """
+    r_tr = y_train - X_train @ beta                  # [n_tr]
+    Ut_r = U_train.T @ r_tr                          # [n]
+    shrink = (F / (F + sigma2)).clamp(0.0, 1.0)      # [n]
+    mu_z = shrink * Ut_r                             # [n]
+    return U_full @ mu_z                             # [n]
+
+
+
 # -------------------------
 # Run one fit
 # -------------------------
@@ -214,10 +680,13 @@ def run_fit(
     *,
     spec_name: str,
     case_id: str,
-    X: torch.Tensor,
-    y: torch.Tensor,
+    X_full: torch.Tensor,
+    y_full: torch.Tensor,
+    U_full: torch.Tensor,
+    X_tr: torch.Tensor,
+    y_tr: torch.Tensor,
+    U_tr: torch.Tensor,
     lam: torch.Tensor,
-    U: torch.Tensor,
     coords: torch.Tensor,
     phi_true: torch.Tensor,
     beta_true: torch.Tensor,
@@ -236,6 +705,13 @@ def run_fit(
     mcmc_thin: int,
     compare_only: bool,
     skip_mcmc: bool,
+    train_idx: np.ndarray,
+    test_idx: np.ndarray,
+    pll_mc: int,
+    vi_log_every: int,
+    phi_vi_mode: str,
+    phi_mcmc_mode: str,
+    phi_draws: int,
 ) -> Optional[FitResult]:
     spec = get_filter_spec(spec_name)
     if case_id not in spec.cases:
@@ -262,10 +738,10 @@ def run_fit(
 
     # VI model
     model = SpectralCAR_FullVI(
-        X=X,
-        y=y,
+        X=X_tr,
+        y=y_tr,
         lam=lam,
-        U=U,
+        U=U_tr,
         filter_module=filter_module,
         prior_m0=None,
         prior_V0=prior_V0,
@@ -277,21 +753,44 @@ def run_fit(
     opt = torch.optim.Adam(model.parameters(), lr=vi_lr)
 
     # Train VI
-    for _ in range(vi_iters):
+    for it in range(1, vi_iters + 1):
         opt.zero_grad()
         elbo, _ = model.elbo()
-        (-elbo).backward()
+        loss = -elbo
+        loss.backward()
         opt.step()
 
-    # VI phi + spectrum
-    with torch.no_grad():
-        phi_vi, _ = model.posterior_phi(mode="mc", num_mc=64)
-        rmse_phi_vi = float(torch.sqrt(torch.mean((phi_vi.detach().cpu() - phi_true.cpu()) ** 2)).item())
+        if vi_log_every and (it % vi_log_every == 0 or it == 1 or it == vi_iters):
+            print(f"  [VI] iter {it:>5}/{vi_iters}  ELBO={float(elbo.detach().cpu()):.3f}")
 
-        # F_vi = spectrum_vi_mean(model.filter, lam).detach()
-        # rmse_logF_vi = rmse_log_spectrum(F_vi, F_true)
-        F_vi = spectrum_vi_mc_mean(model.filter, lam, S=256).detach()
-        rmse_logF_vi = rmse_log_spectrum(F_vi, F_true)
+    # VI phi + spectrum
+    # VI phi + spectrum (switch)
+    with torch.no_grad():
+        # 1) phi + spectrum summary in one place
+        phi_vi_full, F_vi_used, _sigma2 = compute_phi_vi_full(
+            model=model,
+            lam=lam,
+            U_train=U_tr,
+            U_full=U_full,
+            X_train=X_tr,
+            y_train=y_tr,
+            mode=phi_vi_mode,                # <-- SWITCH HERE
+            S=max(1, int(phi_draws)),        # draws if posterior mode
+        )
+
+        rmse_phi_vi = float(torch.sqrt(torch.mean((phi_vi_full.cpu() - phi_true.cpu()) ** 2)).item())
+        rmse_logF_vi = rmse_log_spectrum(F_vi_used, F_true)
+
+        pll_vi = predictive_loglik_vi_heldout(
+            model=model,
+            y=y_full, X=X_full, U=U_full, lam=lam,
+            train_idx=train_idx, test_idx=test_idx,
+            S=pll_mc,
+            use_plugin_beta=True,
+            sample_sigma2=False,
+        )
+
+    F_vi_cpu = F_vi_used.detach().cpu()
 
     # define "mcmc outputs" so VI-only works cleanly
     phi_mcmc = None
@@ -301,7 +800,6 @@ def run_fit(
     acc_s_mid = None
     acc_theta_mid = None
 
-    F_vi_cpu = F_vi.detach().cpu()
 
     # MCMC becomes optional
     if (not skip_mcmc) and (mcmc_steps > 0):
@@ -313,6 +811,7 @@ def run_fit(
             step_theta=case_spec.get_step_theta(model.filter),
             seed=0,
             device=device,
+            print_every=5000
         )
         sampler = make_collapsed_mcmc_from_model(model, config=cfg)
 
@@ -320,23 +819,56 @@ def run_fit(
         theta0 = model.filter.mean_unconstrained()
         init_theta_vec = model.filter.pack(theta0).detach()
 
+        print(
+            f"  [MCMC] starting: steps={mcmc_steps}, burnin={mcmc_burnin}, thin={mcmc_thin} "
+            f"(kept draws ~ {(mcmc_steps - mcmc_burnin)//mcmc_thin if mcmc_steps > mcmc_burnin else 0})"
+        )
+
         out = sampler.run(
             init_s=init_s,
             init_theta_vec=init_theta_vec,
             init_from_conditional_beta=True,
             store_phi_mean=True,
-            U=U,
-            X=X,
-            y=y,
+            U=U_tr,
+            X=X_tr,
+            y=y_tr,
         )
 
-        phi_mean_chain = out["phi_mean"]  # [S,n]
-        phi_mcmc = phi_mean_chain.mean(dim=0)
-        rmse_phi_mcmc = float(torch.sqrt(torch.mean((phi_mcmc - phi_true.cpu()) ** 2)).item())
+        print("  [MCMC] finished")
 
-        theta_chain = out["theta"]  # [S,d]
+        theta_chain = out["theta"]                 # [S, d]
+        s_chain = out.get("s", None)               # [S] or None
+
+        # PLL (full y/X/U, conditioned on train/test)
+        pll_mcmc = predictive_loglik_mcmc_heldout(
+            model=model,
+            theta_chain=theta_chain,
+            s_chain=s_chain,
+            y=y_full, X=X_full, U=U_full, lam=lam,
+            train_idx=train_idx, test_idx=test_idx,
+            S=pll_mc,
+        )
+
+        # Spectrum summary (keep this; used for RMSE + plots)
         F_mcmc = spectrum_mcmc_mean(model.filter, lam, theta_chain).detach()
         rmse_logF_mcmc = rmse_log_spectrum(F_mcmc, F_true)
+        F_mcmc_cpu = F_mcmc.detach().cpu()
+
+        # Phi summary (SWITCH HERE)
+        phi_mcmc_full, _, _ = compute_phi_mcmc_full(
+            model=model,
+            lam=lam,
+            theta_chain=theta_chain,
+            s_chain=s_chain,
+            U_train=U_tr,
+            U_full=U_full,
+            X_train=X_tr,
+            y_train=y_tr,
+            mode=phi_mcmc_mode,
+            max_draws=max(1, int(phi_draws)),
+        )
+
+        rmse_phi_mcmc = float(torch.sqrt(torch.mean((phi_mcmc_full.cpu() - phi_true.cpu()) ** 2)).item())
 
         acc_s_mid = float(out["acc"]["s"][2])
         acc_theta_mid = {k: float(v[2]) for k, v in out["acc"]["theta"].items()}
@@ -350,7 +882,7 @@ def run_fit(
         lam_np = lam.detach().cpu().numpy()
         curves = {
             "truth": F_true.detach().cpu().numpy(),
-            f"{label} (VI)M": F_vi_cpu.numpy(),
+            f"{label} (VI)": F_vi_cpu.numpy(),
         }
         if F_mcmc_cpu is not None:
             curves[f"{label} (MCMC)"] = F_mcmc_cpu.numpy()
@@ -360,14 +892,14 @@ def run_fit(
 
         diagnostics.plot_phi_mean_vs_true(
             coords=coords,
-            mean_phi=phi_vi.to(device),
+            mean_phi=phi_vi_full.to(device),
             phi_true=phi_true,
             save_path_prefix=str(case_dir / "phi_vi"),
         )
-        if phi_mcmc is not None:
+        if (not skip_mcmc) and (mcmc_steps > 0) and (phi_mcmc_full is not None):
             diagnostics.plot_phi_mean_vs_true(
                 coords=coords,
-                mean_phi=phi_mcmc.to(device=device, dtype=torch.double),
+                mean_phi=phi_mcmc_full.to(device=device, dtype=torch.double),
                 phi_true=phi_true,
                 save_path_prefix=str(case_dir / "phi_mcmc"),
             )
@@ -395,6 +927,8 @@ def run_fit(
         rmse_phi_mcmc=rmse_phi_mcmc,
         rmse_logF_vi=rmse_logF_vi,
         rmse_logF_mcmc=rmse_logF_mcmc,
+        pll_vi=float(pll_vi) if "pll_vi" in locals() else None,
+        pll_mcmc=float(pll_mcmc) if "pll_mcmc" in locals() else None,
     )
 
 
@@ -437,12 +971,17 @@ def parse_fit_specs(args) -> List[FitSpec]:
 
 
 def _sort_key(r: FitResult) -> float:
+    # sort descending PLL; fallback to logF RMSE
+    if r.pll_mcmc is not None:
+        return -r.pll_mcmc
+    if r.pll_vi is not None:
+        return -r.pll_vi
     return r.rmse_logF_mcmc if r.rmse_logF_mcmc is not None else r.rmse_logF_vi
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--truth", required=True, choices=["mix2", "floor", "bump", "bandpass"])
+    p.add_argument("--truth", required=True, choices=["mix2", "floor", "bump", "bandpass", "steep", "bimodal"])
 
     # Legacy mode (optional now)
     p.add_argument(
@@ -482,6 +1021,29 @@ def main():
         help="Skip per-fit plots; still writes COMPARE overlay plots + leaderboard.",
     )
     p.add_argument("--skip_mcmc", action="store_true", help="Skip MCMC for all fits (VI only).")
+    p.add_argument("--test_frac", type=float, default=0.2)
+    p.add_argument("--split_seed", type=int, default=0)
+    p.add_argument("--pll_mc", type=int, default=16, help="MC draws for predictive log-lik (VI/MCMC). Keep small.")
+    p.add_argument("--vi_log_every", type=int, default=200, help="Print VI iteration every k steps (0 disables).")
+
+    p.add_argument(
+        "--phi_vi_mode",
+        choices=["plugin", "posterior"],
+        default="plugin",
+        help="How to compute VI phi mean on full domain.",
+    )
+    p.add_argument(
+        "--phi_mcmc_mode",
+        choices=["plugin", "posterior"],
+        default="plugin",
+        help="How to compute MCMC phi mean on full domain.",
+    )
+    p.add_argument(
+        "--phi_draws",
+        type=int,
+        default=128,
+        help="Number of draws used when phi_*_mode=posterior (caps MCMC draws).",
+    )
 
     args = p.parse_args()
 
@@ -529,6 +1091,12 @@ def main():
 
     sigma2_true = 0.10
     y = X @ beta_true + phi_true + math.sqrt(sigma2_true) * torch.randn(n, dtype=torch.double, device=device)
+    train_idx, test_idx = make_split(n, test_frac=args.test_frac, seed=args.split_seed)
+
+    tr = torch.as_tensor(train_idx, device=device)
+    X_tr = X[tr, :]
+    y_tr = y[tr]
+    U_tr = U[tr, :]
 
     # Prior on beta
     sigma2_beta = 10.0
@@ -552,7 +1120,9 @@ def main():
         r = run_fit(
             spec_name=fs.filter,
             case_id=fs.case,
-            X=X, y=y, lam=lam, U=U, coords=coords,
+            X_full=X, y_full=y, U_full=U,
+            X_tr=X_tr, y_tr=y_tr, U_tr=U_tr,
+            lam=lam, coords=coords,
             phi_true=phi_true, beta_true=beta_true,
             F_true=F_true,
             sigma2_true=sigma2_true,
@@ -569,6 +1139,13 @@ def main():
             mcmc_thin=args.mcmc_thin,
             compare_only=args.compare_only,
             skip_mcmc=args.skip_mcmc,
+            train_idx=train_idx,
+            test_idx=test_idx,
+            pll_mc=args.pll_mc,
+            vi_log_every=args.vi_log_every,
+            phi_vi_mode=args.phi_vi_mode,
+            phi_mcmc_mode=args.phi_mcmc_mode,
+            phi_draws=args.phi_draws,
         )
         if r is not None:
             results.append(r)
@@ -589,11 +1166,16 @@ def main():
         print("=" * 80)
         for r in sorted(results, key=_sort_key):
             mcmc_logF = f"{r.rmse_logF_mcmc:.4f}" if r.rmse_logF_mcmc is not None else "NA"
-            mcmc_phi = f"{r.rmse_phi_mcmc:.4f}" if r.rmse_phi_mcmc is not None else "NA"
+            mcmc_phi  = f"{r.rmse_phi_mcmc:.4f}"  if r.rmse_phi_mcmc  is not None else "NA"
+
+            pll_vi   = f"{r.pll_vi:.2f}"   if r.pll_vi   is not None else "NA"
+            pll_mcmc = f"{r.pll_mcmc:.2f}" if r.pll_mcmc is not None else "NA"
+
             print(
                 f"{r.label:<32} | "
                 f"logF_RMSE(VI)={r.rmse_logF_vi:.4f}  logF_RMSE(MCMC)={mcmc_logF} | "
-                f"phi_RMSE(VI)={r.rmse_phi_vi:.4f}  phi_RMSE(MCMC)={mcmc_phi}"
+                f"phi_RMSE(VI)={r.rmse_phi_vi:.4f}  phi_RMSE(MCMC)={mcmc_phi} | "
+                f"PLL(VI)={pll_vi}  PLL(MCMC)={pll_mcmc}"
             )
 
         # also write to file for paper artifacts
@@ -604,10 +1186,13 @@ def main():
             for r in sorted(results, key=_sort_key):
                 mcmc_logF = f"{r.rmse_logF_mcmc:.4f}" if r.rmse_logF_mcmc is not None else "NA"
                 mcmc_phi = f"{r.rmse_phi_mcmc:.4f}" if r.rmse_phi_mcmc is not None else "NA"
+                pll_vi = f"{r.pll_vi:.2f}" if r.pll_vi is not None else "NA"
+                pll_mcmc = f"{r.pll_mcmc:.2f}" if r.pll_mcmc is not None else "NA"
                 f.write(
                     f"{r.label} | "
                     f"logF_RMSE(VI)={r.rmse_logF_vi:.4f}  logF_RMSE(MCMC)={mcmc_logF} | "
-                    f"phi_RMSE(VI)={r.rmse_phi_vi:.4f}  phi_RMSE(MCMC)={mcmc_phi}\n"
+                    f"phi_RMSE(VI)={r.rmse_phi_vi:.4f}  phi_RMSE(MCMC)={mcmc_phi} | "
+                    f"PLL(VI)={pll_vi}  PLL(MCMC)={pll_mcmc}\n"
                 )
 
 
