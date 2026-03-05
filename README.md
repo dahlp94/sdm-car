@@ -176,20 +176,29 @@ This guarantees that SDM-CAR strictly contains classical CAR as a special case a
 All filters are implemented under a unified interface and support **both VI and MCMC**.
 
 | Filter family         | Spectrum $F(\lambda)$                                      | Interpretation                         |
-| --------------------- | ----------------------------------------------------------- | -------------------------------------- |
+|----------------------|-------------------------------------------------------------|----------------------------------------|
 | Classic CAR           | $\tau^2 / (\lambda + \varepsilon_{\text{car}})$            | Classical intrinsic CAR (fixed ridge)  |
 | Inverse-linear CAR    | $\tau^2 / (\lambda + \rho_0)$                               | Proper CAR with learnable ridge        |
 | Leroux CAR            | $\tau^2 / \big((1-\rho) + \rho \lambda\big)$                | Convex blend of IID and CAR            |
 | Matérn-like           | $\tau^2 (\lambda + \rho_0)^{-\nu}$                          | Learnable smoothness exponent          |
 | Polynomial / Rational | Low-order polynomial or rational functions of $\lambda$    | Structured parametric flexibility      |
+| Multiscale bump mixture | $\tau^2 \sum_{k=1}^{K} w_k \exp\!\left(a_k - \tfrac12 \left(\frac{\log(\lambda+\varepsilon_{\text{car}})-m_k}{s_k}\right)^2\right)$ | Mixture of localized spectral bumps (multi-scale spatial structure) |
 | Log-spline            | $\tau^2(\lambda+\rho_0)^{-1} \exp\{s(\lambda)\}$            | Semi-nonparametric spectral correction |
 
 Where:
 
+* **Multiscale bump mixture** models the spectrum as a weighted sum of Gaussian bumps in **log-frequency space**, enabling the model to capture localized spectral energy and multi-scale spatial structure.
+* The bump centers $m_k$ are constrained to the valid log-frequency domain
+  \[
+  \log(\lambda + \varepsilon_{\text{car}}) \in [\log(\varepsilon_{\text{car}}), \log(\lambda_{\max} + \varepsilon_{\text{car}})]
+  \]
+  via a sigmoid transformation.
+* Mixture weights $w_k$ are obtained through a softmax transformation of unconstrained logits.
+* Width parameters $s_k$ are constrained to be positive via a softplus transform with a minimum width for numerical stability.
 * $s(\lambda)$ in **Log-spline** is a B-spline expansion over $[0, \lambda_{\max}]$.
-* Polynomial/Rational filters allow low-degree flexible approximations to unknown spectra.
-* Leroux provides a proper CAR with bounded spectrum.
-* Classic CAR fixes the ridge parameter to a known $\varepsilon_{\text{car}}$.
+* **Polynomial/Rational** filters allow low-degree flexible approximations to unknown spectra.
+* **Leroux** provides a proper CAR with bounded spectrum.
+* **Classic CAR** fixes the ridge parameter to a known $\varepsilon_{\text{car}}$.
 
 ---
 
