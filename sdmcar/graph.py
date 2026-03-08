@@ -74,6 +74,23 @@ def build_laplacian_from_radius(
     L = D - rho * W
     return L, W
 
+def build_laplacian_from_adjacency(W: torch.Tensor, rho: float = 0.95):
+    """
+    Build Laplacian L = D - rho * W from a symmetric adjacency matrix W.
+
+    Args:
+        W: [n, n] adjacency matrix.
+        rho: CAR strength parameter.
+
+    Returns:
+        L: [n, n] Laplacian matrix.
+        W: [n, n] symmetric binary adjacency matrix.
+    """
+    W = 0.5 * (W + W.T)
+    W = (W > 0).double()
+    D = torch.diag(W.sum(1))
+    L = D - rho * W
+    return L, W
 
 def laplacian_eigendecomp(L):
     """
