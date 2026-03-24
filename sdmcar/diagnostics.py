@@ -378,6 +378,108 @@ def plot_spectrum_recovery(
         "mcmc_band_space": mcmc_space,
     }
 
+
+def plot_spectrum_boxplots(
+    lam,
+    F_true,
+    F_plugin=None,
+    F_vi_draws=None,
+    F_mcmc_draws=None,
+    save_path=None,
+    title="Spectrum posterior boxplots",
+    max_boxes=40,
+    use_lam_on_x=True,
+):
+    """
+    Plot boxplots of posterior spectrum draws at selected eigenvalues.
+
+    Parameters
+    ----------
+    lam : torch.Tensor or np.ndarray, shape [n]
+        Eigenvalues.
+    F_true : torch.Tensor or np.ndarray, shape [n]
+        True spectrum values.
+    F_plugin : torch.Tensor or np.ndarray, shape [n], optional
+        Plugin VI spectrum curve to overlay.
+    F_vi_draws : torch.Tensor or np.ndarray, shape [K, n], optional
+        VI posterior draws of the spectrum.
+    F_mcmc_draws : torch.Tensor or np.ndarray, shape [S, n], optional
+        MCMC posterior draws of the spectrum.
+    save_path : str or Path, optional
+        Where to save the figure.
+    title : str
+        Plot title.
+    max_boxes : int
+        Maximum number of x-locations at which to show boxplots.
+    use_lam_on_x : bool
+        If True, use eigenvalues on x-axis; otherwise use eigenvalue index.
+    """
+    lam = np.asarray(lam.detach().cpu() if hasattr(lam, "detach") else lam).reshape(-1)
+    F_true = np.asarray(F_true.detach().cpu() if hasattr(F_true, "detach") else F_true).reshape(-1)
+
+    n = lam.shape[0]
+    idx = np.linspace(0, n - 1, min(max_boxes, n), dtype=int)
+    idx = np.unique(idx)
+
+    xvals = lam[idx] if use_lam_on_x else idx
+
+    plt.figure(figsize=(10, 5))
+
+    # Overlay truth
+    x_full = lam if use_lam_on_x else np.arange(n)
+    plt.plot(x_full, F_true, linewidth=2, label="true")
+
+    # Overlay plugin
+    if F_plugin is not None:
+        F_plugin = np.asarray(F_plugin.detach().cpu() if hasattr(F_plugin, "detach") else F_plugin).reshape(-1)
+        plt.plot(x_full, F_plugin, linewidth=2, linestyle="--", label="VI plugin")
+
+    # VI boxplots
+    if F_vi_draws is not None:
+        F_vi_draws = np.asarray(F_vi_draws.detach().cpu() if hasattr(F_vi_draws, "detach") else F_vi_draws)
+        vi_data = [F_vi_draws[:, j] for j in idx]
+        plt.boxplot(
+            vi_data,
+            positions=xvals,
+            widths=(xvals.max() - xvals.min()) / (len(xvals) * 3.0) if len(xvals) > 1 else 0.05,
+            manage_ticks=False,
+            patch_artist=False,
+            showfliers=False,
+        )
+
+    # MCMC boxplots
+    if F_mcmc_draws is not None:
+        F_mcmc_draws = np.asarray(F_mcmc_draws.detach().cpu() if hasattr(F_mcmc_draws, "detach") else F_mcmc_draws)
+        mcmc_data = [F_mcmc_draws[:, j] for j in idx]
+
+        # Slight horizontal offset to avoid overlap with VI boxplots
+        if len(xvals) > 1:
+            delta = 0.01 * (xvals.max() - xvals.min())
+        else:
+            delta = 0.02
+
+        positions = xvals + delta
+        plt.boxplot(
+            mcmc_data,
+            positions=positions,
+            widths=(xvals.max() - xvals.min()) / (len(xvals) * 3.0) if len(xvals) > 1 else 0.05,
+            manage_ticks=False,
+            patch_artist=False,
+            showfliers=False,
+        )
+
+    plt.xlabel("Eigenvalue" if use_lam_on_x else "Eigenvalue index")
+    plt.ylabel("F(λ)")
+    plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=200)
+        plt.close()
+    else:
+        plt.show()
+
 @torch.no_grad()
 def spectrum_error_log_l1(
     lam: torch.Tensor,
