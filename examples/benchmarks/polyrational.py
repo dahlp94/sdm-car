@@ -25,16 +25,16 @@ register(FilterSpec(
     cases={
         "deg1": CaseSpec(
             case_id="deg1",
-            display_name="poly_deg1",
-            fixed={"degree": 1},
+            display_name="poly_deg1_dec",
+            fixed={"degree": 1, "mode": "decreasing"},
             build_filter=build_poly,
             step_s=0.12,
             step_theta=lambda f: {"log_tau2": 0.20, **{nm: 0.15 for nm in f.unconstrained_names() if nm.startswith("a")}},
         ),
         "deg3": CaseSpec(
             case_id="deg3",
-            display_name="poly_deg3",
-            fixed={"degree": 3},
+            display_name="poly_deg3_dec",
+            fixed={"degree": 3, "mode": "decreasing"},
             build_filter=build_poly,
             step_s=0.12,
             step_theta=lambda f: {"log_tau2": 0.20, **{nm: 0.12 for nm in f.unconstrained_names() if nm.startswith("a")}},
