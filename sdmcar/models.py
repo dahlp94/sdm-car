@@ -80,8 +80,197 @@ class SpectralCAR_FullVI(nn.Module):
         self.kl_sigma_mc = int(kl_sigma_mc) # just as a fail safe
         if self.kl_sigma_mc <= 0:
             raise ValueError("kl_sigma_mc must be positive.")
-
     
+    @torch.no_grad()
+    def plugin_hyperparams(self):
+        """
+        Shared plugin convention for VI summaries.
+
+        Returns:
+            theta_plugin_unconstrained : dict[name -> tensor]
+            theta_plugin_constrained   : dict[name -> tensor]
+            sigma2_plugin              : scalar tensor
+
+        Convention:
+            - theta plugin = variational mean in unconstrained space
+            - sigma2 plugin = lognormal mean under q(s), s = log sigma^2
+                            = exp(mu + 0.5 * std^2)
+        """
+        theta_u = self.filter.mean_unconstrained()
+        theta_c = self.filter._constrain(theta_u)
+
+        std_s = torch.exp(self.log_std_log_sigma2)
+        sigma2_plugin = torch.exp(self.mu_log_sigma2 + 0.5 * std_s**2).clamp_min(1e-12)
+
+        return theta_u, theta_c, sigma2_plugin
+    
+    @torch.no_grad()
+    def sample_vi_hyperparams(self, num_mc: int = 128):
+        """
+        Draw samples from the variational posterior over global hyperparameters.
+
+        Returns:
+            dict with keys:
+                "s"                  : [K]
+                "sigma2"             : [K]
+                "theta_unconstrained": dict[name -> tensor of shape [K, ...]]
+                "theta_constrained"  : dict[name -> tensor of shape [K, ...]]
+
+        Notes:
+            - s = log sigma^2
+            - sigma2 = exp(s)
+            - theta samples are drawn in unconstrained space
+            - constrained parameters are produced via filter._constrain(...)
+        """
+        K = int(num_mc)
+        if K <= 0:
+            raise ValueError("num_mc must be positive.")
+
+        device = self.y.device
+        dtype = self.y.dtype
+
+        # -------------------------
+        # Sample s = log sigma2
+        # -------------------------
+        eps = torch.randn((K,) + self.mu_log_sigma2.shape, dtype=dtype, device=device)
+        s_draws = self.mu_log_sigma2.unsqueeze(0) + torch.exp(self.log_std_log_sigma2).unsqueeze(0) * eps
+        s_draws = s_draws.reshape(K)
+        sigma2_draws = torch.exp(s_draws).clamp_min(1e-12)
+
+        # -------------------------
+        # Sample theta in unconstrained space, then constrain
+        # -------------------------
+        theta_u_list = []
+        theta_c_list = []
+
+        for _ in range(K):
+            theta_u = self.filter.sample_unconstrained()
+            theta_c = self.filter._constrain(theta_u)
+            theta_u_list.append(theta_u)
+            theta_c_list.append(theta_c)
+
+        def _stack_dict_of_tensors(draw_list):
+            keys = draw_list[0].keys()
+            out = {}
+            for k in keys:
+                vals = [d[k] for d in draw_list]
+                stacked = torch.stack(vals, dim=0)
+                if stacked.ndim == 2 and stacked.shape[1] == 1:
+                    stacked = stacked.reshape(K)
+                out[k] = stacked
+            return out
+
+        theta_u_draws = _stack_dict_of_tensors(theta_u_list)
+        theta_c_draws = _stack_dict_of_tensors(theta_c_list)
+
+        return {
+            "s": s_draws,
+            "sigma2": sigma2_draws,
+            "theta_unconstrained": theta_u_draws,
+            "theta_constrained": theta_c_draws,
+        }
+
+    @torch.no_grad()
+    def _summarize_draws_tensor(self, x: torch.Tensor):
+        """
+        Summarize Monte Carlo draws along axis 0.
+
+        Args:
+            x: tensor of shape [K, ...] or [K]
+
+        Returns:
+            dict with:
+                "mean": tensor of shape [...]
+                "sd":   tensor of shape [...]
+                "q025": tensor of shape [...]
+                "q975": tensor of shape [...]
+        """
+        if x.ndim == 0:
+            raise ValueError("x must have at least one draw dimension.")
+
+        mean = x.mean(dim=0)
+        sd = x.std(dim=0, unbiased=True)
+        q025 = torch.quantile(x, 0.025, dim=0)
+        q975 = torch.quantile(x, 0.975, dim=0)
+
+        return {
+            "mean": mean,
+            "sd": sd,
+            "q025": q025,
+            "q975": q975,
+        }
+
+
+    @torch.no_grad()
+    def sigma2_posterior_vi(self, num_mc: int = 128, return_draws: bool = False):
+        """
+        Posterior summary for sigma2 under VI.
+
+        Returns:
+            dict with:
+                "plugin": scalar tensor
+                "mc": {
+                    "mean": scalar tensor,
+                    "sd": scalar tensor,
+                    "q025": scalar tensor,
+                    "q975": scalar tensor,
+                }
+            Optionally includes:
+                "draws": tensor [K]
+        """
+        _, _, sigma2_plugin = self.plugin_hyperparams()
+        draws = self.sample_vi_hyperparams(num_mc=num_mc)
+        sigma2_draws = draws["sigma2"]
+
+        mc_summary = self._summarize_draws_tensor(sigma2_draws)
+
+        out = {
+            "plugin": sigma2_plugin.detach(),
+            "mc": {k: v.detach() for k, v in mc_summary.items()},
+        }
+
+        if return_draws:
+            out["draws"] = sigma2_draws.detach()
+
+        return out
+
+
+    @torch.no_grad()
+    def theta_posterior_vi(self, num_mc: int = 128, return_draws: bool = False):
+        """
+        Posterior summary for constrained filter parameters under VI.
+
+        Returns:
+            dict with:
+                "plugin": dict[name -> tensor]
+                "mc": dict[name -> {
+                    "mean": tensor,
+                    "sd": tensor,
+                    "q025": tensor,
+                    "q975": tensor,
+                }]
+            Optionally includes:
+                "draws": dict[name -> tensor [K, ...]]
+        """
+        _, theta_plugin_c, _ = self.plugin_hyperparams()
+        draws = self.sample_vi_hyperparams(num_mc=num_mc)
+        theta_c_draws = draws["theta_constrained"]
+
+        mc = {}
+        for name, x in theta_c_draws.items():
+            mc[name] = {k: v.detach() for k, v in self._summarize_draws_tensor(x).items()}
+
+        out = {
+            "plugin": {k: v.detach() for k, v in theta_plugin_c.items()},
+            "mc": mc,
+        }
+
+        if return_draws:
+            out["draws"] = {k: v.detach() for k, v in theta_c_draws.items()}
+
+        return out
+
+
     def _beta_update(self, inv_var, return_Xt_invSig_X: bool = False):
         """
         inv_var: [n] = 1 / (F(lam) + sigma2)
@@ -127,9 +316,11 @@ class SpectralCAR_FullVI(nn.Module):
     @torch.no_grad()
     def beta_posterior_plugin(self):
         """
-        Analytic Gaussian posterior of beta under *plugin* hyperparameters:
+        Analytic Gaussian posterior of beta under *plugin* hyperparameters.
+
+        Plugin convention:
             theta = filter.mean_unconstrained()
-            sigma2 = exp(mu_log_sigma2)   (plugin)
+            sigma2 = E_q[sigma^2] under q(log sigma^2)
 
         Returns:
             m_beta_plugin : [p]
@@ -137,18 +328,168 @@ class SpectralCAR_FullVI(nn.Module):
             sigma2_plugin : scalar tensor
             F_lam_plugin  : [n]
         """
-        theta_mean = self.filter.mean_unconstrained()
-
-        # plugin sigma^2 (consistent with your current plugin usage)
-        sigma2 = torch.exp(self.mu_log_sigma2).clamp_min(1e-12)
+        theta_mean, _, sigma2 = self.plugin_hyperparams()
 
         F_lam = self.filter.spectrum(self.lam, theta_mean)  # [n]
         var = (F_lam + sigma2).clamp_min(1e-12)
         inv_var = 1.0 / var
 
         m_beta, V_beta = self._beta_update(inv_var, return_Xt_invSig_X=False)
-        return m_beta.detach(), V_beta.detach(), sigma2.detach(), F_lam.detach() 
+        return m_beta.detach(), V_beta.detach(), sigma2.detach(), F_lam.detach()
     
+    @torch.no_grad()
+    def beta_posterior_vi(self, num_mc: int = 128, return_draws: bool = False):
+        """
+        Posterior summary for beta under VI.
+
+        Returns:
+            dict with:
+                "plugin": {
+                    "mean": [p],
+                    "cov":  [p,p],
+                    "sd":   [p],
+                    "q025": [p],
+                    "q975": [p],
+                },
+                "mc": {
+                    "mean": [p],
+                    "cov":  [p,p],
+                    "sd":   [p],
+                    "q025": [p],
+                    "q975": [p],
+                }
+
+            Optionally includes:
+                "draws": {
+                    "mean": [K,p],        # conditional posterior means m_k
+                    "cov":  [K,p,p],      # conditional posterior covariances V_k
+                }
+        """
+        # -------------------------
+        # Plugin posterior
+        # -------------------------
+        m_beta_plugin, V_beta_plugin, _, _ = self.beta_posterior_plugin()
+        sd_beta_plugin = torch.sqrt(torch.diag(V_beta_plugin).clamp_min(0.0))
+        q025_plugin = m_beta_plugin - 1.96 * sd_beta_plugin
+        q975_plugin = m_beta_plugin + 1.96 * sd_beta_plugin
+
+        # -------------------------
+        # VI-MC marginalized posterior
+        # -------------------------
+        K = int(num_mc)
+        if K <= 0:
+            raise ValueError("num_mc must be positive.")
+
+        p = self.X.shape[1]
+        mean_list = []
+        cov_list = []
+
+        for _ in range(K):
+            # sample s = log sigma2
+            eps = torch.randn_like(self.mu_log_sigma2)
+            s = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps
+            sigma2 = torch.exp(s).clamp_min(1e-12)
+
+            # sample theta
+            theta = self.filter.sample_unconstrained()
+            F_lam = self.filter.spectrum(self.lam, theta).clamp_min(0.0)
+
+            denom = (F_lam + sigma2).clamp_min(1e-12)
+            inv_var = 1.0 / denom
+
+            # exact conditional posterior of beta given this draw
+            m_beta_k, V_beta_k = self._beta_update(inv_var, return_Xt_invSig_X=False)
+
+            mean_list.append(m_beta_k)
+            cov_list.append(V_beta_k)
+
+        mean_draws = torch.stack(mean_list, dim=0)   # [K,p]
+        cov_draws = torch.stack(cov_list, dim=0)     # [K,p,p]
+
+        mean_mc = mean_draws.mean(dim=0)             # [p]
+
+        second_moment = cov_draws + mean_draws.unsqueeze(2) @ mean_draws.unsqueeze(1)  # [K,p,p]
+        cov_mc = second_moment.mean(dim=0) - mean_mc.unsqueeze(1) @ mean_mc.unsqueeze(0)
+        cov_mc = 0.5 * (cov_mc + cov_mc.T)  # numerical symmetrization
+
+        sd_mc = torch.sqrt(torch.diag(cov_mc).clamp_min(0.0))
+        q025_mc = mean_mc - 1.96 * sd_mc
+        q975_mc = mean_mc + 1.96 * sd_mc
+
+        out = {
+            "plugin": {
+                "mean": m_beta_plugin.detach(),
+                "cov": V_beta_plugin.detach(),
+                "sd": sd_beta_plugin.detach(),
+                "q025": q025_plugin.detach(),
+                "q975": q975_plugin.detach(),
+            },
+            "mc": {
+                "mean": mean_mc.detach(),
+                "cov": cov_mc.detach(),
+                "sd": sd_mc.detach(),
+                "q025": q025_mc.detach(),
+                "q975": q975_mc.detach(),
+            },
+        }
+
+        if return_draws:
+            out["draws"] = {
+                "mean": mean_draws.detach(),
+                "cov": cov_draws.detach(),
+            }
+
+        return out
+    
+    @torch.no_grad()
+    def spectrum_posterior_vi(self, num_mc: int = 128, return_draws: bool = False):
+        """
+        Posterior summary for the spectral curve F(lam) under VI.
+
+        Returns:
+            dict with:
+                "plugin": tensor [n]
+                "mc": {
+                    "mean": tensor [n],
+                    "sd":   tensor [n],
+                    "q025": tensor [n],
+                    "q975": tensor [n],
+                }
+
+            Optionally includes:
+                "draws": tensor [K, n]
+        """
+        # -------------------------
+        # Plugin spectrum
+        # -------------------------
+        theta_plugin_u, _, _ = self.plugin_hyperparams()
+        F_plugin = self.filter.spectrum(self.lam, theta_plugin_u).clamp_min(0.0)
+
+        # -------------------------
+        # VI-MC spectrum draws
+        # -------------------------
+        K = int(num_mc)
+        if K <= 0:
+            raise ValueError("num_mc must be positive.")
+
+        F_draws = []
+        for _ in range(K):
+            theta = self.filter.sample_unconstrained()
+            F_k = self.filter.spectrum(self.lam, theta).clamp_min(0.0)
+            F_draws.append(F_k)
+
+        F_draws = torch.stack(F_draws, dim=0)   # [K, n]
+        mc_summary = self._summarize_draws_tensor(F_draws)
+
+        out = {
+            "plugin": F_plugin.detach(),
+            "mc": {k: v.detach() for k, v in mc_summary.items()},
+        }
+
+        if return_draws:
+            out["draws"] = F_draws.detach()
+
+        return out
 
     def _kl_beta(self, m_beta, V_beta):
         """
@@ -363,11 +704,7 @@ class SpectralCAR_FullVI(nn.Module):
         # (A) plugin
         # ---------------------------
         if mode == "plugin":
-            theta_mean = self.filter.mean_unconstrained()
-
-            # plugin sigma2: lognormal mean (ok)
-            std_s = torch.exp(self.log_std_log_sigma2)
-            sigma2 = torch.exp(self.mu_log_sigma2 + 0.5 * std_s**2).clamp_min(1e-12)
+            theta_mean, _, sigma2 = self.plugin_hyperparams()
 
             F_lam = self.filter.spectrum(self.lam, theta_mean).clamp_min(0.0)
             denom = (F_lam + sigma2).clamp_min(1e-12)
@@ -455,11 +792,7 @@ class SpectralCAR_FullVI(nn.Module):
         # (A) plugin
         # -------------------------
         if mode == "plugin":
-            theta = self.filter.mean_unconstrained()
-
-            # keep consistent with your posterior_phi(plugin):
-            std_s = torch.exp(self.log_std_log_sigma2)
-            sigma2 = torch.exp(self.mu_log_sigma2 + 0.5 * std_s**2).clamp_min(1e-12)
+            theta, _, sigma2 = self.plugin_hyperparams()
 
             F = self.filter.spectrum(lam, theta).clamp_min(0.0)
             denom = (F + sigma2).clamp_min(1e-12)
