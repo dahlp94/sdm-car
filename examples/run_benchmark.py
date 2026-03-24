@@ -215,6 +215,14 @@ def decode_theta_chain(out, filter_module):
     return raw, constrained
 
 
+def tensor_to_scalar(x):
+    """
+    Convert a torch tensor / numpy scalar / python scalar to float.
+    """
+    if isinstance(x, torch.Tensor):
+        return float(x.detach().cpu().reshape(-1)[0].item())
+    return float(np.asarray(x).reshape(-1)[0])
+
 
 # -------------------------
 # Core: run a single case
@@ -298,16 +306,17 @@ def run_case(
 
         if (it + 1) % log_every == 0:
             with torch.no_grad():
-                means = unpack_filter_params_from_means(model.filter)
-                tau2_m = means["tau2"]
-                rho0_m = means["rho0"]
-                nu_m = means["nu"]
+                theta_plugin_u, theta_plugin_c, sigma2_plugin_train = model.plugin_hyperparams()
 
-                mu_s  = model.mu_log_sigma2.detach()                 # [1]
-                std_s = torch.exp(model.log_std_log_sigma2.detach()) # [1]
+                tau2_m = theta_plugin_c.get("tau2", None)
+                rho0_m = theta_plugin_c.get("rho0", None)
+                nu_m = theta_plugin_c.get("nu", None)
+
+                mu_s = model.mu_log_sigma2.detach()
+                std_s = torch.exp(model.log_std_log_sigma2.detach())
 
                 sigma2_median = torch.exp(mu_s).item()
-                sigma2_mean   = torch.exp(mu_s + 0.5 * std_s**2).item()
+                sigma2_mean = torch.exp(mu_s + 0.5 * std_s**2).item()
                 beta_m = model.m_beta.detach().cpu().numpy()
 
             nu_str = "NA" if nu_m is None else f"{nu_m.item():.3f}"
@@ -337,52 +346,51 @@ def run_case(
     # VI summaries (plugin + MC)
     # -------------------------
     with torch.no_grad():
+        beta_vi = model.beta_posterior_vi(num_mc=128, return_draws=False)
+        sigma2_vi = model.sigma2_posterior_vi(num_mc=128, return_draws=False)
+        theta_vi = model.theta_posterior_vi(num_mc=128, return_draws=False)
+        spectrum_vi = model.spectrum_posterior_vi(num_mc=128, return_draws=False)
 
-        # ---- Plugin beta posterior ----
-        m_beta_plugin, V_beta_plugin, sigma2_plugin, F_plugin = model.beta_posterior_plugin()
+        # beta
+        beta_vi_plugin = beta_vi["plugin"]["mean"].detach().cpu()
+        beta_vi_plugin_sd = beta_vi["plugin"]["sd"].detach().cpu()
+        beta_vi_plugin_q025 = beta_vi["plugin"]["q025"].detach().cpu()
+        beta_vi_plugin_q975 = beta_vi["plugin"]["q975"].detach().cpu()
 
-        beta_vi_plugin = m_beta_plugin.detach().cpu()
+        beta_vi_mc = beta_vi["mc"]["mean"].detach().cpu()
+        beta_vi_mc_sd = beta_vi["mc"]["sd"].detach().cpu()
+        beta_vi_mc_q025 = beta_vi["mc"]["q025"].detach().cpu()
+        beta_vi_mc_q975 = beta_vi["mc"]["q975"].detach().cpu()
 
-        mu_s  = model.mu_log_sigma2.detach()
-        std_s = torch.exp(model.log_std_log_sigma2.detach())
+        # sigma2
+        sigma2_vi_plugin = tensor_to_scalar(sigma2_vi["plugin"])
+        sigma2_vi_mc_mean = tensor_to_scalar(sigma2_vi["mc"]["mean"])
+        sigma2_vi_mc_sd = tensor_to_scalar(sigma2_vi["mc"]["sd"])
+        sigma2_vi_mc_q025 = tensor_to_scalar(sigma2_vi["mc"]["q025"])
+        sigma2_vi_mc_q975 = tensor_to_scalar(sigma2_vi["mc"]["q975"])
 
-        sigma2_vi_median = float(torch.exp(mu_s).item())
-        sigma2_vi_mean   = float(torch.exp(mu_s + 0.5 * std_s**2).item())
+        # theta plugin summaries (constrained scale)
+        tau2_vi = theta_vi["plugin"].get("tau2", None)
+        rho0_vi = theta_vi["plugin"].get("rho0", None)
+        nu_vi = theta_vi["plugin"].get("nu", None)
 
-        sigma2_vi_plugin_median = float(sigma2_plugin.item())
-        sigma2_vi_plugin_mean   = sigma2_vi_mean  # from mu_s,std_s above
+        # phi
+        mean_phi_vi_plugin, var_phi_vi_plugin = model.posterior_phi(mode="plugin")
+        mean_phi_vi, var_phi_vi = model.posterior_phi(mode="mc", num_mc=128)
 
-        # ---- VI-MC beta mean (marginal over q(theta,s)) ----
-        K_beta = 128  # you can tune this
-        beta_acc = torch.zeros_like(m_beta_plugin)
-
-        for _ in range(K_beta):
-            # sample s
-            eps = torch.randn_like(model.mu_log_sigma2)
-            s = model.mu_log_sigma2 + torch.exp(model.log_std_log_sigma2) * eps
-            sigma2 = torch.exp(s).clamp_min(1e-12)
-
-            # sample theta
-            theta = model.filter.sample_unconstrained()
-            F = model.filter.spectrum(model.lam, theta).clamp_min(0.0)
-            denom = (F + sigma2).clamp_min(1e-12)
-            inv_var = 1.0 / denom
-
-            m_beta_k, _ = model._beta_update(inv_var, return_Xt_invSig_X=False)
-            beta_acc += m_beta_k
-
-        beta_vi_mc = (beta_acc / float(K_beta)).detach().cpu()
-
-        # ---- Filter means (plugin) ----
-        means = unpack_filter_params_from_means(model.filter)
-        tau2_vi = means["tau2"]
-        rho0_vi = means["rho0"]
-        nu_vi = means["nu"]
-
-        # ---- Phi (VI marginal over q) ----
-        mean_phi_vi, _ = model.posterior_phi(mode="mc", num_mc=64)
+        mean_phi_vi_plugin = mean_phi_vi_plugin.detach().cpu()
+        var_phi_vi_plugin = var_phi_vi_plugin.detach().cpu()
         mean_phi_vi = mean_phi_vi.detach().cpu()
+        var_phi_vi = var_phi_vi.detach().cpu()
 
+        # spectrum
+        F_plugin = spectrum_vi["plugin"].detach()
+        F_vi_mc_mean = spectrum_vi["mc"]["mean"].detach()
+        F_vi_mc_sd = spectrum_vi["mc"]["sd"].detach()
+        F_vi_mc_q025 = spectrum_vi["mc"]["q025"].detach()
+        F_vi_mc_q975 = spectrum_vi["mc"]["q975"].detach()
+
+    rmse_phi_vi_plugin = float(torch.sqrt(torch.mean((mean_phi_vi_plugin - phi_true.cpu()) ** 2)).item())
     rmse_phi_vi = float(torch.sqrt(torch.mean((mean_phi_vi - phi_true.cpu()) ** 2)).item())
 
 
@@ -505,6 +513,43 @@ def run_case(
     rmse_phi_mcmc = float(np.sqrt(np.mean((phi_mean_mcmc - phi_true.cpu().numpy()) ** 2)))
     print(f"MCMC RMSE(phi_mean, phi_true) = {rmse_phi_mcmc:.4f}")
 
+    # -------------------------
+    # Latent signal (eta) RMSE
+    # -------------------------
+
+    # true eta
+    eta_true = (X @ beta_true).detach().cpu() + phi_true.detach().cpu()
+
+    # VI plugin
+    eta_vi_plugin = (X @ beta_vi_plugin).detach().cpu() + mean_phi_vi_plugin
+    rmse_eta_vi_plugin = float(
+        torch.sqrt(torch.mean((eta_vi_plugin - eta_true) ** 2)).item()
+    )
+
+    # VI MC
+    eta_vi_mc = (X @ beta_vi_mc).detach().cpu() + mean_phi_vi
+    rmse_eta_vi = float(
+        torch.sqrt(torch.mean((eta_vi_mc - eta_true) ** 2)).item()
+    )
+
+    # MCMC
+    beta_mean_mcmc = np.mean(beta_chain, axis=0)
+
+    eta_mcmc = (
+        X.detach().cpu().numpy() @ beta_mean_mcmc
+        + phi_mean_mcmc
+    )
+
+    rmse_eta_mcmc = float(
+        np.sqrt(np.mean((eta_mcmc - eta_true.numpy()) ** 2))
+    )
+
+    print(
+        f"RMSE(eta): VI(plugin)={rmse_eta_vi_plugin:.4f} | "
+        f"VI(mc)={rmse_eta_vi:.4f} | "
+        f"MCMC={rmse_eta_mcmc:.4f}"
+    )
+
     mean_sd_logF, sd_curve = spectrum_draw_sd(
         lam,
         model.filter,
@@ -531,7 +576,7 @@ def run_case(
         lam=lam,
         F_true=F_true_local,
         filter_module=model.filter,
-        vi_theta=model.filter.mean_unconstrained(),
+        vi_theta=model.plugin_hyperparams()[0],
         mcmc_theta=out["theta"].detach().cpu().numpy(),
         mcmc_theta_names=out["theta_names"],
         title=f"Spectrum recovery — {filter_name}/{case_spec.display_name}",
@@ -561,15 +606,17 @@ def run_case(
     # -------------------------
     # Parameter recovery printout
     # -------------------------
-    print("\nParameter recovery (truth vs VI mean vs MCMC):")
+    print("\nParameter recovery (truth vs VI plugin vs VI MC vs MCMC):")
 
     # beta
     for j in range(beta_chain.shape[1]):
         m, sd, lo, hi = summarize_chain(beta_chain[:, j])
         print(
             f" beta[{j}]  true={beta_true[j].item():.6g}  "
-            f"VI(plugin)={beta_vi_plugin[j].item():.6g}  "
-            f"VI(mc)={beta_vi_mc[j].item():.6g}  "
+            f"VI(plugin)={beta_vi_plugin[j].item():.6g} "
+            f"[{beta_vi_plugin_q025[j].item():.6g}, {beta_vi_plugin_q975[j].item():.6g}]  "
+            f"VI(mc)={beta_vi_mc[j].item():.6g} "
+            f"[{beta_vi_mc_q025[j].item():.6g}, {beta_vi_mc_q975[j].item():.6g}]  "
             f"MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]"
         )
 
@@ -577,39 +624,98 @@ def run_case(
     m, sd, lo, hi = summarize_chain(sigma2_chain)
     print(
         f"  sigma2  true={sigma2_true:.6g}  "
-        f"VI_med={sigma2_vi_median:.6g}  VI_mean={sigma2_vi_mean:.6g}  "
+        f"VI(plugin)={sigma2_vi_plugin:.6g}  "
+        f"VI(mc)={sigma2_vi_mc_mean:.6g} ± {sigma2_vi_mc_sd:.4g}  "
+        f"CI95=[{sigma2_vi_mc_q025:.6g}, {sigma2_vi_mc_q975:.6g}]  "
         f"MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]"
     )
 
     # tau2
     if tau2_chain is not None:
         m, sd, lo, hi = summarize_chain(tau2_chain)
-        print(f"    tau2  true={tau2_true:.6g}  VI={tau2_vi.item():.6g}  MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]")
+        tau2_vi_plugin = "NA" if tau2_vi is None else f"{tensor_to_scalar(tau2_vi):.6g}"
+        tau2_vi_mc = theta_vi["mc"].get("tau2", None)
+        tau2_vi_mc_str = "NA"
+        if tau2_vi_mc is not None:
+            tau2_vi_mc_str = (
+                f"{tensor_to_scalar(tau2_vi_mc['mean']):.6g} ± "
+                f"{tensor_to_scalar(tau2_vi_mc['sd']):.4g}  "
+                f"CI95=[{tensor_to_scalar(tau2_vi_mc['q025']):.6g}, "
+                f"{tensor_to_scalar(tau2_vi_mc['q975']):.6g}]"
+            )
+        print(
+            f"    tau2  true={tau2_true:.6g}  "
+            f"VI(plugin)={tau2_vi_plugin}  "
+            f"VI(mc)={tau2_vi_mc_str}  "
+            f"MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]"
+        )
     else:
         print("    tau2  (not present in this filter)")
 
-
+    # rho0
     if rho0_chain is not None:
         m, sd, lo, hi = summarize_chain(rho0_chain)
-        rho0_vi_str = "NA" if rho0_vi is None else f"{rho0_vi.item():.6g}"
-        print(f"    rho0  true={eps_car:.6g}  VI={rho0_vi_str}  MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]")
+        rho0_vi_plugin = "NA" if rho0_vi is None else f"{tensor_to_scalar(rho0_vi):.6g}"
+        rho0_vi_mc = theta_vi["mc"].get("rho0", None)
+        rho0_vi_mc_str = "NA"
+        if rho0_vi_mc is not None:
+            rho0_vi_mc_str = (
+                f"{tensor_to_scalar(rho0_vi_mc['mean']):.6g} ± "
+                f"{tensor_to_scalar(rho0_vi_mc['sd']):.4g}  "
+                f"CI95=[{tensor_to_scalar(rho0_vi_mc['q025']):.6g}, "
+                f"{tensor_to_scalar(rho0_vi_mc['q975']):.6g}]"
+            )
+        print(
+            f"    rho0  true={eps_car:.6g}  "
+            f"VI(plugin)={rho0_vi_plugin}  "
+            f"VI(mc)={rho0_vi_mc_str}  "
+            f"MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]"
+        )
 
+    # nu
     if nu_chain is not None:
         m, sd, lo, hi = summarize_chain(nu_chain)
-        nu_vi_str = "NA" if nu_vi is None else f"{nu_vi.item():.6g}"
-        print(f"      nu  true={1.0:.6g}  VI={nu_vi_str}  MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]")
-    
+        nu_vi_plugin = "NA" if nu_vi is None else f"{tensor_to_scalar(nu_vi):.6g}"
+        nu_vi_mc = theta_vi["mc"].get("nu", None)
+        nu_vi_mc_str = "NA"
+        if nu_vi_mc is not None:
+            nu_vi_mc_str = (
+                f"{tensor_to_scalar(nu_vi_mc['mean']):.6g} ± "
+                f"{tensor_to_scalar(nu_vi_mc['sd']):.4g}  "
+                f"CI95=[{tensor_to_scalar(nu_vi_mc['q025']):.6g}, "
+                f"{tensor_to_scalar(nu_vi_mc['q975']):.6g}]"
+            )
+        print(
+            f"      nu  true={1.0:.6g}  "
+            f"VI(plugin)={nu_vi_plugin}  "
+            f"VI(mc)={nu_vi_mc_str}  "
+            f"MCMC={m:.6g} ± {sd:.4g}  CI95=[{lo:.6g}, {hi:.6g}]"
+        )
+
     a_chain = theta_constr.get("a", None)
     if a_chain is not None:
-        print("  poly coeff mean:", np.mean(a_chain, axis=0))
+        print("  poly coeff mean (MCMC):", np.mean(a_chain, axis=0))
+        if "a" in theta_vi["plugin"]:
+            print("  poly coeff plugin (VI):", theta_vi["plugin"]["a"].detach().cpu().numpy())
+        if "a" in theta_vi["mc"]:
+            print("  poly coeff mean (VI-MC):", theta_vi["mc"]["a"]["mean"].detach().cpu().numpy())
 
 
     # -------------------------
     # Save plots
     # -------------------------
-    plot_trace(beta_chain[:, 0], f"{filter_name}/{case_spec.display_name}: trace beta[0]", case_dir / "trace_beta0.png")
-    plot_trace(beta_chain[:, 1], f"{filter_name}/{case_spec.display_name}: trace beta[1]", case_dir / "trace_beta1.png")
-    plot_trace(sigma2_chain, f"{filter_name}/{case_spec.display_name}: trace sigma2", case_dir / "trace_sigma2.png")
+    for j in range(beta_chain.shape[1]):
+        plot_trace(
+            beta_chain[:, j],
+            f"{filter_name}/{case_spec.display_name}: trace beta[{j}]",
+            case_dir / f"trace_beta{j}.png",
+        )
+
+    plot_trace(
+        sigma2_chain,
+        f"{filter_name}/{case_spec.display_name}: trace sigma2",
+        case_dir / "trace_sigma2.png",
+    )
     
     if tau2_chain is not None:
         plot_trace(tau2_chain, f"{filter_name}/{case_spec.display_name}: trace tau2", case_dir / "trace_tau2.png")
@@ -619,29 +725,22 @@ def run_case(
         plot_trace(nu_chain, f"{filter_name}/{case_spec.display_name}: trace nu", case_dir / "trace_nu.png")
 
 
-    plot_hist_with_lines(
-        beta_chain[:, 0],
-        f"{filter_name}/{case_spec.display_name}: posterior beta[0]",
-        case_dir / "hist_beta0.png",
-        true_val=float(beta_true[0].item()),
-        vi_val=float(beta_vi_plugin[0].item()),
-    )
-
-    plot_hist_with_lines(
-        beta_chain[:, 1],
-        f"{filter_name}/{case_spec.display_name}: posterior beta[1]",
-        case_dir / "hist_beta1.png",
-        true_val=float(beta_true[1].item()),
-        vi_val=float(beta_vi_plugin[1].item()),
-    )
+    for j in range(beta_chain.shape[1]):
+        plot_hist_with_lines(
+            beta_chain[:, j],
+            f"{filter_name}/{case_spec.display_name}: posterior beta[{j}]",
+            case_dir / f"hist_beta{j}.png",
+            true_val=float(beta_true[j].item()),
+            vi_val=float(beta_vi_plugin[j].item()),
+        )
 
     plot_hist_with_lines(
         sigma2_chain,
         f"{filter_name}/{case_spec.display_name}: posterior sigma2",
         case_dir / "hist_sigma2.png",
         true_val=float(sigma2_true),
-        vi_val=float(sigma2_vi_mean),
-        vi_label="VI mean (marginal)"
+        vi_val=float(sigma2_vi_mc_mean),
+        vi_label="VI MC mean"
     )
     
     # tau2 (only if present)
@@ -651,7 +750,7 @@ def run_case(
             f"{filter_name}/{case_spec.display_name}: posterior tau2",
             case_dir / "hist_tau2.png",
             true_val=float(tau2_true),
-            vi_val=float(tau2_vi.item()),
+            vi_val=None if tau2_vi is None else tensor_to_scalar(tau2_vi),
         )
 
     # rho0 (prefer decoded chain from theta_constr if available; fall back to `named`)
@@ -662,7 +761,7 @@ def run_case(
             f"{filter_name}/{case_spec.display_name}: posterior rho0",
             case_dir / "hist_rho0.png",
             true_val=float(eps_car),
-            vi_val=None if rho0_vi is None else float(rho0_vi.item()),
+            vi_val=None if rho0_vi is None else tensor_to_scalar(rho0_vi),
         )
 
     # nu (prefer decoded chain from theta_constr if available; fall back to `named`)
@@ -673,8 +772,15 @@ def run_case(
             f"{filter_name}/{case_spec.display_name}: posterior nu",
             case_dir / "hist_nu.png",
             true_val=1.0,
-            vi_val=None if nu_vi is None else float(nu_vi.item()),
+            vi_val=None if nu_vi is None else tensor_to_scalar(nu_vi),
         )
+    
+    diagnostics.plot_phi_mean_vs_true(
+        coords=coords,
+        mean_phi=mean_phi_vi_plugin.to(device),
+        phi_true=phi_true,
+        save_path_prefix=str(case_dir / "phi_vi_plugin"),
+    )
 
     diagnostics.plot_phi_mean_vs_true(
         coords=coords,
@@ -693,17 +799,48 @@ def run_case(
     summary = {
         "filter": filter_name,
         "case": case_spec.display_name,
+        "rmse_phi_vi_plugin": rmse_phi_vi_plugin,
         "rmse_phi_vi": rmse_phi_vi,
         "rmse_phi_mcmc": rmse_phi_mcmc,
         "spec_err_vi": spec_err_vi,
         "spec_err_mcmc": spec_err_mcmc,
         "acc_s": acc["s"][2],
         "acc_theta": {k: v[2] for k, v in acc["theta"].items()},
+        "vi_plugin": {
+            "sigma2": sigma2_vi_plugin,
+            **({"tau2": tensor_to_scalar(tau2_vi)} if tau2_vi is not None else {}),
+            **({"rho0": tensor_to_scalar(rho0_vi)} if rho0_vi is not None else {}),
+            **({"nu": tensor_to_scalar(nu_vi)} if nu_vi is not None else {}),
+        },
+        "vi_mc": {
+            "sigma2_mean": sigma2_vi_mc_mean,
+            "sigma2_sd": sigma2_vi_mc_sd,
+            "sigma2_q025": sigma2_vi_mc_q025,
+            "sigma2_q975": sigma2_vi_mc_q975,
+            **(
+                {
+                    "tau2_mean": tensor_to_scalar(theta_vi["mc"]["tau2"]["mean"]),
+                    "tau2_sd": tensor_to_scalar(theta_vi["mc"]["tau2"]["sd"]),
+                } if "tau2" in theta_vi["mc"] else {}
+            ),
+            **(
+                {
+                    "rho0_mean": tensor_to_scalar(theta_vi["mc"]["rho0"]["mean"]),
+                    "rho0_sd": tensor_to_scalar(theta_vi["mc"]["rho0"]["sd"]),
+                } if "rho0" in theta_vi["mc"] else {}
+            ),
+            **(
+                {
+                    "nu_mean": tensor_to_scalar(theta_vi["mc"]["nu"]["mean"]),
+                    "nu_sd": tensor_to_scalar(theta_vi["mc"]["nu"]["sd"]),
+                } if "nu" in theta_vi["mc"] else {}
+            ),
+        },
         "mcmc_means": {
             "sigma2": float(np.mean(sigma2_chain)),
-            **({ "tau2": float(np.mean(tau2_chain)) } if tau2_chain is not None else {}),
-            **({ "rho0": float(np.mean(rho0_chain)) } if rho0_chain is not None else {}),
-            **({ "nu": float(np.mean(nu_chain)) } if nu_chain is not None else {}),
+            **({"tau2": float(np.mean(tau2_chain))} if tau2_chain is not None else {}),
+            **({"rho0": float(np.mean(rho0_chain))} if rho0_chain is not None else {}),
+            **({"nu": float(np.mean(nu_chain))} if nu_chain is not None else {}),
         },
         "ridge": {
             "max_abs_corr": rep["max_abs_corr"],
@@ -711,6 +848,9 @@ def run_case(
             "top_pairs": rep["top_pairs"][:10],
             "highlights": rep["highlights"],
         },
+        "rmse_eta_vi_plugin": rmse_eta_vi_plugin,
+        "rmse_eta_vi": rmse_eta_vi,
+        "rmse_eta_mcmc": rmse_eta_mcmc,
     }
 
     # Add predictive metrics in the summary.
@@ -726,12 +866,15 @@ def run_case(
             {
                 "filter": summary["filter"],
                 "case": summary["case"],
+                "rmse_phi_vi_plugin": summary["rmse_phi_vi_plugin"],
                 "rmse_phi_vi": summary["rmse_phi_vi"],
                 "rmse_phi_mcmc": summary["rmse_phi_mcmc"],
                 "spec_err_vi": summary["spec_err_vi"],
                 "spec_err_mcmc": summary["spec_err_mcmc"],
                 "acc_s": summary["acc_s"],
                 "acc_theta": summary["acc_theta"],
+                "vi_plugin": summary["vi_plugin"],
+                "vi_mc": summary["vi_mc"],
                 "mcmc_means": summary["mcmc_means"],
                 "rmse_y_vi_plugin": summary["rmse_y_vi_plugin"],
                 "rmse_y_vi_mc": summary["rmse_y_vi_mc"],
@@ -739,6 +882,9 @@ def run_case(
                 "lpd_vi_mc": summary["lpd_vi_mc"],
                 "rmse_y_mcmc": summary["rmse_y_mcmc"],
                 "lpd_mcmc": summary["lpd_mcmc"],
+                "rmse_eta_vi_plugin": summary["rmse_eta_vi_plugin"],
+                "rmse_eta_vi": summary["rmse_eta_vi"],
+                "rmse_eta_mcmc": summary["rmse_eta_mcmc"],
             },
             f,
             indent=2,
@@ -884,7 +1030,8 @@ def main():
             theta_acc_str = ", ".join([f"{k}={v:.3f}" for k, v in s["acc_theta"].items()])
             print(
                 f"{s['filter']}/{s['case']:<22} | "
-                f"phi_RMSE(VI)={s['rmse_phi_vi']:.4f}  "
+                f"phi_RMSE(VI-plugin)={s['rmse_phi_vi_plugin']:.4f}  "
+                f"phi_RMSE(VI-mc)={s['rmse_phi_vi']:.4f}  "
                 f"phi_RMSE(MCMC)={s['rmse_phi_mcmc']:.4f} | "
                 f"acc_s={s['acc_s']:.3f} | acc_theta[{theta_acc_str}] | "
                 f"MCMC mean sigma2={m['sigma2']:.4g}{tail}"
