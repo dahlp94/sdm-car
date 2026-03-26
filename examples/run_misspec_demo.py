@@ -64,115 +64,92 @@ class FitResult:
 # -------------------------
 def truth_spectrum(lam: torch.Tensor, kind: str, *, eps_car: float) -> torch.Tensor:
     """
-    Return a synthetic “misspecified truth” spectral variance F_true(lam)
-    for evaluating SDM-CAR against classical CAR-type models.
+    Canonical spectral truth families for Experiment 2.
 
-    All options produce strictly positive spectra (clamped to 1e-12).
+    These define variance allocation across graph frequencies (fixed U),
+    enabling controlled spectral misspecification experiments.
+
+    All spectra are:
+    - strictly positive
+    - normalized to mean 1 (separates shape from scale)
 
     Available kinds:
 
-    - mix2
-        Two-scale spectrum: CAR-like low-frequency power plus
-        an exponential diffusion tail.
-        F(lam) = τ₁/(lam+eps) + τ₂ exp(-alam)
-
-    - floor
-        CAR-like spectrum with a constant floor (violates pure CAR form).
-        F(lam) = τ/(lam+eps) + c
-
-    - bump
-        CAR backbone with multiplicative mid-frequency bump.
-        F(lam) = τ/(lam+eps) · (1 + b · exp(-(lam-mu)² / (2sigma2)))
+    - multiscale (PRIMARY)
+        Two-band spectrum: low-frequency + mid-frequency peaks.
+        Represents global + regional structure.
 
     - bandpass
-        Pure band-pass spectrum (energy concentrated in a mid-frequency band).
-        F(lam) = A · exp(-(lam-mu)² / (2sigma2))
+        Single mid-frequency bump.
+        Clean non-CAR counterexample (no low-frequency dominance).
 
-    - steep
-        Stronger high-frequency decay than classical CAR.
-        F(lam) = τ/(lam+eps)²
+    - car (optional baseline)
+        Classical CAR spectrum for reference.
 
-    - bimodal
-        Two separated band-pass peaks (bimodal spectral density).
-        F(lam) = bump1(lam) + bump2(lam)
-
-    These cases are designed to test scenarios where classical CAR
-    (monotone 1/(lam+rho) structure) may be misspecified.
+    Notes:
+    - Uses quantiles of λ for graph-adaptive parameterization.
+    - Avoids dependence on absolute λ scale.
     """
+
     lam = lam.clamp_min(0.0)
     kind = kind.lower()
 
-    if kind == "mix2":
-        # CAR-like + diffusion tail (two-scale)
-        tau1 = 0.20
-        tau2 = 0.25
-        a = 8.0
-        F = (tau1 / (lam + eps_car)) + tau2 * torch.exp(-a * lam)
+    # Convert once for quantiles
+    lam_np = lam.detach().cpu().numpy()
+    lam_min = float(lam.min())
+    lam_max = float(lam.max())
+    lam_range = max(lam_max - lam_min, 1e-8)
+
+    # -------------------------
+    # 1. Multiscale (PRIMARY)
+    # -------------------------
+    if kind == "multiscale":
+        mu1 = np.quantile(lam_np, 0.10)   # low-frequency peak
+        mu2 = np.quantile(lam_np, 0.40)   # mid-frequency peak
+
+        s1 = 0.05 * lam_range
+        s2 = 0.07 * lam_range
+
+        a1 = 1.0
+        a2 = 0.8
+        delta = 0.03
+
+        F = (
+            delta
+            + a1 * torch.exp(-0.5 * ((lam - mu1) / max(s1, 1e-12)) ** 2)
+            + a2 * torch.exp(-0.5 * ((lam - mu2) / max(s2, 1e-12)) ** 2)
+        )
+
+        F = F / F.mean()  # normalize
         return F.clamp_min(1e-12)
 
-    if kind == "floor":
-        # CAR-like + flat floor
-        tau = 0.20
-        c = 0.03
-        F = (tau / (lam + eps_car)) + c
-        return F.clamp_min(1e-12)
-
-    if kind == "bump":
-        # CAR-like with mid-frequency bump
-        tau = 0.18
-        lam_max = float(lam.max().detach().cpu())
-        mu = 0.35 * lam_max
-        sig = 0.12 * lam_max
-        b = 0.9
-        bump = 1.0 + b * torch.exp(-0.5 * ((lam - mu) / max(sig, 1e-12)) ** 2)
-        F = (tau / (lam + eps_car)) * bump
-        return F.clamp_min(1e-12)
-
+    # -------------------------
+    # 2. Band-pass
+    # -------------------------
     if kind == "bandpass":
-        # Pure band-pass bump (Gaussian in linear lam)
-        lam_max = float(lam.max().detach().cpu())
-        mu = 0.35 * lam_max
-        sig = 0.08 * lam_max
-        A = 0.25
-        F = A * torch.exp(-0.5 * ((lam - mu) / max(sig, 1e-12)) ** 2)
+        mu = np.quantile(lam_np, 0.40)   # centered in mid frequencies
+        s = 0.08 * lam_range
+        A = 1.0
+
+        F = A * torch.exp(-0.5 * ((lam - mu) / max(s, 1e-12)) ** 2)
+
+        F = F / F.mean()
         return F.clamp_min(1e-12)
 
-    if kind == "steep":
-        # Stronger high-frequency suppression than classic CAR
-        tau = 0.25
-        F = tau / (lam + eps_car) ** 2
+    # -------------------------
+    # 3. CAR baseline (optional)
+    # -------------------------
+    if kind == "car":
+        tau = 1.0
+        F = tau / (lam + eps_car)
+
+        F = F / F.mean()
         return F.clamp_min(1e-12)
 
-    if kind == "bimodal":
-        # Two separated band-pass bumps
-        lam_max = float(lam.max().detach().cpu())
-
-        mu1 = 0.15 * lam_max
-        mu2 = 0.55 * lam_max
-
-        sig1 = 0.06 * lam_max
-        sig2 = 0.08 * lam_max
-
-        A1 = 0.20
-        A2 = 0.18
-
-        bump1 = A1 * torch.exp(-0.5 * ((lam - mu1) / max(sig1, 1e-12)) ** 2)
-        bump2 = A2 * torch.exp(-0.5 * ((lam - mu2) / max(sig2, 1e-12)) ** 2)
-
-        F = bump1 + bump2
-        return F.clamp_min(1e-12)
-
-    choices = ["mix2", "floor", "bump", "bandpass", "steep", "bimodal"]
-    raise ValueError(f"Unknown truth kind '{kind}'. Choose from: {', '.join(choices)}.")
-
-
-# -------------------------
-# Spectrum diagnostics
-# -------------------------
-# @torch.no_grad()
-# def spectrum_vi_mean(filter_module, lam: torch.Tensor) -> torch.Tensor:
-#     theta_mean = filter_module.mean_unconstrained()
-#     return filter_module.spectrum(lam, theta_mean)
+    raise ValueError(
+        f"Unknown truth kind '{kind}'. "
+        f"Choose from: multiscale, bandpass, car."
+    )
 
 # -------------------------
 # Spectrum diagnostics
@@ -186,7 +163,7 @@ def spectrum_vi_mc_mean(filter_module, lam: torch.Tensor, *, S: int = 256) -> to
     acc = torch.zeros_like(lam)
     for _ in range(S):
         th = filter_module.sample_unconstrained()
-        acc += filter_module.spectrum(lam, th)
+        acc += filter_module.spectrum(lam, th).clamp_min(1e-12)
     return acc / float(S)
 
 
@@ -202,7 +179,8 @@ def spectrum_mcmc_mean(
     theta_chain: [S, d_theta] packed
     returns: mean over draws of F(lam; theta_s)
     """
-    device = next(filter_module.parameters()).device if any(True for _ in filter_module.parameters()) else lam.device
+    params = list(filter_module.parameters())
+    device = params[0].device if params else lam.device
     dtype = lam.dtype
     lam = lam.to(device=device, dtype=dtype)
 
@@ -214,7 +192,7 @@ def spectrum_mcmc_mean(
         chunk = theta_chain[i:i+batch].to(device=device, dtype=dtype)
         for j in range(chunk.shape[0]):
             theta = filter_module.unpack(chunk[j])
-            acc += filter_module.spectrum(lam, theta)
+            acc += filter_module.spectrum(lam, theta).clamp_min(1e-12)
             count += 1
 
     return acc / max(count, 1)
@@ -222,8 +200,10 @@ def spectrum_mcmc_mean(
 
 def plot_spectrum_curves(lam_np: np.ndarray, curves: Dict[str, np.ndarray], save_path: Path, *, ylog: bool, title: str):
     plt.figure(figsize=(6.2, 4.2))
+    idx = np.argsort(lam_np)
+    lam_sorted = lam_np[idx]
     for name, y in curves.items():
-        plt.plot(lam_np, y, linewidth=2.0 if name == "truth" else 1.6, label=name)
+        plt.plot(lam_sorted, y[idx], linewidth=2.0 if name == "truth" else 1.6, label=name)
     plt.xlabel(r"$\lambda$")
     plt.ylabel(r"$F(\lambda)$")
     plt.title(title)
@@ -301,7 +281,7 @@ def _k_blocks_from_spectrum(
     Utr = U[tr, :]  # [n_tr, n]
     Ute = U[te, :]  # [n_te, n]
 
-    F_row = F.clamp_min(1e-12).reshape(1, -1)
+    F_row = F.to(device=device, dtype=dtype).clamp_min(1e-12).reshape(1, -1)
 
     # K_tt = Utr diag(F) Utr^T + sigma2 I
     K_tt = (Utr * F_row) @ Utr.T
@@ -363,7 +343,10 @@ def conditional_predictive_loglik(
     # Conditional cov: K_ss - K_st K_tt^{-1} K_ts
     # First solve V = K_tt^{-1} K_ts, where K_ts = K_st^T
     V = torch.cholesky_solve(K_st.T, L)  # [n_tr, n_te]
+
+    # numerically symmetric
     cond_cov = K_ss - (K_st @ V)
+    cond_cov = 0.5 * (cond_cov + cond_cov.T)
 
     # MVN logpdf: -0.5*( (y-m)^T C^{-1} (y-m) + logdet(C) + n log(2π) )
     e = (y_te - cond_mean).reshape(-1, 1)
@@ -487,32 +470,6 @@ def predictive_loglik_mcmc_heldout(
     pll = a + math.log(sum(math.exp(v - a) for v in logliks) / float(len(logliks)))
     return float(pll)
 
-@torch.no_grad()
-def phi_posterior_mean_from_train(
-    *,
-    U_train: torch.Tensor,   # [n_tr, n]
-    U_full: torch.Tensor,    # [n, n]
-    X_train: torch.Tensor,   # [n_tr, p]
-    y_train: torch.Tensor,   # [n_tr]
-    beta: torch.Tensor,      # [p]
-    lam: torch.Tensor,       # [n]
-    F: torch.Tensor,         # [n]
-    sigma2: float,
-) -> torch.Tensor:
-    """
-    Posterior mean of full phi = U_full mu_z,
-    where mu_z is computed from training observations only.
-
-    z | y_train ~ N(mu_z, diag(v_spec)) with:
-      mu_z = (F/(F+sigma2)) ⊙ (U_train^T r_train)
-      r_train = y_train - X_train beta
-    """
-    r_tr = y_train - X_train @ beta
-    Ut_r = U_train.T @ r_tr                          # [n]
-    shrink = (F / (F + sigma2)).clamp(0.0, 1.0)      # [n]
-    mu_z = shrink * Ut_r                             # [n]
-    phi_full = U_full @ mu_z                         # [n]
-    return phi_full
 
 @torch.no_grad()
 def compute_phi_vi_full(
@@ -538,7 +495,7 @@ def compute_phi_vi_full(
 
     if mode == "plugin":
         # E_q[F]
-        F_used = spectrum_vi_mc_mean(model.filter, lam, S=256).detach()
+        F_used = spectrum_vi_mc_mean(model.filter, lam, S=S).detach()
         phi = phi_full_from_train(
             U_train=U_train, U_full=U_full,
             X_train=X_train, y_train=y_train,
@@ -981,7 +938,7 @@ def _sort_key(r: FitResult) -> float:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--truth", required=True, choices=["mix2", "floor", "bump", "bandpass", "steep", "bimodal"])
+    p.add_argument("--truth", required=True, choices=["multiscale", "bandpass", "car"])
 
     # Legacy mode (optional now)
     p.add_argument(
