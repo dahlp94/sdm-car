@@ -731,17 +731,32 @@ class FitResult:
     pll_vi: float
     pll_vi_per_test: float
 
-    rmse_phi_vi: float
-    rmse_eta_vi: float
-    rmse_phi_vi_test: float
-    rmse_eta_vi_test: float
+    # Plugin reconstruction metrics
+    rmse_phi_vi_plugin_full: float
+    rmse_eta_vi_plugin_full: float
+    rmse_phi_vi_plugin_test: float
+    rmse_eta_vi_plugin_test: float
 
-    y_rmse_train: float
-    y_rmse_test: float
+    # Posterior-mean reconstruction metrics
+    rmse_phi_vi_post_full: float
+    rmse_eta_vi_post_full: float
+    rmse_phi_vi_post_test: float
+    rmse_eta_vi_post_test: float
 
-    spectrum_mean_vi: torch.Tensor
-    phi_hat_vi: torch.Tensor
-    eta_hat_vi: torch.Tensor
+    y_rmse_train_plugin: float
+    y_rmse_test_plugin: float
+
+    y_rmse_train_post: float
+    y_rmse_test_post: float
+
+    spectrum_mean_vi_plugin: torch.Tensor
+    spectrum_mean_vi_post: torch.Tensor
+
+    phi_hat_vi_plugin: torch.Tensor
+    eta_hat_vi_plugin: torch.Tensor
+
+    phi_hat_vi_post: torch.Tensor
+    eta_hat_vi_post: torch.Tensor
 
 # ---------------------------------------------------------------------
 # Model fitting wrapper
@@ -826,7 +841,10 @@ def fit_one_model(
             )
     print(f"[MODEL] Finished {filter_name}:{variant}\n")
 
-    phi_hat_vi, F_vi_used, _ = compute_phi_vi_full(
+    # ----------------------------
+    # Plugin reconstruction
+    # ----------------------------
+    phi_hat_vi_plugin, F_vi_plugin, _ = compute_phi_vi_full(
         model=model,
         lam=lam,
         U_train=U_tr,
@@ -839,17 +857,47 @@ def fit_one_model(
 
     beta_mean, _, _, _ = model.beta_posterior_plugin()
     beta_mean = beta_mean.reshape(-1)
-    eta_hat_vi = (X @ beta_mean) + phi_hat_vi
 
-    rmse_phi_full = rmse(phi_hat_vi.cpu(), phi_true.cpu())
-    rmse_eta_full = rmse(eta_hat_vi.cpu(), eta_true.cpu())
+    eta_hat_vi_plugin = (X @ beta_mean) + phi_hat_vi_plugin
 
-    rmse_phi_test = rmse_on_index(phi_hat_vi, phi_true, test_idx)
-    rmse_eta_test = rmse_on_index(eta_hat_vi, eta_true, test_idx)
+    rmse_phi_plugin_full = rmse(phi_hat_vi_plugin.cpu(), phi_true.cpu())
+    rmse_eta_plugin_full = rmse(eta_hat_vi_plugin.cpu(), eta_true.cpu())
 
-    y_rmse_train, y_rmse_test = summarize_residual_rmse(
+    rmse_phi_plugin_test = rmse_on_index(phi_hat_vi_plugin, phi_true, test_idx)
+    rmse_eta_plugin_test = rmse_on_index(eta_hat_vi_plugin, eta_true, test_idx)
+
+    y_rmse_train_plugin, y_rmse_test_plugin = summarize_residual_rmse(
         y=y,
-        y_hat=eta_hat_vi,
+        y_hat=eta_hat_vi_plugin,
+        train_idx=train_idx,
+        test_idx=test_idx,
+    )
+
+    # ----------------------------
+    # Posterior-mean reconstruction
+    # ----------------------------
+    phi_hat_vi_post, F_vi_post, _ = compute_phi_vi_full(
+        model=model,
+        lam=lam,
+        U_train=U_tr,
+        U_full=U,
+        X_train=X_tr,
+        y_train=y_tr,
+        mode="posterior",
+        S=128,
+    )
+
+    eta_hat_vi_post = (X @ beta_mean) + phi_hat_vi_post
+
+    rmse_phi_post_full = rmse(phi_hat_vi_post.cpu(), phi_true.cpu())
+    rmse_eta_post_full = rmse(eta_hat_vi_post.cpu(), eta_true.cpu())
+
+    rmse_phi_post_test = rmse_on_index(phi_hat_vi_post, phi_true, test_idx)
+    rmse_eta_post_test = rmse_on_index(eta_hat_vi_post, eta_true, test_idx)
+
+    y_rmse_train_post, y_rmse_test_post = summarize_residual_rmse(
+        y=y,
+        y_hat=eta_hat_vi_post,
         train_idx=train_idx,
         test_idx=test_idx,
     )
@@ -870,13 +918,21 @@ def fit_one_model(
 
     print(
         f"[RESULT] {filter_name}:{variant} | "
-        f"PLL/test = {pll_vi_per_test:.4f} | "
-        f"phi_RMSE(full) = {rmse_phi_full:.4f} | "
-        f"eta_RMSE(full) = {rmse_eta_full:.4f} | "
-        f"phi_RMSE(test) = {rmse_phi_test:.4f} | "
-        f"eta_RMSE(test) = {rmse_eta_test:.4f} | "
-        f"y_RMSE(train) = {y_rmse_train:.4f} | "
-        f"y_RMSE(test) = {y_rmse_test:.4f}"
+        f"PLL/test = {pll_vi_per_test:.4f}\n"
+        f"    [PLUGIN]  "
+        f"phi_RMSE(full) = {rmse_phi_plugin_full:.4f} | "
+        f"eta_RMSE(full) = {rmse_eta_plugin_full:.4f} | "
+        f"phi_RMSE(test) = {rmse_phi_plugin_test:.4f} | "
+        f"eta_RMSE(test) = {rmse_eta_plugin_test:.4f} | "
+        f"y_RMSE(train) = {y_rmse_train_plugin:.4f} | "
+        f"y_RMSE(test) = {y_rmse_test_plugin:.4f}\n"
+        f"    [POST]    "
+        f"phi_RMSE(full) = {rmse_phi_post_full:.4f} | "
+        f"eta_RMSE(full) = {rmse_eta_post_full:.4f} | "
+        f"phi_RMSE(test) = {rmse_phi_post_test:.4f} | "
+        f"eta_RMSE(test) = {rmse_eta_post_test:.4f} | "
+        f"y_RMSE(train) = {y_rmse_train_post:.4f} | "
+        f"y_RMSE(test) = {y_rmse_test_post:.4f}"
     )
 
     return FitResult(
@@ -885,15 +941,31 @@ def fit_one_model(
         label=f"{filter_name}/{case_spec.display_name}",
         pll_vi=float(pll_vi),
         pll_vi_per_test=float(pll_vi_per_test),
-        rmse_phi_vi=rmse_phi_full,
-        rmse_eta_vi=rmse_eta_full,
-        rmse_phi_vi_test=rmse_phi_test,
-        rmse_eta_vi_test=rmse_eta_test,
-        y_rmse_train=y_rmse_train,
-        y_rmse_test=y_rmse_test,
-        spectrum_mean_vi=F_vi_used.detach().cpu(),
-        phi_hat_vi=phi_hat_vi.detach().cpu(),
-        eta_hat_vi=eta_hat_vi.detach().cpu(),
+
+        rmse_phi_vi_plugin_full=rmse_phi_plugin_full,
+        rmse_eta_vi_plugin_full=rmse_eta_plugin_full,
+        rmse_phi_vi_plugin_test=rmse_phi_plugin_test,
+        rmse_eta_vi_plugin_test=rmse_eta_plugin_test,
+
+        rmse_phi_vi_post_full=rmse_phi_post_full,
+        rmse_eta_vi_post_full=rmse_eta_post_full,
+        rmse_phi_vi_post_test=rmse_phi_post_test,
+        rmse_eta_vi_post_test=rmse_eta_post_test,
+
+        y_rmse_train_plugin=y_rmse_train_plugin,
+        y_rmse_test_plugin=y_rmse_test_plugin,
+
+        y_rmse_train_post=y_rmse_train_post,
+        y_rmse_test_post=y_rmse_test_post,
+
+        spectrum_mean_vi_plugin=F_vi_plugin.detach().cpu(),
+        spectrum_mean_vi_post=F_vi_post.detach().cpu(),
+
+        phi_hat_vi_plugin=phi_hat_vi_plugin.detach().cpu(),
+        eta_hat_vi_plugin=eta_hat_vi_plugin.detach().cpu(),
+
+        phi_hat_vi_post=phi_hat_vi_post.detach().cpu(),
+        eta_hat_vi_post=eta_hat_vi_post.detach().cpu(),
     )
 
 
@@ -903,14 +975,28 @@ def fit_one_model(
 def write_leaderboard(results: list[FitResult], outpath: Path) -> None:
     lines = ["HOTSPOT DEMO SUMMARY"]
     for r in results:
-        line = (
+        lines.append(
             f"{r.label:30s} | "
-            f"PLL(VI)={r.pll_vi:8.2f}  PLL/test(VI)={r.pll_vi_per_test:8.4f} | "
-            f"phi_RMSE(full)={r.rmse_phi_vi:7.4f}  eta_RMSE(full)={r.rmse_eta_vi:7.4f} | "
-            f"phi_RMSE(test)={r.rmse_phi_vi_test:7.4f}  eta_RMSE(test)={r.rmse_eta_vi_test:7.4f} | "
-            f"y_RMSE(train)={r.y_rmse_train:7.4f}  y_RMSE(test)={r.y_rmse_test:7.4f}"
+            f"PLL/test(VI)={r.pll_vi_per_test:8.4f}"
         )
-        lines.append(line)
+        lines.append(
+            f"  PLUGIN | "
+            f"phi_full={r.rmse_phi_vi_plugin_full:7.4f}  "
+            f"eta_full={r.rmse_eta_vi_plugin_full:7.4f}  "
+            f"phi_test={r.rmse_phi_vi_plugin_test:7.4f}  "
+            f"eta_test={r.rmse_eta_vi_plugin_test:7.4f}  "
+            f"y_train={r.y_rmse_train_plugin:7.4f}  "
+            f"y_test={r.y_rmse_test_plugin:7.4f}"
+        )
+        lines.append(
+            f"  POST   | "
+            f"phi_full={r.rmse_phi_vi_post_full:7.4f}  "
+            f"eta_full={r.rmse_eta_vi_post_full:7.4f}  "
+            f"phi_test={r.rmse_phi_vi_post_test:7.4f}  "
+            f"eta_test={r.rmse_eta_vi_post_test:7.4f}  "
+            f"y_train={r.y_rmse_train_post:7.4f}  "
+            f"y_test={r.y_rmse_test_post:7.4f}"
+        )
 
     text = "\n".join(lines)
     outpath.write_text(text)
@@ -931,12 +1017,24 @@ def save_metrics_json(
                 "label": r.label,
                 "pll_vi": r.pll_vi,
                 "pll_vi_per_test": r.pll_vi_per_test,
-                "rmse_phi_vi_full": r.rmse_phi_vi,
-                "rmse_eta_vi_full": r.rmse_eta_vi,
-                "rmse_phi_vi_test": r.rmse_phi_vi_test,
-                "rmse_eta_vi_test": r.rmse_eta_vi_test,
-                "y_rmse_train": r.y_rmse_train,
-                "y_rmse_test": r.y_rmse_test,
+
+                "plugin": {
+                    "rmse_phi_full": r.rmse_phi_vi_plugin_full,
+                    "rmse_eta_full": r.rmse_eta_vi_plugin_full,
+                    "rmse_phi_test": r.rmse_phi_vi_plugin_test,
+                    "rmse_eta_test": r.rmse_eta_vi_plugin_test,
+                    "y_rmse_train": r.y_rmse_train_plugin,
+                    "y_rmse_test": r.y_rmse_test_plugin,
+                },
+
+                "posterior_mean": {
+                    "rmse_phi_full": r.rmse_phi_vi_post_full,
+                    "rmse_eta_full": r.rmse_eta_vi_post_full,
+                    "rmse_phi_test": r.rmse_phi_vi_post_test,
+                    "rmse_eta_test": r.rmse_eta_vi_post_test,
+                    "y_rmse_train": r.y_rmse_train_post,
+                    "y_rmse_test": r.y_rmse_test_post,
+                },
             }
         )
     outpath.write_text(json.dumps(payload, indent=2))
@@ -1125,54 +1223,88 @@ def main() -> None:
         results.append(res)
 
         save_heatmap(
-            res.phi_hat_vi,
+            res.phi_hat_vi_plugin,
             nx=args.nx,
             ny=args.ny,
-            title=f"{res.label} phi_hat (VI)",
-            outpath=model_dir / "phi_hat_vi.png",
+            title=f"{res.label} phi_hat (VI plugin)",
+            outpath=model_dir / "phi_hat_vi_plugin.png",
         )
         save_heatmap(
-            res.eta_hat_vi,
+            res.eta_hat_vi_plugin,
             nx=args.nx,
             ny=args.ny,
-            title=f"{res.label} eta_hat (VI)",
-            outpath=model_dir / "eta_hat_vi.png",
+            title=f"{res.label} eta_hat (VI plugin)",
+            outpath=model_dir / "eta_hat_vi_plugin.png",
+        )
+
+        save_heatmap(
+            res.phi_hat_vi_post,
+            nx=args.nx,
+            ny=args.ny,
+            title=f"{res.label} phi_hat (VI posterior mean)",
+            outpath=model_dir / "phi_hat_vi_post.png",
+        )
+        save_heatmap(
+            res.eta_hat_vi_post,
+            nx=args.nx,
+            ny=args.ny,
+            title=f"{res.label} eta_hat (VI posterior mean)",
+            outpath=model_dir / "eta_hat_vi_post.png",
         )
 
         plot_empirical_vs_learned_spectra(
             lam=lam,
             empirical_energy=empirical_energy,
-            learned={"VI mean": res.spectrum_mean_vi},
+            learned={
+                "VI plugin": res.spectrum_mean_vi_plugin,
+                "VI posterior mean": res.spectrum_mean_vi_post,
+            },
             outpath=model_dir / "spectrum_empirical_vs_learned.png",
         )
 
         plot_empirical_vs_learned_spectra_logy(
             lam=lam,
             empirical_energy=empirical_energy,
-            learned={"VI mean": res.spectrum_mean_vi},
+            learned={
+                "VI plugin": res.spectrum_mean_vi_plugin,
+                "VI posterior mean": res.spectrum_mean_vi_post,
+            },
             outpath=model_dir / "spectrum_empirical_vs_learned_logy.png",
         )
 
         plot_empirical_vs_learned_spectra_zoom(
             lam=lam,
             empirical_energy=empirical_energy,
-            learned={"VI mean": res.spectrum_mean_vi},
+            learned={
+                "VI plugin": res.spectrum_mean_vi_plugin,
+                "VI posterior mean": res.spectrum_mean_vi_post,
+            },
             outpath=model_dir / "spectrum_empirical_vs_learned_zoom.png",
             lam_quantile=0.15,
         )
 
     compare_dir = ensure_dir(outdir / "COMPARE")
 
-    phi_hats_vi = {r.label: r.phi_hat_vi for r in results}
+    phi_hats_vi_plugin = {r.label: r.phi_hat_vi_plugin for r in results}
     plot_compare_fields(
         phi_true=phi_true,
-        phi_hats=phi_hats_vi,
+        phi_hats=phi_hats_vi_plugin,
         nx=args.nx,
         ny=args.ny,
-        outpath=compare_dir / "phi_compare_vi.png",
+        outpath=compare_dir / "phi_compare_vi_plugin.png",
     )
 
-    learned_vi = {r.label: r.spectrum_mean_vi for r in results}
+    phi_hats_vi_post = {r.label: r.phi_hat_vi_post for r in results}
+    plot_compare_fields(
+        phi_true=phi_true,
+        phi_hats=phi_hats_vi_post,
+        nx=args.nx,
+        ny=args.ny,
+        outpath=compare_dir / "phi_compare_vi_post.png",
+    )
+
+    learned_vi = {r.label: r.spectrum_mean_vi_plugin for r in results}
+
     plot_empirical_vs_learned_spectra(
         lam=lam,
         empirical_energy=empirical_energy,
