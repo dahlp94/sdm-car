@@ -1,4 +1,3 @@
-# examples/run_null_signal_demo.py
 from __future__ import annotations
 
 import os
@@ -51,16 +50,32 @@ class FitResult:
     label: str
     F_vi: torch.Tensor
     F_mcmc: Optional[torch.Tensor]
+
     rmse_phi_vi: float
     rmse_phi_mcmc: Optional[float]
-    rmse_logF_vi: float
+
+    rmse_logF_vi: Optional[float]
     rmse_logF_mcmc: Optional[float]
+
     pll_vi: Optional[float] = None
     pll_mcmc: Optional[float] = None
+    pll_vi_per_test: Optional[float] = None
+    pll_mcmc_per_test: Optional[float] = None
+
     mass_vi: float | None = None
     mass_mcmc: float | None = None
+
     flatness_vi: float | None = None
     flatness_mcmc: float | None = None
+
+    spec_sdlog_vi: float | None = None
+    spec_sdlog_mcmc: float | None = None
+
+    phi_energy_vi: float | None = None
+    phi_energy_mcmc: float | None = None
+
+    vi_band: Optional[dict[str, torch.Tensor]] = None
+    mcmc_band: Optional[dict[str, torch.Tensor]] = None
 
 
 # -------------------------
@@ -70,6 +85,34 @@ def car_like_truth_spectrum(lam: torch.Tensor, *, eps_car: float, tau: float = 1
     lam = lam.clamp_min(0.0)
     F = tau / (lam + eps_car)
     return F.clamp_min(1e-12)
+
+
+def multiscale_truth_spectrum(
+    lam: torch.Tensor,
+    *,
+    eps_car: float,
+    tau1: float = 0.7,
+    tau2: float = 0.3,
+    decay: float = 6.0,
+) -> torch.Tensor:
+    lam = lam.clamp_min(0.0)
+    lowfreq = tau1 / (lam + eps_car)
+    midfreq = tau2 * torch.exp(-decay * lam)
+    F = lowfreq + midfreq
+    return F.clamp_min(1e-12)
+
+
+def make_truth_spectrum(
+    lam: torch.Tensor,
+    *,
+    truth_shape: str,
+    eps_car: float,
+) -> torch.Tensor:
+    if truth_shape == "car":
+        return car_like_truth_spectrum(lam, eps_car=eps_car, tau=1.0)
+    if truth_shape == "multiscale":
+        return multiscale_truth_spectrum(lam, eps_car=eps_car)
+    raise ValueError(f"Unknown truth_shape='{truth_shape}'")
 
 
 def make_split(n: int, test_frac: float, seed: int):
@@ -112,7 +155,7 @@ def spectrum_mcmc_mean(
     count = 0
 
     for i in range(0, S, batch):
-        chunk = theta_chain[i:i+batch].to(device=device, dtype=dtype)
+        chunk = theta_chain[i:i + batch].to(device=device, dtype=dtype)
         for j in range(chunk.shape[0]):
             theta = filter_module.unpack(chunk[j])
             acc += filter_module.spectrum(lam, theta)
@@ -122,19 +165,30 @@ def spectrum_mcmc_mean(
 
 
 def rmse_log_spectrum(F_hat: torch.Tensor, F_true: torch.Tensor) -> float:
-    # For null-signal where F_true can be 0, compare in log with an epsilon floor
     eps = 1e-12
     a = torch.log(F_hat.clamp_min(eps))
     b = torch.log(F_true.clamp_min(eps))
     return float(torch.sqrt(torch.mean((a - b) ** 2)).detach().cpu().item())
 
+
 def spectrum_mass(F: torch.Tensor) -> float:
     return float(F.mean().detach().cpu())
+
 
 def spectrum_flatness(F: torch.Tensor, eps: float = 1e-12) -> float:
     m = F.mean()
     s = F.std(unbiased=False)
     return float((s / (m + eps)).detach().cpu())
+
+
+def spectrum_sdlog(F: torch.Tensor, eps: float = 1e-12) -> float:
+    logF = torch.log(F.clamp_min(eps))
+    return float(logF.std(unbiased=False).detach().cpu())
+
+
+def phi_energy(phi: torch.Tensor) -> float:
+    return float(torch.mean(phi.detach().cpu() ** 2).item())
+
 
 # posterior band helpers
 @torch.no_grad()
@@ -144,7 +198,8 @@ def spectrum_vi_draws(filter_module, lam: torch.Tensor, *, S: int = 256) -> torc
         th = filter_module.sample_unconstrained()
         F = filter_module.spectrum(lam, th).clamp_min(1e-12)
         draws.append(F.detach().cpu())
-    return torch.stack(draws, dim=0)   # [S, n]
+    return torch.stack(draws, dim=0)
+
 
 @torch.no_grad()
 def spectrum_mcmc_draws(filter_module, lam: torch.Tensor, theta_chain: torch.Tensor, *, max_draws: int = 256) -> torch.Tensor:
@@ -155,15 +210,16 @@ def spectrum_mcmc_draws(filter_module, lam: torch.Tensor, theta_chain: torch.Ten
         theta = filter_module.unpack(theta_chain[i])
         F = filter_module.spectrum(lam, theta).clamp_min(1e-12)
         draws.append(F.detach().cpu())
-    return torch.stack(draws, dim=0)   # [S, n]
+    return torch.stack(draws, dim=0)
 
-# quantile helper
+
 def summarize_spectrum_draws(F_draws: torch.Tensor) -> dict[str, torch.Tensor]:
     return {
         "q10": torch.quantile(F_draws, 0.10, dim=0),
         "q50": torch.quantile(F_draws, 0.50, dim=0),
         "q90": torch.quantile(F_draws, 0.90, dim=0),
     }
+
 
 def plot_spectrum_curves(
     lam_np: np.ndarray,
@@ -185,6 +241,7 @@ def plot_spectrum_curves(
     plt.tight_layout()
     plt.savefig(save_path, dpi=220)
     plt.close()
+
 
 def plot_spectrum_band(
     lam_np: np.ndarray,
@@ -212,6 +269,7 @@ def plot_spectrum_band(
     plt.savefig(save_path, dpi=220)
     plt.close()
 
+
 def plot_spectrum_overlay(*, lam: torch.Tensor, F_true: torch.Tensor, results: List[FitResult], save_dir: Path, title_tag: str):
     save_dir.mkdir(parents=True, exist_ok=True)
     lam_np = lam.detach().cpu().numpy()
@@ -224,6 +282,37 @@ def plot_spectrum_overlay(*, lam: torch.Tensor, F_true: torch.Tensor, results: L
 
     plot_spectrum_curves(lam_np, curves, save_dir / "spectrum_overlay_linear.png", ylog=False, title=f"Spectrum overlay ({title_tag})")
     plot_spectrum_curves(lam_np, curves, save_dir / "spectrum_overlay_log.png", ylog=True, title=f"Spectrum overlay ({title_tag})")
+
+
+def plot_compare_vi_bands(
+    *,
+    lam: torch.Tensor,
+    F_true: torch.Tensor,
+    band_map: Dict[str, dict[str, torch.Tensor]],
+    save_path: Path,
+    title: str,
+):
+    lam_np = lam.detach().cpu().numpy()
+    truth_np = F_true.detach().cpu().numpy()
+
+    plt.figure(figsize=(7.0, 4.8))
+    plt.plot(lam_np, truth_np, linewidth=2.2, label="truth")
+
+    for label, band in band_map.items():
+        q10 = band["q10"].detach().cpu().numpy()
+        q50 = band["q50"].detach().cpu().numpy()
+        q90 = band["q90"].detach().cpu().numpy()
+        plt.fill_between(lam_np, q10, q90, alpha=0.12)
+        plt.plot(lam_np, q50, linewidth=1.8, label=label)
+
+    plt.xlabel(r"$\lambda$")
+    plt.ylabel(r"$F(\lambda)$")
+    plt.yscale("log")
+    plt.title(title)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=220)
+    plt.close()
 
 
 # -------------------------
@@ -242,8 +331,8 @@ def _k_blocks_from_spectrum(
     tr = torch.as_tensor(train_idx, device=device)
     te = torch.as_tensor(test_idx, device=device)
 
-    Utr = U[tr, :]  # [n_tr, n]
-    Ute = U[te, :]  # [n_te, n]
+    Utr = U[tr, :]
+    Ute = U[te, :]
 
     F_row = F.clamp_min(1e-12).reshape(1, -1)
 
@@ -318,19 +407,9 @@ def predictive_loglik_vi_heldout(
     train_idx: np.ndarray,
     test_idx: np.ndarray,
     S: int = 16,
-    beta_mode: str = "plugin",     # "plugin" or "draw"
-    sigma2_mode: str = "plugin",   # "plugin" or "draw"
+    beta_mode: str = "plugin",
+    sigma2_mode: str = "plugin",
 ) -> float:
-    """
-    PLL under VI posterior:
-      MC over theta ~ q(theta).
-      beta_mode:
-        - "plugin": use beta posterior mean under plugin hypers (fast/stable)
-        - "draw"  : recompute beta mean conditional on current draw's inv_var (slower)
-      sigma2_mode:
-        - "plugin": use plugin sigma2
-        - "draw"  : sample log sigma2 from q(s)
-    """
     m_beta_plugin, _, sigma2_plugin, _ = model.beta_posterior_plugin()
     beta_plugin = m_beta_plugin.reshape(-1)
 
@@ -378,13 +457,9 @@ def predictive_loglik_mcmc_heldout(
     train_idx: np.ndarray,
     test_idx: np.ndarray,
     S: int = 16,
-    sigma2_mode: str = "chain",   # "chain" or "plugin"
-    beta_mode: str = "plugin",    # "plugin" (recommended here)
+    sigma2_mode: str = "chain",
+    beta_mode: str = "plugin",
 ) -> float:
-    """
-    PLL using MCMC draws of theta (and optionally s).
-    We default beta_mode="plugin" to avoid needing a beta chain.
-    """
     beta_plugin, _, sigma2_plugin, _ = model.beta_posterior_plugin()
     beta_plugin = beta_plugin.reshape(-1)
 
@@ -401,7 +476,7 @@ def predictive_loglik_mcmc_heldout(
         else:
             sigma2 = float(sigma2_plugin.detach().cpu())
 
-        beta = beta_plugin  # keep simple/clean
+        beta = beta_plugin
 
         ll = conditional_predictive_loglik(
             y=y, X=X, beta=beta, U=U, F=F, sigma2=sigma2,
@@ -444,7 +519,7 @@ def compute_phi_vi_full(
     U_full: torch.Tensor,
     X_train: torch.Tensor,
     y_train: torch.Tensor,
-    mode: str = "plugin",   # "plugin" or "posterior"
+    mode: str = "plugin",
     S: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
     beta_mean, _, sigma2_plugin, _ = model.beta_posterior_plugin()
@@ -491,7 +566,7 @@ def compute_phi_mcmc_full(
     U_full: torch.Tensor,
     X_train: torch.Tensor,
     y_train: torch.Tensor,
-    mode: str = "plugin",     # "plugin" or "posterior"
+    mode: str = "plugin",
     max_draws: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
     beta_mean, _, sigma2_plugin, _ = model.beta_posterior_plugin()
@@ -580,7 +655,11 @@ def _sort_key(r: FitResult) -> float:
         return -r.pll_mcmc
     if r.pll_vi is not None:
         return -r.pll_vi
-    return r.rmse_logF_mcmc if r.rmse_logF_mcmc is not None else r.rmse_logF_vi
+    if r.rmse_logF_mcmc is not None:
+        return r.rmse_logF_mcmc
+    if r.rmse_logF_vi is not None:
+        return r.rmse_logF_vi
+    return 0.0
 
 
 # -------------------------
@@ -671,6 +750,7 @@ def run_fit(
         if vi_log_every and (it % vi_log_every == 0 or it == 1 or it == vi_iters):
             print(f"  [VI] iter {it:>5}/{vi_iters}  ELBO={float(elbo.detach().cpu()):.3f}")
 
+    vi_band = None
     with torch.no_grad():
         phi_vi_full, F_vi_used, _ = compute_phi_vi_full(
             model=model,
@@ -682,10 +762,16 @@ def run_fit(
             mode=phi_vi_mode,
             S=max(1, int(phi_draws)),
         )
+
         rmse_phi_vi = float(torch.sqrt(torch.mean((phi_vi_full.cpu() - phi_true.cpu()) ** 2)).item())
-        rmse_logF_vi = rmse_log_spectrum(F_vi_used, F_true)
+        phi_energy_vi = phi_energy(phi_vi_full)
+
+        is_null_truth = bool(torch.all(F_true == 0).item())
+        rmse_logF_vi = None if is_null_truth else rmse_log_spectrum(F_vi_used, F_true)
+
         mass_vi = spectrum_mass(F_vi_used)
         flatness_vi = spectrum_flatness(F_vi_used)
+        spec_sdlog_vi = spectrum_sdlog(F_vi_used)
 
         pll_vi = predictive_loglik_vi_heldout(
             model=model,
@@ -695,14 +781,10 @@ def run_fit(
             beta_mode=vi_pll_beta_mode,
             sigma2_mode=vi_pll_sigma2_mode,
         )
+        pll_vi_per_test = float(pll_vi) / float(len(test_idx))
 
     F_vi_cpu = F_vi_used.detach().cpu()
 
-    # VI scalar summaries
-    # mass_vi = None
-    # flatness_vi = None
-
-    # MCMC placeholders
     mcmc_band = None
     phi_mcmc_full = None
     rmse_phi_mcmc = None
@@ -712,7 +794,9 @@ def run_fit(
     acc_s_mid = None
     acc_theta_mid = None
 
-    # MCMC scalar-summary placeholders
+    phi_energy_mcmc = None
+    spec_sdlog_mcmc = None
+    pll_mcmc_per_test = None
     mass_mcmc = None
     flatness_mcmc = None
 
@@ -725,7 +809,7 @@ def run_fit(
             step_theta=case_spec.get_step_theta(model.filter),
             seed=0,
             device=device,
-            print_every=5000
+            print_every=5000,
         )
         sampler = make_collapsed_mcmc_from_model(model, config=cfg)
 
@@ -768,12 +852,12 @@ def run_fit(
         )
 
         F_mcmc = spectrum_mcmc_mean(model.filter, lam, theta_chain).detach()
-        rmse_logF_mcmc = rmse_log_spectrum(F_mcmc, F_true)
+        rmse_logF_mcmc = None if is_null_truth else rmse_log_spectrum(F_mcmc, F_true)
         F_mcmc_cpu = F_mcmc.detach().cpu()
-        
+
         mass_mcmc = spectrum_mass(F_mcmc)
         flatness_mcmc = spectrum_flatness(F_mcmc)
-        
+        spec_sdlog_mcmc = spectrum_sdlog(F_mcmc)
 
         phi_mcmc_full, _, _ = compute_phi_mcmc_full(
             model=model,
@@ -788,13 +872,16 @@ def run_fit(
             max_draws=max(1, int(phi_draws)),
         )
         rmse_phi_mcmc = float(torch.sqrt(torch.mean((phi_mcmc_full.cpu() - phi_true.cpu()) ** 2)).item())
+        phi_energy_mcmc = phi_energy(phi_mcmc_full)
+
+        pll_mcmc_per_test = float(pll_mcmc) / float(len(test_idx)) if pll_mcmc is not None else None
 
         acc_s_mid = float(out["acc"]["s"][2])
         acc_theta_mid = {k: float(v[2]) for k, v in out["acc"]["theta"].items()}
 
     if not compare_only:
         lam_np = lam.detach().cpu().numpy()
-        curves = {"truth": F_true.detach().cpu().numpy(), f"{label} (VI)": F_vi_cpu.numpy()}
+        curves = {"truth": F_true.clamp_min(1e-12).detach().cpu().numpy(), f"{label} (VI)": F_vi_cpu.numpy()}
         if F_mcmc_cpu is not None:
             curves[f"{label} (MCMC)"] = F_mcmc_cpu.numpy()
 
@@ -814,7 +901,7 @@ def run_fit(
                 phi_true=phi_true,
                 save_path_prefix=str(case_dir / "phi_mcmc"),
             )
-        
+
         F_vi_draws = spectrum_vi_draws(model.filter, lam, S=max(64, int(phi_draws)))
         vi_band = summarize_spectrum_draws(F_vi_draws)
         plot_spectrum_band(
@@ -825,7 +912,17 @@ def run_fit(
             case_dir / "spectrum_vi_band_linear.png",
             ylog=False,
             title="VI spectrum posterior band",
-            truth=F_true.detach().cpu().numpy(),
+            truth=F_true.clamp_min(1e-12).detach().cpu().numpy(),
+        )
+        plot_spectrum_band(
+            lam_np,
+            vi_band["q10"].numpy(),
+            vi_band["q50"].numpy(),
+            vi_band["q90"].numpy(),
+            case_dir / "spectrum_vi_band_log.png",
+            ylog=True,
+            title="VI spectrum posterior band",
+            truth=F_true.clamp_min(1e-12).detach().cpu().numpy(),
         )
 
         if mcmc_band is not None:
@@ -837,15 +934,31 @@ def run_fit(
                 case_dir / "spectrum_mcmc_band_linear.png",
                 ylog=False,
                 title="MCMC spectrum posterior band",
-                truth=F_true.detach().cpu().numpy(),
+                truth=F_true.clamp_min(1e-12).detach().cpu().numpy(),
+            )
+            plot_spectrum_band(
+                lam_np,
+                mcmc_band["q10"].numpy(),
+                mcmc_band["q50"].numpy(),
+                mcmc_band["q90"].numpy(),
+                case_dir / "spectrum_mcmc_band_log.png",
+                ylog=True,
+                title="MCMC spectrum posterior band",
+                truth=F_true.clamp_min(1e-12).detach().cpu().numpy(),
             )
 
     if rmse_phi_mcmc is None:
         print(f"  phi RMSE  : VI={rmse_phi_vi:.4f} | MCMC=NA")
-        print(f"  logF RMSE : VI={rmse_logF_vi:.4f} | MCMC=NA")
+        if rmse_logF_vi is None:
+            print("  logF RMSE : VI=NA | MCMC=NA")
+        else:
+            print(f"  logF RMSE : VI={rmse_logF_vi:.4f} | MCMC=NA")
     else:
         print(f"  phi RMSE  : VI={rmse_phi_vi:.4f} | MCMC={rmse_phi_mcmc:.4f}")
-        print(f"  logF RMSE : VI={rmse_logF_vi:.4f} | MCMC={rmse_logF_mcmc:.4f}")
+        if rmse_logF_vi is None or rmse_logF_mcmc is None:
+            print("  logF RMSE : VI=NA | MCMC=NA")
+        else:
+            print(f"  logF RMSE : VI={rmse_logF_vi:.4f} | MCMC={rmse_logF_mcmc:.4f}")
         if acc_s_mid is not None and acc_theta_mid is not None:
             print(
                 f"  acc_s={acc_s_mid:.3f}  acc_theta="
@@ -858,16 +971,32 @@ def run_fit(
         label=label,
         F_vi=F_vi_cpu,
         F_mcmc=F_mcmc_cpu,
+
         rmse_phi_vi=rmse_phi_vi,
         rmse_phi_mcmc=rmse_phi_mcmc,
+
         rmse_logF_vi=rmse_logF_vi,
         rmse_logF_mcmc=rmse_logF_mcmc,
+
         pll_vi=float(pll_vi) if pll_vi is not None else None,
         pll_mcmc=float(pll_mcmc) if pll_mcmc is not None else None,
+        pll_vi_per_test=pll_vi_per_test,
+        pll_mcmc_per_test=pll_mcmc_per_test,
+
         mass_vi=mass_vi,
         mass_mcmc=mass_mcmc,
+
         flatness_vi=flatness_vi,
         flatness_mcmc=flatness_mcmc,
+
+        spec_sdlog_vi=spec_sdlog_vi,
+        spec_sdlog_mcmc=spec_sdlog_mcmc,
+
+        phi_energy_vi=phi_energy_vi,
+        phi_energy_mcmc=phi_energy_mcmc,
+
+        vi_band=vi_band,
+        mcmc_band=mcmc_band,
     )
 
 
@@ -876,7 +1005,18 @@ def run_fit(
 # -------------------------
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--signal", choices=["none", "weak"], required=True, help="Null-signal or weak spatial-signal DGP.")
+    p.add_argument(
+        "--regime",
+        choices=["null", "weak"],
+        required=True,
+        help="Experiment 3 regime: null signal or weak spatial signal.",
+    )
+    p.add_argument(
+        "--truth_shape",
+        choices=["car", "multiscale"],
+        default="multiscale",
+        help="Base truth spectrum used when regime=weak.",
+    )
 
     p.add_argument(
         "--filters",
@@ -890,7 +1030,7 @@ def main():
         "--fits",
         nargs="+",
         default=None,
-        help="Preferred mode: explicit list as filter:case tokens. Example: --fits classic_car:baseline multiscale_bump:k2",
+        help="Preferred mode: explicit list as filter:case tokens. Example: --fits classic_car:baseline rational:rat_num2_den1",
     )
 
     p.add_argument("--outdir", default=str(Path("examples") / "figures" / "null_signal"))
@@ -915,30 +1055,29 @@ def main():
     p.add_argument("--phi_mcmc_mode", choices=["plugin", "posterior"], default="plugin")
     p.add_argument("--phi_draws", type=int, default=128)
 
-    # PLL switches for beta/sigma2
     p.add_argument("--vi_pll_beta", choices=["plugin", "draw"], default="plugin")
     p.add_argument("--vi_pll_sigma2", choices=["plugin", "draw"], default="plugin")
     p.add_argument("--mcmc_pll_beta", choices=["plugin"], default="plugin")
     p.add_argument("--mcmc_pll_sigma2", choices=["plugin", "chain"], default="chain")
 
-    # weak-signal strength
-    p.add_argument("--tau2_weak", type=float, default=0.01, help="tau^2 used when --signal weak.")
-    p.add_argument("--sigma2_true", type=float, default=0.10, help="noise variance in DGP.")
-    p.add_argument("--eps_car", type=float, default=1e-3, help="eps used in CAR-like spectrum for weak DGP.")
+    p.add_argument("--tau2_weak", type=float, default=0.01, help="Amplitude multiplier for weak spatial signal.")
+    p.add_argument("--sigma2_true", type=float, default=0.10, help="Noise variance in DGP.")
+    p.add_argument("--eps_car", type=float, default=1e-3, help="Epsilon used in CAR-like truth spectrum.")
 
     args = p.parse_args()
 
     if args.fits is None and args.filters is None:
         raise ValueError("Provide either --fits or --filters (legacy).")
 
-    # seeds + device
     seed = 0
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
     device = torch.device("cpu")
 
-    outdir = Path(args.outdir) / f"signal_{args.signal}"
+    outdir = Path(args.outdir) / f"regime_{args.regime}"
+    if args.regime == "weak":
+        outdir = outdir / f"truth_{args.truth_shape}" / f"tau2weak_{args.tau2_weak:g}"
     outdir.mkdir(parents=True, exist_ok=True)
 
     # 1) grid + graph + eigendecomp
@@ -963,12 +1102,16 @@ def main():
 
     # 3) DGP
     eps_car = float(args.eps_car)
-    if args.signal == "none":
-        F_true = torch.zeros_like(lam)  # true spatial spectrum = 0
+
+    if args.regime == "null":
+        F_true = torch.zeros_like(lam)
         phi_true = torch.zeros(n, dtype=torch.double, device=device)
     else:
-        # weak spatial signal: tau2_weak * CAR-like spectrum
-        F_base = car_like_truth_spectrum(lam, eps_car=eps_car, tau=1.0)
+        F_base = make_truth_spectrum(
+            lam,
+            truth_shape=args.truth_shape,
+            eps_car=eps_car,
+        )
         F_true = float(args.tau2_weak) * F_base
         z_true = torch.sqrt(F_true.clamp_min(1e-12)) * torch.randn(n, dtype=torch.double, device=device)
         phi_true = U @ z_true
@@ -982,11 +1125,9 @@ def main():
     y_tr = y[tr]
     U_tr = U[tr, :]
 
-    # beta prior
     sigma2_beta = 10.0
     prior_V0 = sigma2_beta * torch.eye(X.shape[1], dtype=torch.double, device=device)
 
-    # fits
     tau2_init = 0.4
     fit_specs = parse_fit_specs(args)
 
@@ -1029,52 +1170,86 @@ def main():
         if r is not None:
             results.append(r)
 
-    # COMPARE overlay
     if results:
         compare_dir = outdir / "COMPARE"
-        plot_spectrum_overlay(lam=lam, F_true=F_true.clamp_min(1e-12), results=results, save_dir=compare_dir, title_tag=f"signal={args.signal}")
+        compare_dir.mkdir(parents=True, exist_ok=True)
 
-    # Leaderboard
+        plot_spectrum_overlay(
+            lam=lam,
+            F_true=F_true.clamp_min(1e-12),
+            results=results,
+            save_dir=compare_dir,
+            title_tag=f"regime={args.regime}, truth={args.truth_shape if args.regime == 'weak' else 'null'}",
+        )
+
+        vi_band_map = {r.label: r.vi_band for r in results if r.vi_band is not None}
+        if vi_band_map:
+            plot_compare_vi_bands(
+                lam=lam,
+                F_true=F_true.clamp_min(1e-12),
+                band_map=vi_band_map,
+                save_path=compare_dir / "compare_vi_bands_log.png",
+                title=f"VI posterior spectrum bands ({args.regime})",
+            )
+
     if results:
         print("\n" + "=" * 80)
-        print(f"NULL/LOW-SIGNAL SUMMARY (signal={args.signal})")
+        print(f"EXPERIMENT 3 SUMMARY (regime={args.regime}, truth_shape={args.truth_shape if args.regime == 'weak' else 'null'})")
         print("=" * 80)
+
         for r in sorted(results, key=_sort_key):
-            mass_vi = f"{r.mass_vi:.4e}" if r.mass_vi is not None else "NA"
-            mass_mcmc = f"{r.mass_mcmc:.4e}" if r.mass_mcmc is not None else "NA"
-            flat_vi = f"{r.flatness_vi:.3f}" if r.flatness_vi is not None else "NA"
-            flat_mcmc = f"{r.flatness_mcmc:.3f}" if r.flatness_mcmc is not None else "NA"
             pll_vi = f"{r.pll_vi:.2f}" if r.pll_vi is not None else "NA"
             pll_mcmc = f"{r.pll_mcmc:.2f}" if r.pll_mcmc is not None else "NA"
-            mcmc_phi = f"{r.rmse_phi_mcmc:.4f}" if r.rmse_phi_mcmc is not None else "NA"
+            pll_vi_pt = f"{r.pll_vi_per_test:.4f}" if r.pll_vi_per_test is not None else "NA"
+            pll_mcmc_pt = f"{r.pll_mcmc_per_test:.4f}" if r.pll_mcmc_per_test is not None else "NA"
+
+            phi_rmse_mcmc = f"{r.rmse_phi_mcmc:.4f}" if r.rmse_phi_mcmc is not None else "NA"
+            phi_eng_vi = f"{r.phi_energy_vi:.4e}" if r.phi_energy_vi is not None else "NA"
+            phi_eng_mcmc = f"{r.phi_energy_mcmc:.4e}" if r.phi_energy_mcmc is not None else "NA"
+
+            flat_vi = f"{r.flatness_vi:.3f}" if r.flatness_vi is not None else "NA"
+            flat_mcmc = f"{r.flatness_mcmc:.3f}" if r.flatness_mcmc is not None else "NA"
+            sdlog_vi = f"{r.spec_sdlog_vi:.3f}" if r.spec_sdlog_vi is not None else "NA"
+            sdlog_mcmc = f"{r.spec_sdlog_mcmc:.3f}" if r.spec_sdlog_mcmc is not None else "NA"
 
             print(
                 f"{r.label:<32} | "
-                f"mass(VI)={mass_vi}  mass(MCMC)={mass_mcmc} | "
+                f"PLL(VI)={pll_vi}  PLL/test(VI)={pll_vi_pt} | "
+                f"PLL(MCMC)={pll_mcmc}  PLL/test(MCMC)={pll_mcmc_pt} | "
+                f"phi_RMSE(VI)={r.rmse_phi_vi:.4f}  phi_RMSE(MCMC)={phi_rmse_mcmc} | "
+                f"phi_energy(VI)={phi_eng_vi}  phi_energy(MCMC)={phi_eng_mcmc} | "
                 f"flat(VI)={flat_vi}  flat(MCMC)={flat_mcmc} | "
-                f"phi_RMSE(VI)={r.rmse_phi_vi:.4f}  phi_RMSE(MCMC)={mcmc_phi} | "
-                f"PLL(VI)={pll_vi}  PLL(MCMC)={pll_mcmc}"
+                f"sdlog(VI)={sdlog_vi}  sdlog(MCMC)={sdlog_mcmc}"
             )
 
-        compare_dir = outdir / "COMPARE"
-        compare_dir.mkdir(parents=True, exist_ok=True)
         with open(compare_dir / "leaderboard.txt", "w", encoding="utf-8") as f:
-            f.write(f"NULL/LOW-SIGNAL SUMMARY (signal={args.signal})\n")
+            f.write(
+                f"EXPERIMENT 3 SUMMARY (regime={args.regime}, "
+                f"truth_shape={args.truth_shape if args.regime == 'weak' else 'null'})\n"
+            )
             for r in sorted(results, key=_sort_key):
-                mass_vi = f"{r.mass_vi:.4e}" if r.mass_vi is not None else "NA"
-                mass_mcmc = f"{r.mass_mcmc:.4e}" if r.mass_mcmc is not None else "NA"
-                flat_vi = f"{r.flatness_vi:.3f}" if r.flatness_vi is not None else "NA"
-                flat_mcmc = f"{r.flatness_mcmc:.3f}" if r.flatness_mcmc is not None else "NA"
                 pll_vi = f"{r.pll_vi:.2f}" if r.pll_vi is not None else "NA"
                 pll_mcmc = f"{r.pll_mcmc:.2f}" if r.pll_mcmc is not None else "NA"
-                mcmc_phi = f"{r.rmse_phi_mcmc:.4f}" if r.rmse_phi_mcmc is not None else "NA"
+                pll_vi_pt = f"{r.pll_vi_per_test:.4f}" if r.pll_vi_per_test is not None else "NA"
+                pll_mcmc_pt = f"{r.pll_mcmc_per_test:.4f}" if r.pll_mcmc_per_test is not None else "NA"
+
+                phi_rmse_mcmc = f"{r.rmse_phi_mcmc:.4f}" if r.rmse_phi_mcmc is not None else "NA"
+                phi_eng_vi = f"{r.phi_energy_vi:.4e}" if r.phi_energy_vi is not None else "NA"
+                phi_eng_mcmc = f"{r.phi_energy_mcmc:.4e}" if r.phi_energy_mcmc is not None else "NA"
+
+                flat_vi = f"{r.flatness_vi:.3f}" if r.flatness_vi is not None else "NA"
+                flat_mcmc = f"{r.flatness_mcmc:.3f}" if r.flatness_mcmc is not None else "NA"
+                sdlog_vi = f"{r.spec_sdlog_vi:.3f}" if r.spec_sdlog_vi is not None else "NA"
+                sdlog_mcmc = f"{r.spec_sdlog_mcmc:.3f}" if r.spec_sdlog_mcmc is not None else "NA"
 
                 f.write(
                     f"{r.label:<32} | "
-                    f"mass(VI)={mass_vi}  mass(MCMC)={mass_mcmc} | "
+                    f"PLL(VI)={pll_vi}  PLL/test(VI)={pll_vi_pt} | "
+                    f"PLL(MCMC)={pll_mcmc}  PLL/test(MCMC)={pll_mcmc_pt} | "
+                    f"phi_RMSE(VI)={r.rmse_phi_vi:.4f}  phi_RMSE(MCMC)={phi_rmse_mcmc} | "
+                    f"phi_energy(VI)={phi_eng_vi}  phi_energy(MCMC)={phi_eng_mcmc} | "
                     f"flat(VI)={flat_vi}  flat(MCMC)={flat_mcmc} | "
-                    f"phi_RMSE(VI)={r.rmse_phi_vi:.4f}  phi_RMSE(MCMC)={mcmc_phi} | "
-                    f"PLL(VI)={pll_vi}  PLL(MCMC)={pll_mcmc}\n"
+                    f"sdlog(VI)={sdlog_vi}  sdlog(MCMC)={sdlog_mcmc}\n"
                 )
 
 
