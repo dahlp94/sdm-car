@@ -246,6 +246,67 @@ def empirical_hotspot_spectrum(U: torch.Tensor, phi_true: torch.Tensor) -> torch
     z = U.T @ phi_true
     return z ** 2
 
+def inject_high_frequency_component(
+    phi_base: torch.Tensor,
+    U: torch.Tensor,
+    lam: torch.Tensor,
+    *,
+    spectral_weight: float = 0.50,
+    hf_start_quantile: float = 0.80,
+    normalize_to_sd: float | None = 1.0,
+) -> torch.Tensor:
+    """
+    Add a controlled high-frequency spectral perturbation to a spatial field.
+
+    Parameters
+    ----------
+    phi_base : torch.Tensor
+        Base hotspot field in node space.
+    U : torch.Tensor
+        Laplacian eigenvectors.
+    lam : torch.Tensor
+        Laplacian eigenvalues.
+    spectral_weight : float
+        Strength of injected high-frequency component.
+    hf_start_quantile : float
+        Start of the high-frequency band, e.g. 0.80 means use top 20% eigenvectors.
+    normalize_to_sd : float | None
+        If not None, re-scale the final field to this standard deviation.
+
+    Returns
+    -------
+    phi_new : torch.Tensor
+        Perturbed field with extra high-frequency content.
+    """
+    n = lam.numel()
+    start = int(hf_start_quantile * n)
+    start = max(1, min(n - 1, start))
+
+    idx = torch.arange(start, n, device=lam.device)
+
+    # Random coefficients on high-frequency eigenvectors
+    z_hf = torch.randn(idx.numel(), dtype=U.dtype, device=U.device)
+
+    # Optional mild decay so this is not pure white noise
+    lam_hf = lam[idx]
+    weights = 1.0 / torch.sqrt(lam_hf + 1e-6)
+    z_hf = z_hf * weights
+
+    phi_hf = U[:, idx] @ z_hf
+
+    # Standardize the injected component
+    phi_hf = phi_hf - torch.mean(phi_hf)
+    phi_hf = phi_hf / (torch.std(phi_hf) + 1e-8)
+
+    phi_new = phi_base + spectral_weight * phi_hf
+
+    # Recenter and optionally normalize
+    phi_new = phi_new - torch.mean(phi_new)
+    if normalize_to_sd is not None:
+        phi_new = phi_new / (torch.std(phi_new) + 1e-8) * normalize_to_sd
+
+    return phi_new
+
 def spectral_band_summary(
     lam: torch.Tensor,
     energy: torch.Tensor,
@@ -908,6 +969,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ring_outer", type=float, default=3.8)
     p.add_argument("--ring_amplitude", type=float, default=1.25)
 
+    # Injection
+    p.add_argument("--inject_highfreq", action="store_true")
+    p.add_argument("--spectral_weight", type=float, default=0.50)
+    p.add_argument("--hf_start_quantile", type=float, default=0.80)
+
     p.add_argument("--test_frac", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=1)
 
@@ -978,9 +1044,28 @@ def main() -> None:
     )
 
     X = data["X"]
-    y = data["y"]
+    beta_true = data["beta_true"]
     phi_true = data["phi_true"]
-    eta_true = data["eta_true"]
+
+    # Inject spectral non-CAR component HERE
+    if args.inject_highfreq:
+        print(
+            f"[INFO] Injecting high-frequency component | "
+            f"spectral_weight={args.spectral_weight:.3f}, "
+            f"hf_start_quantile={args.hf_start_quantile:.2f}"
+        )
+        phi_true = inject_high_frequency_component(
+            phi_true,
+            U=U,
+            lam=lam,
+            spectral_weight=args.spectral_weight,
+            hf_start_quantile=args.hf_start_quantile,
+            normalize_to_sd=args.normalize_phi_sd,
+        )
+
+    # Recompute eta_true and y AFTER possible spectral injection
+    eta_true = (X @ beta_true).reshape(-1) + phi_true
+    y = eta_true + args.sigma * torch.randn(X.shape[0], dtype=DTYPE, device=device)
 
     print("[INFO] Data generated")
     print(f"[INFO] y mean: {y.mean().item():.4f}, std: {y.std().item():.4f}")
@@ -1130,6 +1215,9 @@ def main() -> None:
         "ring_inner": args.ring_inner,
         "ring_outer": args.ring_outer,
         "ring_amplitude": args.ring_amplitude,
+        "inject_highfreq": args.inject_highfreq,
+        "spectral_weight": args.spectral_weight,
+        "hf_start_quantile": args.hf_start_quantile,
         "test_frac": args.test_frac,
         "seed": args.seed,
         "fits": args.fits,
