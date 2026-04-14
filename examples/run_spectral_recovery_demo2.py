@@ -481,6 +481,7 @@ def plot_true_vs_empirical(
     outpath: Path,
     title: str,
     logy: bool = False,
+    use_markers: bool = True,          # NEW
 ) -> None:
     lam_np = lam.detach().cpu().numpy()
     F_np = F_true.detach().cpu().numpy()
@@ -491,14 +492,38 @@ def plot_true_vs_empirical(
         e_np = np.clip(e_np, 1e-12, None)
 
     fig, ax = plt.subplots(figsize=(7.0, 4.8))
-    ax.plot(lam_np, F_np, label="True $F_0(x)$", linewidth=2.5)
-    ax.plot(lam_np, e_np, label="Empirical energy $z^2$", linewidth=1.8)
+
+    if use_markers:
+        ax.plot(
+            lam_np,
+            F_np,
+            marker="o",
+            linestyle="none",
+            label="True $F_0(x)$",
+            markersize=4,
+            alpha=0.9,
+        )
+        ax.plot(
+            lam_np,
+            e_np,
+            marker="x",
+            linestyle="none",
+            label="Empirical energy $z^2$",
+            markersize=4,
+            alpha=0.7,
+        )
+    else:
+        ax.plot(lam_np, F_np, label="True $F_0(x)$", linewidth=2.5)
+        ax.plot(lam_np, e_np, label="Empirical energy $z^2$", linewidth=1.8)
+
     if logy:
         ax.set_yscale("log")
+
     ax.set_xlabel(r"$\lambda$")
     ax.set_ylabel("Spectral value")
     ax.set_title(title)
     ax.legend(frameon=False)
+
     fig.tight_layout()
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
@@ -512,29 +537,57 @@ def plot_true_vs_learned_spectra(
     outpath: Path,
     title: str,
     logy: bool = False,
+    use_markers: bool = True,     # NEW
 ) -> None:
     lam_np = lam.detach().cpu().numpy()
     true_np = F_true.detach().cpu().numpy()
+
     if logy:
         true_np = np.clip(true_np, 1e-12, None)
 
     fig, ax = plt.subplots(figsize=(7.0, 4.8))
-    ax.plot(lam_np, true_np, label="True $F_0(x)$", linewidth=2.5)
+
+    if use_markers:
+        ax.plot(
+            lam_np,
+            true_np,
+            marker="o",
+            linestyle="none",
+            label="True $F_0(x)$",
+            markersize=4,
+        )
+    else:
+        ax.plot(lam_np, true_np, label="True $F_0(x)$", linewidth=2.5)
+
     for label, spec in learned.items():
         spec_np = spec.detach().cpu().numpy()
         if logy:
             spec_np = np.clip(spec_np, 1e-12, None)
-        ax.plot(lam_np, spec_np, label=label, linewidth=2.0)
+
+        if use_markers:
+            ax.plot(
+                lam_np,
+                spec_np,
+                marker="x",
+                linestyle="none",
+                label=label,
+                markersize=4,
+                alpha=0.8,
+            )
+        else:
+            ax.plot(lam_np, spec_np, label=label, linewidth=2.0)
+
     if logy:
         ax.set_yscale("log")
+
     ax.set_xlabel(r"$\lambda$")
     ax.set_ylabel("Spectral value")
     ax.set_title(title)
     ax.legend(frameon=False)
+
     fig.tight_layout()
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
-
 
 # ---------------------------------------------------------------------
 # Fit wrapper
@@ -695,6 +748,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vi_mc", type=int, default=10)
     p.add_argument("--vi_lr", type=float, default=1e-2)
 
+    p.add_argument("--use_markers", action="store_true")
+
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--outdir", type=str, default="examples/figures/hardcoded_power_decay_recovery")
     return p
@@ -763,6 +818,7 @@ def main() -> None:
         outpath=outdir / "truth_vs_empirical.png",
         title="True spectrum vs empirical energy",
         logy=False,
+        use_markers=args.use_markers,
     )
     plot_true_vs_empirical(
         lam=lam,
@@ -771,6 +827,7 @@ def main() -> None:
         outpath=outdir / "truth_vs_empirical_logy.png",
         title="True spectrum vs empirical energy (log-y)",
         logy=True,
+        use_markers=args.use_markers,
     )
     plot_true_vs_empirical(
         lam=lam,
@@ -779,6 +836,7 @@ def main() -> None:
         outpath=outdir / "truth_vs_mc_mean.png",
         title=f"True spectrum vs MC mean energy (R={args.mc_reps})",
         logy=False,
+        use_markers=args.use_markers,
     )
     plot_true_vs_empirical(
         lam=lam,
@@ -787,6 +845,7 @@ def main() -> None:
         outpath=outdir / "truth_vs_mc_mean_logy.png",
         title=f"True spectrum vs MC mean energy (R={args.mc_reps}, log-y)",
         logy=True,
+        use_markers=args.use_markers,
     )
 
     save_heatmap(
