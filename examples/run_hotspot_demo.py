@@ -39,6 +39,7 @@ def ensure_dir(path: str | Path) -> Path:
 def rmse(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(torch.sqrt(torch.mean((a - b) ** 2)).item())
 
+
 def rmse_on_index(a: torch.Tensor, b: torch.Tensor, idx: np.ndarray) -> float:
     ii = torch.as_tensor(idx, device=a.device)
     return float(torch.sqrt(torch.mean((a[ii] - b[ii]) ** 2)).item())
@@ -159,15 +160,6 @@ def make_hotspot_field(
     ring_amplitude: float = 1.25,
     center_field: bool = True,
 ) -> torch.Tensor:
-    """
-    Build a more spectrally challenging hotspot field.
-
-    Base component:
-        phi_i = sum_k a_k exp(-||s_i - c_k||^2 / (2 r_k^2))
-
-    Optional addition:
-        localized Mexican-hat feature to inject local sign changes.
-    """
     if not (len(centers) == len(radii) == len(amplitudes)):
         raise ValueError("centers, radii, and amplitudes must have same length.")
 
@@ -246,6 +238,7 @@ def empirical_hotspot_spectrum(U: torch.Tensor, phi_true: torch.Tensor) -> torch
     z = U.T @ phi_true
     return z ** 2
 
+
 def inject_high_frequency_component(
     phi_base: torch.Tensor,
     U: torch.Tensor,
@@ -255,57 +248,31 @@ def inject_high_frequency_component(
     hf_start_quantile: float = 0.80,
     normalize_to_sd: float | None = 1.0,
 ) -> torch.Tensor:
-    """
-    Add a controlled high-frequency spectral perturbation to a spatial field.
-
-    Parameters
-    ----------
-    phi_base : torch.Tensor
-        Base hotspot field in node space.
-    U : torch.Tensor
-        Laplacian eigenvectors.
-    lam : torch.Tensor
-        Laplacian eigenvalues.
-    spectral_weight : float
-        Strength of injected high-frequency component.
-    hf_start_quantile : float
-        Start of the high-frequency band, e.g. 0.80 means use top 20% eigenvectors.
-    normalize_to_sd : float | None
-        If not None, re-scale the final field to this standard deviation.
-
-    Returns
-    -------
-    phi_new : torch.Tensor
-        Perturbed field with extra high-frequency content.
-    """
     n = lam.numel()
     start = int(hf_start_quantile * n)
     start = max(1, min(n - 1, start))
 
     idx = torch.arange(start, n, device=lam.device)
 
-    # Random coefficients on high-frequency eigenvectors
     z_hf = torch.randn(idx.numel(), dtype=U.dtype, device=U.device)
 
-    # Optional mild decay so this is not pure white noise
     lam_hf = lam[idx]
     weights = 1.0 / torch.sqrt(lam_hf + 1e-6)
     z_hf = z_hf * weights
 
     phi_hf = U[:, idx] @ z_hf
 
-    # Standardize the injected component
     phi_hf = phi_hf - torch.mean(phi_hf)
     phi_hf = phi_hf / (torch.std(phi_hf) + 1e-8)
 
     phi_new = phi_base + spectral_weight * phi_hf
 
-    # Recenter and optionally normalize
     phi_new = phi_new - torch.mean(phi_new)
     if normalize_to_sd is not None:
         phi_new = phi_new / (torch.std(phi_new) + 1e-8) * normalize_to_sd
 
     return phi_new
+
 
 def spectral_band_summary(
     lam: torch.Tensor,
@@ -355,9 +322,12 @@ def print_spectral_summary(name: str, summary: dict[str, float]) -> None:
         f"cum@75%={summary['cum_energy_75pct_eigs']:.3f}"
     )
 
+
 def print_spectral_band_energy(
     lam: torch.Tensor,
     empirical_energy: torch.Tensor,
+    *,
+    label: str = "Empirical energy fractions",
 ) -> None:
     lam_np = lam.detach().cpu().numpy()
     e_np = empirical_energy.detach().cpu().numpy()
@@ -370,14 +340,164 @@ def print_spectral_band_energy(
     mid = float(np.sum(e_np[(lam_np > q1) & (lam_np <= q2)]) / total)
     high = float(np.sum(e_np[lam_np > q2]) / total)
 
-    print(
-        "[SPECTRUM] Empirical hotspot energy fractions -> "
-        f"low: {low:.3f}, mid: {mid:.3f}, high: {high:.3f}"
-    )
+    print(f"[SPECTRUM] {label} -> low: {low:.3f}, mid: {mid:.3f}, high: {high:.3f}")
 
 
 # ---------------------------------------------------------------------
-# Spectrum / predictive helpers (adapted from Experiment 3)
+# Two-spike spectral truth
+# ---------------------------------------------------------------------
+def _resolve_mode_index(n: int, raw_idx: int | None, quantile: float | None, *, name: str) -> int:
+    if raw_idx is not None and raw_idx >= 0:
+        idx = int(raw_idx)
+    elif quantile is not None:
+        q = float(quantile)
+        if not (0.0 <= q <= 1.0):
+            raise ValueError(f"{name}_quantile must be in [0, 1].")
+        idx = int(round(q * (n - 1)))
+    else:
+        raise ValueError(f"Need either {name}_idx or {name}_quantile.")
+
+    idx = max(0, min(n - 1, idx))
+    return idx
+
+
+def build_two_spike_spectrum(
+    n: int,
+    *,
+    idx1: int,
+    idx2: int,
+    tau1: float = 2.0,
+    tau2: float = 1.5,
+    inactive_sd: float = 1e-6,
+    device: torch.device,
+    dtype: torch.dtype = DTYPE,
+) -> torch.Tensor:
+    if tau1 <= 0 or tau2 <= 0:
+        raise ValueError("tau1 and tau2 must be positive.")
+    if inactive_sd < 0:
+        raise ValueError("inactive_sd must be nonnegative.")
+    if idx1 == idx2:
+        raise ValueError("idx1 and idx2 must be different.")
+
+    F_true = torch.full((n,), inactive_sd ** 2, dtype=dtype, device=device)
+    F_true[idx1] = tau1 ** 2
+    F_true[idx2] = tau2 ** 2
+    return F_true
+
+
+def simulate_two_spike_spectral_truth(
+    U: torch.Tensor,
+    lam: torch.Tensor,
+    *,
+    beta0: float,
+    sigma: float,
+    device: torch.device,
+    idx1: int,
+    idx2: int,
+    deterministic: bool = True,
+    amp1: float = 2.0,
+    amp2: float = -1.5,
+    tau1: float = 2.0,
+    tau2: float = 1.5,
+    inactive_sd: float = 1e-6,
+    normalize_phi_sd: float | None = None,
+) -> dict[str, torch.Tensor]:
+    if sigma <= 0:
+        raise ValueError("sigma must be positive.")
+    if idx1 == idx2:
+        raise ValueError("idx1 and idx2 must be different.")
+
+    n = U.shape[0]
+    X = torch.ones((n, 1), dtype=DTYPE, device=device)
+    beta_true = torch.tensor([beta0], dtype=DTYPE, device=device)
+
+    if deterministic:
+        z_true = torch.zeros(n, dtype=DTYPE, device=device)
+        z_true[idx1] = amp1
+        z_true[idx2] = amp2
+
+        F_true = torch.zeros(n, dtype=DTYPE, device=device)
+        F_true[idx1] = amp1 ** 2
+        F_true[idx2] = amp2 ** 2
+    else:
+        F_true = build_two_spike_spectrum(
+            n,
+            idx1=idx1,
+            idx2=idx2,
+            tau1=tau1,
+            tau2=tau2,
+            inactive_sd=inactive_sd,
+            device=device,
+            dtype=DTYPE,
+        )
+        eps = torch.randn(n, dtype=DTYPE, device=device)
+        z_true = torch.sqrt(F_true) * eps
+
+    phi_true = U @ z_true
+    phi_true = phi_true - torch.mean(phi_true)
+
+    if normalize_phi_sd is not None:
+        sd = torch.std(phi_true)
+        if float(sd) > 0.0:
+            phi_true = phi_true / sd * normalize_phi_sd
+            z_true = U.T @ phi_true
+
+            if deterministic:
+                F_true = torch.zeros_like(z_true)
+                F_true[idx1] = z_true[idx1] ** 2
+                F_true[idx2] = z_true[idx2] ** 2
+
+    eta_true = (X @ beta_true).reshape(-1) + phi_true
+    y = eta_true + sigma * torch.randn(n, dtype=DTYPE, device=device)
+    empirical_energy = z_true ** 2
+
+    return {
+        "X": X,
+        "y": y,
+        "phi_true": phi_true,
+        "eta_true": eta_true,
+        "beta_true": beta_true,
+        "z_true": z_true,
+        "F_true": F_true,
+        "empirical_energy": empirical_energy,
+    }
+
+
+@torch.no_grad()
+def monte_carlo_mean_two_spike_energy(
+    n: int,
+    *,
+    idx1: int,
+    idx2: int,
+    tau1: float = 2.0,
+    tau2: float = 1.5,
+    inactive_sd: float = 1e-6,
+    R: int = 500,
+    device: torch.device,
+    dtype: torch.dtype = DTYPE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    F_true = build_two_spike_spectrum(
+        n,
+        idx1=idx1,
+        idx2=idx2,
+        tau1=tau1,
+        tau2=tau2,
+        inactive_sd=inactive_sd,
+        device=device,
+        dtype=dtype,
+    )
+
+    acc = torch.zeros(n, dtype=dtype, device=device)
+    for _ in range(int(R)):
+        eps = torch.randn(n, dtype=dtype, device=device)
+        z = torch.sqrt(F_true) * eps
+        acc += z ** 2
+
+    return F_true, acc / float(R)
+
+
+# ---------------------------------------------------------------------
+# Spectrum / predictive helpers
 # ---------------------------------------------------------------------
 @torch.no_grad()
 def spectrum_vi_mc_mean(filter_module, lam: torch.Tensor, *, S: int = 256) -> torch.Tensor:
@@ -650,18 +770,19 @@ def plot_empirical_vs_learned_spectra(
     emp_np = empirical_energy.detach().cpu().numpy()
 
     fig, ax = plt.subplots(figsize=(7.0, 4.8))
-    ax.plot(lam_np, emp_np, label="Empirical hotspot energy", linewidth=2.0)
+    ax.plot(lam_np, emp_np, label="Empirical spectral energy", linewidth=2.0)
 
     for label, spec in learned.items():
         ax.plot(lam_np, spec.detach().cpu().numpy(), label=label, linewidth=2.0)
 
     ax.set_xlabel(r"$\lambda$")
     ax.set_ylabel("Spectral energy / learned F")
-    ax.set_title("Empirical hotspot graph spectrum vs learned spectra")
+    ax.set_title("Empirical graph spectrum vs learned spectra")
     ax.legend(frameon=False)
     fig.tight_layout()
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
+
 
 def plot_empirical_vs_learned_spectra_logy(
     *,
@@ -674,7 +795,7 @@ def plot_empirical_vs_learned_spectra_logy(
     emp_np = np.clip(empirical_energy.detach().cpu().numpy(), 1e-12, None)
 
     fig, ax = plt.subplots(figsize=(7.0, 4.8))
-    ax.plot(lam_np, emp_np, label="Empirical hotspot energy", linewidth=2.0)
+    ax.plot(lam_np, emp_np, label="Empirical spectral energy", linewidth=2.0)
 
     for label, spec in learned.items():
         spec_np = np.clip(spec.detach().cpu().numpy(), 1e-12, None)
@@ -705,7 +826,7 @@ def plot_empirical_vs_learned_spectra_zoom(
     mask = lam_np <= cutoff
 
     fig, ax = plt.subplots(figsize=(7.0, 4.8))
-    ax.plot(lam_np[mask], emp_np[mask], label="Empirical hotspot energy", linewidth=2.0)
+    ax.plot(lam_np[mask], emp_np[mask], label="Empirical spectral energy", linewidth=2.0)
 
     for label, spec in learned.items():
         spec_np = spec.detach().cpu().numpy()
@@ -719,6 +840,45 @@ def plot_empirical_vs_learned_spectra_zoom(
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
 
+
+def plot_true_two_spike_spectrum(
+    *,
+    lam: torch.Tensor,
+    F_true: torch.Tensor,
+    empirical_energy: torch.Tensor,
+    idx1: int,
+    idx2: int,
+    outpath: Path,
+    title: str = "Two-spike spectral truth",
+    logy: bool = False,
+) -> None:
+    lam_np = lam.detach().cpu().numpy()
+    F_np = F_true.detach().cpu().numpy()
+    e_np = empirical_energy.detach().cpu().numpy()
+
+    if logy:
+        F_np = np.clip(F_np, 1e-12, None)
+        e_np = np.clip(e_np, 1e-12, None)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+    ax.plot(lam_np, F_np, label="True two-spike F", linewidth=2.0)
+    ax.plot(lam_np, e_np, label="Empirical energy z^2", linewidth=1.6)
+
+    ax.axvline(float(lam_np[idx1]), linestyle="--", linewidth=1.2, alpha=0.7)
+    ax.axvline(float(lam_np[idx2]), linestyle="--", linewidth=1.2, alpha=0.7)
+
+    if logy:
+        ax.set_yscale("log")
+
+    ax.set_xlabel(r"$\lambda$")
+    ax.set_ylabel("Spectral value")
+    ax.set_title(title)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=180)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------
 # Result container
 # ---------------------------------------------------------------------
@@ -731,13 +891,11 @@ class FitResult:
     pll_vi: float
     pll_vi_per_test: float
 
-    # Plugin reconstruction metrics
     rmse_phi_vi_plugin_full: float
     rmse_eta_vi_plugin_full: float
     rmse_phi_vi_plugin_test: float
     rmse_eta_vi_plugin_test: float
 
-    # Posterior-mean reconstruction metrics
     rmse_phi_vi_post_full: float
     rmse_eta_vi_post_full: float
     rmse_phi_vi_post_test: float
@@ -757,6 +915,7 @@ class FitResult:
 
     phi_hat_vi_post: torch.Tensor
     eta_hat_vi_post: torch.Tensor
+
 
 # ---------------------------------------------------------------------
 # Model fitting wrapper
@@ -841,9 +1000,6 @@ def fit_one_model(
             )
     print(f"[MODEL] Finished {filter_name}:{variant}\n")
 
-    # ----------------------------
-    # Plugin reconstruction
-    # ----------------------------
     phi_hat_vi_plugin, F_vi_plugin, _ = compute_phi_vi_full(
         model=model,
         lam=lam,
@@ -873,9 +1029,6 @@ def fit_one_model(
         test_idx=test_idx,
     )
 
-    # ----------------------------
-    # Posterior-mean reconstruction
-    # ----------------------------
     phi_hat_vi_post, F_vi_post, _ = compute_phi_vi_full(
         model=model,
         lam=lam,
@@ -941,29 +1094,22 @@ def fit_one_model(
         label=f"{filter_name}/{case_spec.display_name}",
         pll_vi=float(pll_vi),
         pll_vi_per_test=float(pll_vi_per_test),
-
         rmse_phi_vi_plugin_full=rmse_phi_plugin_full,
         rmse_eta_vi_plugin_full=rmse_eta_plugin_full,
         rmse_phi_vi_plugin_test=rmse_phi_plugin_test,
         rmse_eta_vi_plugin_test=rmse_eta_plugin_test,
-
         rmse_phi_vi_post_full=rmse_phi_post_full,
         rmse_eta_vi_post_full=rmse_eta_post_full,
         rmse_phi_vi_post_test=rmse_phi_post_test,
         rmse_eta_vi_post_test=rmse_eta_post_test,
-
         y_rmse_train_plugin=y_rmse_train_plugin,
         y_rmse_test_plugin=y_rmse_test_plugin,
-
         y_rmse_train_post=y_rmse_train_post,
         y_rmse_test_post=y_rmse_test_post,
-
         spectrum_mean_vi_plugin=F_vi_plugin.detach().cpu(),
         spectrum_mean_vi_post=F_vi_post.detach().cpu(),
-
         phi_hat_vi_plugin=phi_hat_vi_plugin.detach().cpu(),
         eta_hat_vi_plugin=eta_hat_vi_plugin.detach().cpu(),
-
         phi_hat_vi_post=phi_hat_vi_post.detach().cpu(),
         eta_hat_vi_post=eta_hat_vi_post.detach().cpu(),
     )
@@ -1017,7 +1163,6 @@ def save_metrics_json(
                 "label": r.label,
                 "pll_vi": r.pll_vi,
                 "pll_vi_per_test": r.pll_vi_per_test,
-
                 "plugin": {
                     "rmse_phi_full": r.rmse_phi_vi_plugin_full,
                     "rmse_eta_full": r.rmse_eta_vi_plugin_full,
@@ -1026,7 +1171,6 @@ def save_metrics_json(
                     "y_rmse_train": r.y_rmse_train_plugin,
                     "y_rmse_test": r.y_rmse_test_plugin,
                 },
-
                 "posterior_mean": {
                     "rmse_phi_full": r.rmse_phi_vi_post_full,
                     "rmse_eta_full": r.rmse_eta_vi_post_full,
@@ -1055,25 +1199,44 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sigma", type=float, default=0.4)
     p.add_argument("--normalize_phi_sd", type=float, default=1.0)
 
-    # Mixed-sign, mixed-scale defaults for a stronger non-CAR hotspot truth
     p.add_argument("--centers", type=str, default="9,10;29,30;31,9")
     p.add_argument("--radii", type=str, default="1.6;3.8;1.8")
     p.add_argument("--amplitudes", type=str, default="2.6;1.7;-2.2")
 
-    # Optional local ring feature
     p.add_argument("--add_ring", action="store_true")
     p.add_argument("--ring_center", type=str, default="16,24")
     p.add_argument("--ring_inner", type=float, default=1.6)
     p.add_argument("--ring_outer", type=float, default=3.8)
     p.add_argument("--ring_amplitude", type=float, default=1.25)
 
-    # Injection
     p.add_argument("--inject_highfreq", action="store_true")
     p.add_argument("--spectral_weight", type=float, default=0.50)
     p.add_argument("--hf_start_quantile", type=float, default=0.80)
 
     p.add_argument("--test_frac", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=1)
+
+    p.add_argument(
+        "--truth_mode",
+        type=str,
+        default="hotspot",
+        choices=["hotspot", "two_spike_spectral"],
+        help="Type of latent truth to generate.",
+    )
+
+    p.add_argument("--mode1_idx", type=int, default=-1)
+    p.add_argument("--mode2_idx", type=int, default=-1)
+    p.add_argument("--mode1_quantile", type=float, default=0.05)
+    p.add_argument("--mode2_quantile", type=float, default=0.75)
+
+    p.add_argument("--two_spike_deterministic", action="store_true")
+    p.add_argument("--amp1", type=float, default=2.0)
+    p.add_argument("--amp2", type=float, default=-1.5)
+
+    p.add_argument("--tau1", type=float, default=2.0)
+    p.add_argument("--tau2", type=float, default=1.5)
+    p.add_argument("--inactive_sd", type=float, default=1e-6)
+    p.add_argument("--mc_reps_two_spike", type=int, default=500)
 
     p.add_argument(
         "--fits",
@@ -1120,62 +1283,204 @@ def main() -> None:
     print(f"[INFO] Number of nodes: {coords.shape[0]}")
     print(f"[INFO] Eigenvalues range: [{lam.min().item():.4f}, {lam.max().item():.4f}]\n")
 
-    centers = parse_centers(args.centers)
-    radii = parse_float_list(args.radii)
-    amplitudes = parse_float_list(args.amplitudes)
-    ring_center = parse_point(args.ring_center)
+    n_nodes = U.shape[0]
+    F_true = None
+    mc_mean_energy = None
+    active_idx1 = None
+    active_idx2 = None
 
-    data = simulate_hotspot_dataset(
-        coords=coords,
-        beta0=args.beta0,
-        sigma=args.sigma,
-        centers=centers,
-        radii=radii,
-        amplitudes=amplitudes,
-        normalize_phi_sd=args.normalize_phi_sd,
-        device=device,
-        add_ring=args.add_ring,
-        ring_center=ring_center,
-        ring_inner=args.ring_inner,
-        ring_outer=args.ring_outer,
-        ring_amplitude=args.ring_amplitude,
-    )
+    if args.truth_mode == "hotspot":
+        centers = parse_centers(args.centers)
+        radii = parse_float_list(args.radii)
+        amplitudes = parse_float_list(args.amplitudes)
+        ring_center = parse_point(args.ring_center)
 
-    X = data["X"]
-    beta_true = data["beta_true"]
-    phi_true = data["phi_true"]
-
-    # Inject spectral non-CAR component HERE
-    if args.inject_highfreq:
-        print(
-            f"[INFO] Injecting high-frequency component | "
-            f"spectral_weight={args.spectral_weight:.3f}, "
-            f"hf_start_quantile={args.hf_start_quantile:.2f}"
+        data = simulate_hotspot_dataset(
+            coords=coords,
+            beta0=args.beta0,
+            sigma=args.sigma,
+            centers=centers,
+            radii=radii,
+            amplitudes=amplitudes,
+            normalize_phi_sd=args.normalize_phi_sd,
+            device=device,
+            add_ring=args.add_ring,
+            ring_center=ring_center,
+            ring_inner=args.ring_inner,
+            ring_outer=args.ring_outer,
+            ring_amplitude=args.ring_amplitude,
         )
-        phi_true = inject_high_frequency_component(
-            phi_true,
+
+        X = data["X"]
+        beta_true = data["beta_true"]
+        phi_true = data["phi_true"]
+
+        if args.inject_highfreq:
+            print(
+                f"[INFO] Injecting high-frequency component | "
+                f"spectral_weight={args.spectral_weight:.3f}, "
+                f"hf_start_quantile={args.hf_start_quantile:.2f}"
+            )
+            phi_true = inject_high_frequency_component(
+                phi_true,
+                U=U,
+                lam=lam,
+                spectral_weight=args.spectral_weight,
+                hf_start_quantile=args.hf_start_quantile,
+                normalize_to_sd=args.normalize_phi_sd,
+            )
+
+        eta_true = (X @ beta_true).reshape(-1) + phi_true
+        y = eta_true + args.sigma * torch.randn(X.shape[0], dtype=DTYPE, device=device)
+        empirical_energy = empirical_hotspot_spectrum(U, phi_true)
+
+        summary_label = "empirical_hotspot"
+        spectral_energy_label = "Empirical hotspot energy fractions"
+        true_field_title = "True hotspot field"
+
+    elif args.truth_mode == "two_spike_spectral":
+        centers = None
+        radii = None
+        amplitudes = None
+        ring_center = None
+
+        active_idx1 = _resolve_mode_index(
+            n_nodes,
+            None if args.mode1_idx < 0 else args.mode1_idx,
+            args.mode1_quantile,
+            name="mode1",
+        )
+        active_idx2 = _resolve_mode_index(
+            n_nodes,
+            None if args.mode2_idx < 0 else args.mode2_idx,
+            args.mode2_quantile,
+            name="mode2",
+        )
+
+        data = simulate_two_spike_spectral_truth(
             U=U,
             lam=lam,
-            spectral_weight=args.spectral_weight,
-            hf_start_quantile=args.hf_start_quantile,
-            normalize_to_sd=args.normalize_phi_sd,
+            beta0=args.beta0,
+            sigma=args.sigma,
+            device=device,
+            idx1=active_idx1,
+            idx2=active_idx2,
+            deterministic=args.two_spike_deterministic,
+            amp1=args.amp1,
+            amp2=args.amp2,
+            tau1=args.tau1,
+            tau2=args.tau2,
+            inactive_sd=args.inactive_sd,
+            normalize_phi_sd=args.normalize_phi_sd,
         )
 
-    # Recompute eta_true and y AFTER possible spectral injection
-    eta_true = (X @ beta_true).reshape(-1) + phi_true
-    y = eta_true + args.sigma * torch.randn(X.shape[0], dtype=DTYPE, device=device)
+        X = data["X"]
+        y = data["y"]
+        beta_true = data["beta_true"]
+        phi_true = data["phi_true"]
+        eta_true = data["eta_true"]
+        empirical_energy = data["empirical_energy"]
+        F_true = data["F_true"]
+
+        z_true = data["z_true"]
+
+        print("\n[DEBUG] Inspecting spectral coefficients z_k")
+        print(f"Active indices: idx1={active_idx1}, idx2={active_idx2}")
+
+        print(f"z[idx1] = {z_true[active_idx1].item():.4f}")
+        print(f"z[idx2] = {z_true[active_idx2].item():.4f}")
+
+        print(f"z[idx1]^2 = {(z_true[active_idx1]**2).item():.4f}")
+        print(f"z[idx2]^2 = {(z_true[active_idx2]**2).item():.4f}")
+
+        # Optional: check top energies
+        topk = torch.topk(z_true**2, k=5)
+        print("\nTop 5 z_k^2 values:")
+        for val, idx in zip(topk.values, topk.indices):
+            print(f"  idx={idx.item():4d}, z^2={val.item():.4f}, lambda={lam[idx].item():.6f}")
+
+        if not args.two_spike_deterministic:
+            F_true_mc, mc_mean_energy = monte_carlo_mean_two_spike_energy(
+                n_nodes,
+                idx1=active_idx1,
+                idx2=active_idx2,
+                tau1=args.tau1,
+                tau2=args.tau2,
+                inactive_sd=args.inactive_sd,
+                R=args.mc_reps_two_spike,
+                device=device,
+                dtype=DTYPE,
+            )
+            F_true = F_true_mc
+
+        print(
+            f"[INFO] Two-spike truth active modes -> "
+            f"idx1={active_idx1}, lambda1={lam[active_idx1].item():.6f}; "
+            f"idx2={active_idx2}, lambda2={lam[active_idx2].item():.6f}"
+        )
+
+        summary_label = "empirical_two_spike"
+        spectral_energy_label = "Empirical two-spike energy fractions"
+        true_field_title = "True two-spike spectral field"
+
+    else:
+        raise ValueError(f"Unknown truth_mode '{args.truth_mode}'.")
 
     print("[INFO] Data generated")
     print(f"[INFO] y mean: {y.mean().item():.4f}, std: {y.std().item():.4f}")
     print(f"[INFO] phi_true std: {phi_true.std().item():.4f}\n")
 
-    empirical_energy = empirical_hotspot_spectrum(U, phi_true)
-
     emp_summary = spectral_band_summary(lam, empirical_energy)
-    print_spectral_summary("empirical_hotspot", emp_summary)
+    print_spectral_summary(summary_label, emp_summary)
     (outdir / "empirical_spectral_summary.json").write_text(json.dumps(emp_summary, indent=2))
 
-    print_spectral_band_energy(lam, empirical_energy)
+    if args.truth_mode == "two_spike_spectral" and F_true is not None:
+        plot_true_two_spike_spectrum(
+            lam=lam,
+            F_true=F_true,
+            empirical_energy=empirical_energy,
+            idx1=active_idx1,
+            idx2=active_idx2,
+            outpath=outdir / "two_spike_truth_vs_empirical.png",
+            title="Two-spike truth vs empirical energy",
+            logy=False,
+        )
+
+        plot_true_two_spike_spectrum(
+            lam=lam,
+            F_true=F_true,
+            empirical_energy=empirical_energy,
+            idx1=active_idx1,
+            idx2=active_idx2,
+            outpath=outdir / "two_spike_truth_vs_empirical_logy.png",
+            title="Two-spike truth vs empirical energy (log-y)",
+            logy=True,
+        )
+
+        if mc_mean_energy is not None:
+            plot_true_two_spike_spectrum(
+                lam=lam,
+                F_true=F_true,
+                empirical_energy=mc_mean_energy,
+                idx1=active_idx1,
+                idx2=active_idx2,
+                outpath=outdir / "two_spike_truth_vs_mc_mean.png",
+                title=f"Two-spike truth vs MC mean energy (R={args.mc_reps_two_spike})",
+                logy=False,
+            )
+
+            plot_true_two_spike_spectrum(
+                lam=lam,
+                F_true=F_true,
+                empirical_energy=mc_mean_energy,
+                idx1=active_idx1,
+                idx2=active_idx2,
+                outpath=outdir / "two_spike_truth_vs_mc_mean_logy.png",
+                title=f"Two-spike truth vs MC mean energy (R={args.mc_reps_two_spike}, log-y)",
+                logy=True,
+            )
+
+    print_spectral_band_energy(lam, empirical_energy, label=spectral_energy_label)
 
     train_idx, test_idx = make_split(n=X.shape[0], test_frac=args.test_frac, seed=args.seed)
 
@@ -1187,7 +1492,7 @@ def main() -> None:
         phi_true,
         nx=args.nx,
         ny=args.ny,
-        title="True hotspot field",
+        title=true_field_title,
         outpath=outdir / "true_phi.png",
     )
     save_heatmap(
@@ -1356,6 +1661,18 @@ def main() -> None:
         "vi_iters": args.vi_iters,
         "vi_mc": args.vi_mc,
         "vi_lr": args.vi_lr,
+        "truth_mode": args.truth_mode,
+        "mode1_idx": args.mode1_idx,
+        "mode2_idx": args.mode2_idx,
+        "mode1_quantile": args.mode1_quantile,
+        "mode2_quantile": args.mode2_quantile,
+        "two_spike_deterministic": args.two_spike_deterministic,
+        "amp1": args.amp1,
+        "amp2": args.amp2,
+        "tau1": args.tau1,
+        "tau2": args.tau2,
+        "inactive_sd": args.inactive_sd,
+        "mc_reps_two_spike": args.mc_reps_two_spike,
     }
     (outdir / "config.json").write_text(json.dumps(config, indent=2))
 
