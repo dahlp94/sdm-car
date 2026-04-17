@@ -271,6 +271,57 @@ def filter_parameter_mc_mean(filter_module, *, S: int = 1024) -> dict[str, float
     }
 
 
+def bandwise_energy_diagnostic(
+    lam: torch.Tensor,
+    F_true: torch.Tensor,
+    F_hat: torch.Tensor,
+) -> dict[str, float]:
+    lam_cpu = lam.detach().cpu()
+    F_true_cpu = F_true.detach().cpu()
+    F_hat_cpu = F_hat.detach().cpu()
+
+    q1 = torch.quantile(lam_cpu, 1.0 / 3.0)
+    q2 = torch.quantile(lam_cpu, 2.0 / 3.0)
+
+    low = lam_cpu <= q1
+    mid = (lam_cpu > q1) & (lam_cpu <= q2)
+    high = lam_cpu > q2
+
+    def safe_sum(x: torch.Tensor, mask: torch.Tensor) -> float:
+        return float(x[mask].sum().item())
+
+    low_true = safe_sum(F_true_cpu, low)
+    mid_true = safe_sum(F_true_cpu, mid)
+    high_true = safe_sum(F_true_cpu, high)
+
+    low_hat = safe_sum(F_hat_cpu, low)
+    mid_hat = safe_sum(F_hat_cpu, mid)
+    high_hat = safe_sum(F_hat_cpu, high)
+
+    total_true = float(F_true_cpu.sum().item())
+    total_hat = float(F_hat_cpu.sum().item())
+
+    def safe_div(a: float, b: float) -> float:
+        return a / b if abs(b) > 1e-12 else float("nan")
+
+    return {
+        "low_band_frac_true": safe_div(low_true, total_true),
+        "mid_band_frac_true": safe_div(mid_true, total_true),
+        "high_band_frac_true": safe_div(high_true, total_true),
+        "low_band_frac_hat": safe_div(low_hat, total_hat),
+        "mid_band_frac_hat": safe_div(mid_hat, total_hat),
+        "high_band_frac_hat": safe_div(high_hat, total_hat),
+        "low_band_ratio_hat_to_true": safe_div(low_hat, low_true),
+        "mid_band_ratio_hat_to_true": safe_div(mid_hat, mid_true),
+        "high_band_ratio_hat_to_true": safe_div(high_hat, high_true),
+        "low_band_mass_true": low_true,
+        "mid_band_mass_true": mid_true,
+        "high_band_mass_true": high_true,
+        "low_band_mass_hat": low_hat,
+        "mid_band_mass_hat": mid_hat,
+        "high_band_mass_hat": high_hat,
+    }
+
 def _k_blocks_from_spectrum(
     U: torch.Tensor,
     F_spec: torch.Tensor,
@@ -891,6 +942,17 @@ def main() -> None:
     metrics["logF_rmse_plugin"] = log_spectrum_rmse(metrics["spectrum_mean_vi_plugin"].to(F_true.device), F_true)
     metrics["logF_rmse_post"] = log_spectrum_rmse(metrics["spectrum_mean_vi_post"].to(F_true.device), F_true)
 
+    band_plugin = bandwise_energy_diagnostic(
+        lam=lam,
+        F_true=F_true,
+        F_hat=metrics["spectrum_mean_vi_plugin"].to(F_true.device),
+    )
+    band_post = bandwise_energy_diagnostic(
+        lam=lam,
+        F_true=F_true,
+        F_hat=metrics["spectrum_mean_vi_post"].to(F_true.device),
+    )
+
     ratio_plugin = metrics["spectrum_mean_vi_plugin"].to(F_true.device) / F_true
     ratio_post = metrics["spectrum_mean_vi_post"].to(F_true.device) / F_true
 
@@ -899,6 +961,16 @@ def main() -> None:
     print(f"plugin ratio std  = {float(ratio_plugin.std()):.6f}")
     print(f"post ratio mean   = {float(ratio_post.mean()):.6f}")
     print(f"post ratio std    = {float(ratio_post.std()):.6f}")
+
+    print("\n[DEBUG] Bandwise energy diagnostic (plugin)")
+    print(f"low  frac true={band_plugin['low_band_frac_true']:.4f} | hat={band_plugin['low_band_frac_hat']:.4f} | ratio={band_plugin['low_band_ratio_hat_to_true']:.4f}")
+    print(f"mid  frac true={band_plugin['mid_band_frac_true']:.4f} | hat={band_plugin['mid_band_frac_hat']:.4f} | ratio={band_plugin['mid_band_ratio_hat_to_true']:.4f}")
+    print(f"high frac true={band_plugin['high_band_frac_true']:.4f} | hat={band_plugin['high_band_frac_hat']:.4f} | ratio={band_plugin['high_band_ratio_hat_to_true']:.4f}")
+
+    print("\n[DEBUG] Bandwise energy diagnostic (posterior)")
+    print(f"low  frac true={band_post['low_band_frac_true']:.4f} | hat={band_post['low_band_frac_hat']:.4f} | ratio={band_post['low_band_ratio_hat_to_true']:.4f}")
+    print(f"mid  frac true={band_post['mid_band_frac_true']:.4f} | hat={band_post['mid_band_frac_hat']:.4f} | ratio={band_post['mid_band_ratio_hat_to_true']:.4f}")
+    print(f"high frac true={band_post['high_band_frac_true']:.4f} | hat={band_post['high_band_frac_hat']:.4f} | ratio={band_post['high_band_ratio_hat_to_true']:.4f}")
 
     plot_true_vs_learned_spectra(
         lam=lam,
@@ -972,6 +1044,8 @@ def main() -> None:
             "y_rmse_test_post": metrics["y_rmse_test_post"],
             "logF_rmse_plugin": metrics["logF_rmse_plugin"],
             "logF_rmse_post": metrics["logF_rmse_post"],
+            "bandwise_plugin": band_plugin,
+            "bandwise_post": band_post,
         },
         "config": {
             "nx": args.nx,
