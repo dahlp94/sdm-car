@@ -42,6 +42,25 @@ def log_spectrum_rmse(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> f
     bb = torch.log(b.clamp_min(eps))
     return float(torch.sqrt(torch.mean((aa - bb) ** 2)).item())
 
+def relative_l2_spectral_error(
+    F_hat: torch.Tensor,
+    F_true: torch.Tensor,
+    eps: float = 1e-12,
+) -> float:
+    num = torch.sum((F_hat - F_true) ** 2)
+    den = torch.sum(F_true ** 2).clamp_min(eps)
+    return float((num / den).item())
+
+
+def spectral_scale_ratio(
+    F_hat: torch.Tensor,
+    F_true: torch.Tensor,
+    eps: float = 1e-12,
+) -> float:
+    num = torch.sum(F_hat)
+    den = torch.sum(F_true).clamp_min(eps)
+    return float((num / den).item())
+
 
 def make_grid_2d_coords(
     nx: int,
@@ -942,6 +961,15 @@ def main() -> None:
     metrics["logF_rmse_plugin"] = log_spectrum_rmse(metrics["spectrum_mean_vi_plugin"].to(F_true.device), F_true)
     metrics["logF_rmse_post"] = log_spectrum_rmse(metrics["spectrum_mean_vi_post"].to(F_true.device), F_true)
 
+    F_hat_plugin = metrics["spectrum_mean_vi_plugin"].to(F_true.device)
+    F_hat_post = metrics["spectrum_mean_vi_post"].to(F_true.device)
+
+    metrics["rel_l2_error_plugin"] = relative_l2_spectral_error(F_hat_plugin, F_true)
+    metrics["rel_l2_error_post"] = relative_l2_spectral_error(F_hat_post, F_true)
+
+    metrics["scale_ratio_plugin"] = spectral_scale_ratio(F_hat_plugin, F_true)
+    metrics["scale_ratio_post"] = spectral_scale_ratio(F_hat_post, F_true)
+
     band_plugin = bandwise_energy_diagnostic(
         lam=lam,
         F_true=F_true,
@@ -961,6 +989,12 @@ def main() -> None:
     print(f"plugin ratio std  = {float(ratio_plugin.std()):.6f}")
     print(f"post ratio mean   = {float(ratio_post.mean()):.6f}")
     print(f"post ratio std    = {float(ratio_post.std()):.6f}")
+
+    print("\n[DEBUG] Integrated / scale diagnostics")
+    print(f"rel L2 error (plugin) = {metrics['rel_l2_error_plugin']:.6f}")
+    print(f"rel L2 error (post)   = {metrics['rel_l2_error_post']:.6f}")
+    print(f"scale ratio (plugin)  = {metrics['scale_ratio_plugin']:.6f}")
+    print(f"scale ratio (post)    = {metrics['scale_ratio_post']:.6f}")
 
     print("\n[DEBUG] Bandwise energy diagnostic (plugin)")
     print(f"low  frac true={band_plugin['low_band_frac_true']:.4f} | hat={band_plugin['low_band_frac_hat']:.4f} | ratio={band_plugin['low_band_ratio_hat_to_true']:.4f}")
@@ -1044,8 +1078,10 @@ def main() -> None:
             "y_rmse_test_post": metrics["y_rmse_test_post"],
             "logF_rmse_plugin": metrics["logF_rmse_plugin"],
             "logF_rmse_post": metrics["logF_rmse_post"],
-            "bandwise_plugin": band_plugin,
-            "bandwise_post": band_post,
+            "rel_l2_error_plugin": metrics["rel_l2_error_plugin"],
+            "rel_l2_error_post": metrics["rel_l2_error_post"],
+            "scale_ratio_plugin": metrics["scale_ratio_plugin"],
+            "scale_ratio_post": metrics["scale_ratio_post"],
         },
         "config": {
             "nx": args.nx,
@@ -1085,6 +1121,10 @@ def main() -> None:
     )
     print(f"  logF_RMSE(plugin) = {metrics['logF_rmse_plugin']:.4f}")
     print(f"  logF_RMSE(post)   = {metrics['logF_rmse_post']:.4f}")
+    print(f"  relL2(plugin)     = {metrics['rel_l2_error_plugin']:.4f}")
+    print(f"  relL2(post)       = {metrics['rel_l2_error_post']:.4f}")
+    print(f"  scale ratio(plugin) = {metrics['scale_ratio_plugin']:.4f}")
+    print(f"  scale ratio(post)   = {metrics['scale_ratio_post']:.4f}")
     print(f"\n[INFO] Results saved to: {outdir}\n")
 
 
