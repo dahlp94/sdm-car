@@ -42,6 +42,44 @@ def log_spectrum_rmse(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> f
     bb = torch.log(b.clamp_min(eps))
     return float(torch.sqrt(torch.mean((aa - bb) ** 2)).item())
 
+def relative_l2_spectral_error(
+    F_hat: torch.Tensor,
+    F_true: torch.Tensor,
+    eps: float = 1e-12,
+) -> float:
+    num = torch.sum((F_hat - F_true) ** 2)
+    den = torch.sum(F_true ** 2).clamp_min(eps)
+    return float((num / den).item())
+
+
+def spectral_scale_ratio(
+    F_hat: torch.Tensor,
+    F_true: torch.Tensor,
+    eps: float = 1e-12,
+) -> float:
+    num = torch.sum(F_hat)
+    den = torch.sum(F_true).clamp_min(eps)
+    return float((num / den).item())
+
+
+def total_modal_variance(
+    F_spec: torch.Tensor,
+    sigma2: float | torch.Tensor,
+) -> torch.Tensor:
+    if not torch.is_tensor(sigma2):
+        sigma2 = torch.tensor(float(sigma2), dtype=F_spec.dtype, device=F_spec.device)
+    return F_spec + sigma2
+
+
+def relative_l2_total_variance_error(
+    total_hat: torch.Tensor,
+    total_true: torch.Tensor,
+    eps: float = 1e-12,
+) -> float:
+    num = torch.sum((total_hat - total_true) ** 2)
+    den = torch.sum(total_true ** 2).clamp_min(eps)
+    return float((num / den).item())
+
 
 def make_grid_2d_coords(
     nx: int,
@@ -623,6 +661,67 @@ def plot_true_vs_learned_spectra(
     plt.close(fig)
 
 
+def plot_true_vs_learned_curves(
+    *,
+    lam: torch.Tensor,
+    true_curve: torch.Tensor,
+    learned: dict[str, torch.Tensor],
+    outpath: Path,
+    title: str,
+    ylabel: str,
+    logy: bool = False,
+    use_markers: bool = True,
+) -> None:
+    lam_np = lam.detach().cpu().numpy()
+    true_np = true_curve.detach().cpu().numpy()
+
+    if logy:
+        true_np = np.clip(true_np, 1e-12, None)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+
+    if use_markers:
+        ax.plot(
+            lam_np,
+            true_np,
+            marker="o",
+            linestyle="none",
+            label="Truth",
+            markersize=4,
+        )
+    else:
+        ax.plot(lam_np, true_np, label="Truth", linewidth=2.5)
+
+    for label, curve in learned.items():
+        curve_np = curve.detach().cpu().numpy()
+        if logy:
+            curve_np = np.clip(curve_np, 1e-12, None)
+
+        if use_markers:
+            ax.plot(
+                lam_np,
+                curve_np,
+                marker="x",
+                linestyle="none",
+                label=label,
+                markersize=4,
+                alpha=0.8,
+            )
+        else:
+            ax.plot(lam_np, curve_np, label=label, linewidth=2.0)
+
+    if logy:
+        ax.set_yscale("log")
+
+    ax.set_xlabel(r"$\lambda$")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend(frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=180)
+    plt.close(fig)
+
 # ---------------------------------------------------------------------
 # Fit wrapper
 # ---------------------------------------------------------------------
@@ -941,6 +1040,28 @@ def main() -> None:
     metrics["logF_rmse_plugin"] = log_spectrum_rmse(metrics["spectrum_mean_vi_plugin"].to(F_true.device), F_true)
     metrics["logF_rmse_post"] = log_spectrum_rmse(metrics["spectrum_mean_vi_post"].to(F_true.device), F_true)
 
+    F_hat_plugin = metrics["spectrum_mean_vi_plugin"].to(F_true.device)
+    F_hat_post = metrics["spectrum_mean_vi_post"].to(F_true.device)
+
+    metrics["rel_l2_error_plugin"] = relative_l2_spectral_error(F_hat_plugin, F_true)
+    metrics["rel_l2_error_post"] = relative_l2_spectral_error(F_hat_post, F_true)
+
+    metrics["scale_ratio_plugin"] = spectral_scale_ratio(F_hat_plugin, F_true)
+    metrics["scale_ratio_post"] = spectral_scale_ratio(F_hat_post, F_true)
+
+    sigma2_true = float(args.sigma ** 2)
+    sigma2_hat = float(metrics["sigma2_plugin"])
+
+    total_true = total_modal_variance(F_true, sigma2_true)
+    total_hat_plugin = total_modal_variance(F_hat_plugin, sigma2_hat)
+    total_hat_post = total_modal_variance(F_hat_post, sigma2_hat)
+
+    metrics["total_var_rel_l2_plugin"] = relative_l2_total_variance_error(total_hat_plugin, total_true)
+    metrics["total_var_rel_l2_post"] = relative_l2_total_variance_error(total_hat_post, total_true)
+
+    metrics["sigma2_ratio_plugin"] = sigma2_hat / sigma2_true if sigma2_true > 1e-12 else float("nan")
+    metrics["sigma_ratio_plugin"] = metrics["sigma_plugin"] / float(args.sigma) if args.sigma > 1e-12 else float("nan")
+
     band_plugin = bandwise_energy_diagnostic(
         lam=lam,
         F_true=F_true,
@@ -960,6 +1081,20 @@ def main() -> None:
     print(f"plugin ratio std  = {float(ratio_plugin.std()):.6f}")
     print(f"post ratio mean   = {float(ratio_post.mean()):.6f}")
     print(f"post ratio std    = {float(ratio_post.std()):.6f}")
+
+    print("\n[DEBUG] Integrated / scale diagnostics")
+    print(f"rel L2 error (plugin) = {metrics['rel_l2_error_plugin']:.6f}")
+    print(f"rel L2 error (post)   = {metrics['rel_l2_error_post']:.6f}")
+    print(f"scale ratio (plugin)  = {metrics['scale_ratio_plugin']:.6f}")
+    print(f"scale ratio (post)    = {metrics['scale_ratio_post']:.6f}")
+
+    print("\n[DEBUG] Sigma diagnostics")
+    print(f"sigma ratio (plugin)  = {metrics['sigma_ratio_plugin']:.6f}")
+    print(f"sigma2 ratio (plugin) = {metrics['sigma2_ratio_plugin']:.6f}")
+
+    print("\n[DEBUG] Total modal variance diagnostics")
+    print(f"total-var relL2 (plugin) = {metrics['total_var_rel_l2_plugin']:.6f}")
+    print(f"total-var relL2 (post)   = {metrics['total_var_rel_l2_post']:.6f}")
 
     print("\n[DEBUG] Bandwise energy diagnostic (plugin)")
     print(f"low  frac true={band_plugin['low_band_frac_true']:.4f} | hat={band_plugin['low_band_frac_hat']:.4f} | ratio={band_plugin['low_band_ratio_hat_to_true']:.4f}")
@@ -992,6 +1127,34 @@ def main() -> None:
         },
         outpath=outdir / "true_vs_learned_logy.png",
         title="True vs learned spectrum (log-y)",
+        logy=True,
+        use_markers=args.use_markers,
+    )
+
+    plot_true_vs_learned_curves(
+        lam=lam,
+        true_curve=total_true,
+        learned={
+            "VI plugin total": total_hat_plugin.detach().cpu(),
+            "VI posterior total": total_hat_post.detach().cpu(),
+        },
+        outpath=outdir / "true_vs_learned_total_variance.png",
+        title="True vs learned total modal variance",
+        ylabel=r"$F(\lambda) + \sigma^2$",
+        logy=False,
+        use_markers=args.use_markers,
+    )
+
+    plot_true_vs_learned_curves(
+        lam=lam,
+        true_curve=total_true,
+        learned={
+            "VI plugin total": total_hat_plugin.detach().cpu(),
+            "VI posterior total": total_hat_post.detach().cpu(),
+        },
+        outpath=outdir / "true_vs_learned_total_variance_logy.png",
+        title="True vs learned total modal variance (log-y)",
+        ylabel=r"$F(\lambda) + \sigma^2$",
         logy=True,
         use_markers=args.use_markers,
     )
@@ -1039,6 +1202,8 @@ def main() -> None:
             "abs_err_tau2_mc_mean": abs(metrics["tau2_mc_mean"] - 1.0),
             "abs_err_sigma_plugin": metrics["abs_err_sigma_plugin"],
             "abs_err_sigma2_plugin": metrics["abs_err_sigma2_plugin"],
+            "sigma_plugin": metrics["sigma_plugin"],
+            "sigma2_plugin": metrics["sigma2_plugin"],
         },
         "metrics": {
             "pll_vi_per_test": metrics["pll_vi_per_test"],
@@ -1054,6 +1219,14 @@ def main() -> None:
             "logF_rmse_post": metrics["logF_rmse_post"],
             "bandwise_plugin": band_plugin,
             "bandwise_post": band_post,
+            "rel_l2_error_plugin": metrics["rel_l2_error_plugin"],
+            "rel_l2_error_post": metrics["rel_l2_error_post"],
+            "scale_ratio_plugin": metrics["scale_ratio_plugin"],
+            "scale_ratio_post": metrics["scale_ratio_post"],
+            "sigma_ratio_plugin": metrics["sigma_ratio_plugin"],
+            "sigma2_ratio_plugin": metrics["sigma2_ratio_plugin"],
+            "total_var_rel_l2_plugin": metrics["total_var_rel_l2_plugin"],
+            "total_var_rel_l2_post": metrics["total_var_rel_l2_post"],
         },
         "config": {
             "nx": args.nx,
@@ -1102,6 +1275,16 @@ def main() -> None:
     )
     print(f"  logF_RMSE(plugin) = {metrics['logF_rmse_plugin']:.4f}")
     print(f"  logF_RMSE(post)   = {metrics['logF_rmse_post']:.4f}")
+
+    print(f"  relL2(plugin)       = {metrics['rel_l2_error_plugin']:.4f}")
+    print(f"  relL2(post)         = {metrics['rel_l2_error_post']:.4f}")
+    print(f"  scale ratio(plugin) = {metrics['scale_ratio_plugin']:.4f}")
+    print(f"  scale ratio(post)   = {metrics['scale_ratio_post']:.4f}")
+    print(f"  sigma ratio(plugin) = {metrics['sigma_ratio_plugin']:.4f}")
+    print(f"  sigma2 ratio(plugin)= {metrics['sigma2_ratio_plugin']:.4f}")
+    print(f"  totalVar relL2(plugin) = {metrics['total_var_rel_l2_plugin']:.4f}")
+    print(f"  totalVar relL2(post)   = {metrics['total_var_rel_l2_post']:.4f}")
+    
     print(f"\n[INFO] Results saved to: {outdir}\n")
 
 
