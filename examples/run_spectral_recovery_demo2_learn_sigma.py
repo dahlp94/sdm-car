@@ -5,6 +5,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import argparse
 import json
+import csv
 import math
 from pathlib import Path
 
@@ -722,6 +723,44 @@ def plot_true_vs_learned_curves(
     fig.savefig(outpath, dpi=180)
     plt.close(fig)
 
+def plot_snr_task_comparison(*, rows: list[dict[str, float]], outdir: Path) -> None:
+    rows = sorted(rows, key=lambda r: r["sigma_true"])
+    sigma_vals = np.array([r["sigma_true"] for r in rows], dtype=float)
+    rel_l2_F = np.array([r["rel_l2_error_plugin"] for r in rows], dtype=float)
+    rel_l2_total = np.array([r["total_var_rel_l2_plugin"] for r in rows], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+    ax.plot(sigma_vals, rel_l2_F, marker="o", label=r"Structured spectrum error: $F$")
+    ax.plot(sigma_vals, rel_l2_total, marker="x", label=r"Total modal variance error: $F+\sigma^2$")
+    ax.set_xlabel(r"True $\sigma$")
+    ax.set_ylabel("Relative L2 error")
+    ax.set_title("Task 1 vs Task 2 across noise levels")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(outdir / "snr_task_comparison.png", dpi=180)
+    plt.close(fig)
+
+
+def plot_snr_band_ratios(*, rows: list[dict[str, float]], outdir: Path) -> None:
+    rows = sorted(rows, key=lambda r: r["sigma_true"])
+    sigma_vals = np.array([r["sigma_true"] for r in rows], dtype=float)
+    low = np.array([r["low_band_ratio_plugin"] for r in rows], dtype=float)
+    mid = np.array([r["mid_band_ratio_plugin"] for r in rows], dtype=float)
+    high = np.array([r["high_band_ratio_plugin"] for r in rows], dtype=float)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+    ax.plot(sigma_vals, low, marker="o", label="Low band")
+    ax.plot(sigma_vals, mid, marker="x", label="Mid band")
+    ax.plot(sigma_vals, high, marker="s", label="High band")
+    ax.axhline(1.0, linestyle="--", linewidth=1.0)
+    ax.set_xlabel(r"True $\sigma$")
+    ax.set_ylabel("Bandwise ratio (hat / true)")
+    ax.set_title("Bandwise spectral distortion across noise levels")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(outdir / "snr_band_ratios.png", dpi=180)
+    plt.close(fig)
+
 # ---------------------------------------------------------------------
 # Fit wrapper
 # ---------------------------------------------------------------------
@@ -870,6 +909,52 @@ def fit_model(
     }
     return model, metrics
 
+def build_snr_summary_row(
+    *,
+    sigma_true: float,
+    metrics: dict,
+    band_plugin: dict[str, float],
+    band_post: dict[str, float],
+) -> dict[str, float]:
+    return {
+        "sigma_true": float(sigma_true),
+        "sigma2_true": float(sigma_true ** 2),
+        "sigma_plugin": float(metrics["sigma_plugin"]),
+        "sigma2_plugin": float(metrics["sigma2_plugin"]),
+        "sigma_ratio_plugin": float(metrics["sigma_ratio_plugin"]),
+        "sigma2_ratio_plugin": float(metrics["sigma2_ratio_plugin"]),
+        "logF_rmse_plugin": float(metrics["logF_rmse_plugin"]),
+        "logF_rmse_post": float(metrics["logF_rmse_post"]),
+        "rel_l2_error_plugin": float(metrics["rel_l2_error_plugin"]),
+        "rel_l2_error_post": float(metrics["rel_l2_error_post"]),
+        "scale_ratio_plugin": float(metrics["scale_ratio_plugin"]),
+        "scale_ratio_post": float(metrics["scale_ratio_post"]),
+        "total_var_rel_l2_plugin": float(metrics["total_var_rel_l2_plugin"]),
+        "total_var_rel_l2_post": float(metrics["total_var_rel_l2_post"]),
+        "low_band_ratio_plugin": float(band_plugin["low_band_ratio_hat_to_true"]),
+        "mid_band_ratio_plugin": float(band_plugin["mid_band_ratio_hat_to_true"]),
+        "high_band_ratio_plugin": float(band_plugin["high_band_ratio_hat_to_true"]),
+        "low_band_ratio_post": float(band_post["low_band_ratio_hat_to_true"]),
+        "mid_band_ratio_post": float(band_post["mid_band_ratio_hat_to_true"]),
+        "high_band_ratio_post": float(band_post["high_band_ratio_hat_to_true"]),
+    }
+
+def save_snr_summary_table(*, rows: list[dict[str, float]], outdir: Path) -> None:
+    if not rows:
+        return
+
+    rows_sorted = sorted(rows, key=lambda r: r["sigma_true"])
+    fieldnames = list(rows_sorted[0].keys())
+
+    csv_path = outdir / "snr_summary_table.csv"
+    json_path = outdir / "snr_summary_table.json"
+
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows_sorted)
+
+    json_path.write_text(json.dumps(rows_sorted, indent=2))
 
 # ---------------------------------------------------------------------
 # CLI
@@ -901,8 +986,147 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="examples/figures/hardcoded_power_decay_recovery_learn_sigma",
     )
+
+    p.add_argument(
+        "--sigma_grid",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Optional list of sigma values for an SNR sweep, e.g. --sigma_grid 0.10 0.20 0.35 0.50",
+    )
+    p.add_argument(
+        "--sweep_subdir_prefix",
+        type=str,
+        default="sigma",
+        help="Prefix for per-sigma subdirectories during sigma sweep runs.",
+    )
+
     return p
 
+def run_sigma_sweep(args) -> None:
+    outdir = ensure_dir(args.outdir)
+    rows = []
+
+    sigma_list = [float(s) for s in args.sigma_grid]
+    sigma_list = sorted(sigma_list)
+
+    for sigma_val in sigma_list:
+        print("\n" + "=" * 80)
+        print(f"[SWEEP] Running sigma = {sigma_val:.4f}")
+        print("=" * 80)
+
+        # clone args behavior manually
+        device = torch.device(args.device)
+
+        coords = make_grid_2d_coords(args.nx, args.ny, device=device, dtype=DTYPE)
+        L, _W = build_laplacian_from_knn(coords, k=args.k, gamma=args.gamma, rho=args.rho)
+        lam, U = laplacian_eigendecomp(L)
+
+        data = simulate_hardcoded_truth(
+            U=U,
+            lam=lam,
+            beta0=args.beta0,
+            sigma=sigma_val,
+            device=device,
+            normalize_phi_sd=args.normalize_phi_sd,
+        )
+
+        X = data["X"]
+        y = data["y"]
+        phi_true = data["phi_true"]
+        eta_true = data["eta_true"]
+        F_true = data["F_true"]
+        empirical_energy = data["empirical_energy"]
+
+        train_idx, test_idx = make_split(n=X.shape[0], test_frac=args.test_frac, seed=args.seed)
+
+        sigma_subdir = ensure_dir(outdir / f"{args.sweep_subdir_prefix}_{sigma_val:.2f}".replace(".", "p"))
+
+        model, metrics = fit_model(
+            X=X,
+            y=y,
+            U=U,
+            lam=lam,
+            train_idx=train_idx,
+            test_idx=test_idx,
+            phi_true=phi_true,
+            eta_true=eta_true,
+            sigma_true=sigma_val,
+            vi_iters=args.vi_iters,
+            vi_mc=args.vi_mc,
+            vi_lr=args.vi_lr,
+            device=device,
+        )
+
+        F_hat_plugin = metrics["spectrum_mean_vi_plugin"].to(F_true.device)
+        F_hat_post = metrics["spectrum_mean_vi_post"].to(F_true.device)
+
+        metrics["logF_rmse_plugin"] = log_spectrum_rmse(F_hat_plugin, F_true)
+        metrics["logF_rmse_post"] = log_spectrum_rmse(F_hat_post, F_true)
+
+        metrics["rel_l2_error_plugin"] = relative_l2_spectral_error(F_hat_plugin, F_true)
+        metrics["rel_l2_error_post"] = relative_l2_spectral_error(F_hat_post, F_true)
+        metrics["scale_ratio_plugin"] = spectral_scale_ratio(F_hat_plugin, F_true)
+        metrics["scale_ratio_post"] = spectral_scale_ratio(F_hat_post, F_true)
+
+        sigma2_true = float(sigma_val ** 2)
+        sigma2_hat = float(metrics["sigma2_plugin"])
+        total_true = total_modal_variance(F_true, sigma2_true)
+        total_hat_plugin = total_modal_variance(F_hat_plugin, sigma2_hat)
+        total_hat_post = total_modal_variance(F_hat_post, sigma2_hat)
+
+        metrics["total_var_rel_l2_plugin"] = relative_l2_total_variance_error(total_hat_plugin, total_true)
+        metrics["total_var_rel_l2_post"] = relative_l2_total_variance_error(total_hat_post, total_true)
+        metrics["sigma_ratio_plugin"] = metrics["sigma_plugin"] / sigma_val if sigma_val > 1e-12 else float("nan")
+        metrics["sigma2_ratio_plugin"] = metrics["sigma2_plugin"] / sigma2_true if sigma2_true > 1e-12 else float("nan")
+
+        band_plugin = bandwise_energy_diagnostic(lam=lam, F_true=F_true, F_hat=F_hat_plugin)
+        band_post = bandwise_energy_diagnostic(lam=lam, F_true=F_true, F_hat=F_hat_post)
+
+        metrics["band_plugin"] = band_plugin
+        metrics["band_post"] = band_post
+
+        # optional: per-sigma plots
+        plot_true_vs_learned_spectra(
+            lam=lam,
+            F_true=F_true,
+            learned={
+                "VI plugin": metrics["spectrum_mean_vi_plugin"],
+                "VI posterior mean": metrics["spectrum_mean_vi_post"],
+            },
+            outpath=sigma_subdir / "true_vs_learned_logy.png",
+            title=f"True vs learned spectrum (sigma={sigma_val:.2f}, log-y)",
+            logy=True,
+            use_markers=args.use_markers,
+        )
+
+        plot_true_vs_learned_curves(
+            lam=lam,
+            true_curve=total_true,
+            learned={
+                "VI plugin total": total_hat_plugin.detach().cpu(),
+                "VI posterior total": total_hat_post.detach().cpu(),
+            },
+            outpath=sigma_subdir / "true_vs_learned_total_variance_logy.png",
+            title=f"Total modal variance (sigma={sigma_val:.2f}, log-y)",
+            ylabel=r"$F(\lambda)+\sigma^2$",
+            logy=True,
+            use_markers=args.use_markers,
+        )
+
+        row = build_snr_summary_row(
+            sigma_true=sigma_val,
+            metrics=metrics,
+            band_plugin=band_plugin,
+            band_post=band_post,
+        )
+        rows.append(row)
+
+    save_snr_summary_table(rows=rows, outdir=outdir)
+    plot_snr_task_comparison(rows=rows, outdir=outdir)
+    plot_snr_band_ratios(rows=rows, outdir=outdir)
+
+    print(f"\n[INFO] Sigma sweep results saved to: {outdir}\n")
 
 # ---------------------------------------------------------------------
 # Main
@@ -912,6 +1136,10 @@ def main() -> None:
 
     set_default_dtype(DTYPE)
     set_seed(args.seed)
+
+    if args.sigma_grid is not None and len(args.sigma_grid) > 0:
+        run_sigma_sweep(args)
+        return
 
     device = torch.device(args.device)
     outdir = ensure_dir(args.outdir)
@@ -1284,7 +1512,7 @@ def main() -> None:
     print(f"  sigma2 ratio(plugin)= {metrics['sigma2_ratio_plugin']:.4f}")
     print(f"  totalVar relL2(plugin) = {metrics['total_var_rel_l2_plugin']:.4f}")
     print(f"  totalVar relL2(post)   = {metrics['total_var_rel_l2_post']:.4f}")
-    
+
     print(f"\n[INFO] Results saved to: {outdir}\n")
 
 
