@@ -212,6 +212,185 @@ class SimplePowerDecayFilter(nn.Module):
 
         return kl1 + kl2 + kl3
 
+class TwoBumpFilter(nn.Module):
+    """
+    Variational filter family
+
+        F_theta(x) = tau2 * [a1 * exp(-0.5 ((x-c1)/w1)^2)
+                           + a2 * exp(-0.5 ((x-c2)/w2)^2)] + eps
+
+    with:
+        c1, c2 in (0,1),
+        w1, w2 > 0,
+        a1, a2 > 0,
+        tau2 > 0.
+    """
+    def __init__(
+        self,
+        *,
+        init_c1: float = 0.25,
+        init_c2: float = 0.75,
+        init_w1: float = 0.08,
+        init_w2: float = 0.08,
+        init_a1: float = 1.0,
+        init_a2: float = 1.0,
+        init_tau2: float = 1.0,
+        log_std0: float = -2.3,
+        eps_floor: float = 1e-8,
+    ):
+        super().__init__()
+        self.eps_floor = float(eps_floor)
+
+        def inv_sigmoid(p: float) -> float:
+            p = min(max(p, 1e-6), 1.0 - 1e-6)
+            return math.log(p / (1.0 - p))
+
+        def inv_softplus(y: float) -> float:
+            y = max(y, 1e-8)
+            return math.log(math.exp(y) - 1.0)
+
+        # centers in (0,1)
+        self.mu_c1_raw = nn.Parameter(torch.tensor(inv_sigmoid(init_c1), dtype=DTYPE))
+        self.mu_c2_raw = nn.Parameter(torch.tensor(inv_sigmoid(init_c2), dtype=DTYPE))
+
+        # widths > 0
+        self.mu_w1_raw = nn.Parameter(torch.tensor(inv_softplus(init_w1), dtype=DTYPE))
+        self.mu_w2_raw = nn.Parameter(torch.tensor(inv_softplus(init_w2), dtype=DTYPE))
+
+        # amplitudes > 0
+        self.mu_a1_raw = nn.Parameter(torch.tensor(inv_softplus(init_a1), dtype=DTYPE))
+        self.mu_a2_raw = nn.Parameter(torch.tensor(inv_softplus(init_a2), dtype=DTYPE))
+
+        # global scale > 0
+        self.mu_log_tau2 = nn.Parameter(torch.tensor(math.log(init_tau2), dtype=DTYPE))
+
+        self.log_std_c1_raw = nn.Parameter(torch.tensor(log_std0, dtype=DTYPE))
+        self.log_std_c2_raw = nn.Parameter(torch.tensor(log_std0, dtype=DTYPE))
+        self.log_std_w1_raw = nn.Parameter(torch.tensor(log_std0, dtype=DTYPE))
+        self.log_std_w2_raw = nn.Parameter(torch.tensor(log_std0, dtype=DTYPE))
+        self.log_std_a1_raw = nn.Parameter(torch.tensor(log_std0, dtype=DTYPE))
+        self.log_std_a2_raw = nn.Parameter(torch.tensor(log_std0, dtype=DTYPE))
+        self.log_std_log_tau2 = nn.Parameter(torch.tensor(log_std0, dtype=DTYPE))
+
+    def sample_unconstrained(self) -> dict[str, torch.Tensor]:
+        device = self.mu_c1_raw.device
+
+        def rsample(mu: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
+            eps = torch.randn((), dtype=DTYPE, device=device)
+            return mu + torch.exp(log_std) * eps
+
+        return {
+            "c1_raw": rsample(self.mu_c1_raw, self.log_std_c1_raw),
+            "c2_raw": rsample(self.mu_c2_raw, self.log_std_c2_raw),
+            "w1_raw": rsample(self.mu_w1_raw, self.log_std_w1_raw),
+            "w2_raw": rsample(self.mu_w2_raw, self.log_std_w2_raw),
+            "a1_raw": rsample(self.mu_a1_raw, self.log_std_a1_raw),
+            "a2_raw": rsample(self.mu_a2_raw, self.log_std_a2_raw),
+            "log_tau2": rsample(self.mu_log_tau2, self.log_std_log_tau2),
+        }
+
+    def mean_unconstrained(self) -> dict[str, torch.Tensor]:
+        return {
+            "c1_raw": self.mu_c1_raw,
+            "c2_raw": self.mu_c2_raw,
+            "w1_raw": self.mu_w1_raw,
+            "w2_raw": self.mu_w2_raw,
+            "a1_raw": self.mu_a1_raw,
+            "a2_raw": self.mu_a2_raw,
+            "log_tau2": self.mu_log_tau2,
+        }
+
+    def posterior_mean_unconstrained(self) -> dict[str, torch.Tensor]:
+        return self.mean_unconstrained()
+
+    def posterior_mean_constrained(self) -> dict[str, torch.Tensor]:
+        return self.constrain(self.mean_unconstrained())
+
+    def constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        c1 = torch.sigmoid(theta["c1_raw"]).reshape(())
+        c2 = torch.sigmoid(theta["c2_raw"]).reshape(())
+
+        w1 = F.softplus(theta["w1_raw"]).clamp_min(1e-4).reshape(())
+        w2 = F.softplus(theta["w2_raw"]).clamp_min(1e-4).reshape(())
+
+        a1 = F.softplus(theta["a1_raw"]).clamp_min(1e-8).reshape(())
+        a2 = F.softplus(theta["a2_raw"]).clamp_min(1e-8).reshape(())
+
+        tau2 = torch.exp(theta["log_tau2"]).reshape(())
+
+        return {
+            "c1": c1,
+            "c2": c2,
+            "w1": w1,
+            "w2": w2,
+            "a1": a1,
+            "a2": a2,
+            "tau2": tau2,
+        }
+    
+    def _constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return self.constrain(theta)
+
+    def spectrum(self, lam: torch.Tensor, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        c = self.constrain(theta)
+
+        lam_max = lam.max().clamp_min(1e-12)
+        x = (lam / lam_max).clamp(0.0, 1.0)
+
+        bump1 = c["a1"] * torch.exp(-0.5 * ((x - c["c1"]) / c["w1"]) ** 2)
+        bump2 = c["a2"] * torch.exp(-0.5 * ((x - c["c2"]) / c["w2"]) ** 2)
+
+        return c["tau2"] * (bump1 + bump2) + self.eps_floor
+
+    def kl_q_p(self) -> torch.Tensor:
+        def kl_standard_normal(mu: torch.Tensor, log_std: torch.Tensor) -> torch.Tensor:
+            s = torch.exp(log_std)
+            return 0.5 * (mu.pow(2) + s.pow(2) - 1.0 - 2.0 * log_std)
+
+        return (
+            kl_standard_normal(self.mu_c1_raw, self.log_std_c1_raw)
+            + kl_standard_normal(self.mu_c2_raw, self.log_std_c2_raw)
+            + kl_standard_normal(self.mu_w1_raw, self.log_std_w1_raw)
+            + kl_standard_normal(self.mu_w2_raw, self.log_std_w2_raw)
+            + kl_standard_normal(self.mu_a1_raw, self.log_std_a1_raw)
+            + kl_standard_normal(self.mu_a2_raw, self.log_std_a2_raw)
+            + kl_standard_normal(self.mu_log_tau2, self.log_std_log_tau2)
+        )
+
+def build_filter_module(
+    *,
+    filter_kind: str,
+    log_std0: float,
+    init_t1: float,
+    init_t2: float,
+    init_c1: float,
+    init_c2: float,
+    init_w1: float,
+    init_w2: float,
+    init_a1: float,
+    init_a2: float,
+    init_tau2: float,
+) -> nn.Module:
+    if filter_kind == "power_decay":
+        return SimplePowerDecayFilter(
+            mu_t1_raw=math.log(math.exp(init_t1) - 1.0),
+            mu_t2_raw=math.log(math.exp(init_t2) - 1.0),
+            log_std0=log_std0,
+        )
+
+    if filter_kind == "two_bump":
+        return TwoBumpFilter(
+            init_c1=init_c1,
+            init_c2=init_c2,
+            init_w1=init_w1,
+            init_w2=init_w2,
+            init_a1=init_a1,
+            init_a2=init_a2,
+            init_tau2=init_tau2,
+            log_std0=log_std0,
+        )
+
+    raise ValueError(f"Unknown filter_kind: {filter_kind}")
 
 # ---------------------------------------------------------------------
 # Truth generation
@@ -224,6 +403,16 @@ def simulate_hardcoded_truth(
     sigma: float,
     device: torch.device,
     normalize_phi_sd: float | None = None,
+    truth_kind: str = "power_decay",
+    t1_true: float = 3.0,
+    t2_true: float = 2.0,
+    c1_true: float = 0.25,
+    c2_true: float = 0.75,
+    w1_true: float = 0.08,
+    w2_true: float = 0.08,
+    a1_true: float = 1.0,
+    a2_true: float = 1.0,
+    tau2_true: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     if sigma <= 0:
         raise ValueError("sigma must be positive.")
@@ -234,7 +423,19 @@ def simulate_hardcoded_truth(
 
     lam_max = lam.max().clamp_min(1e-12)
     x = (lam / lam_max).clamp(0.0, 1.0)
-    F_true = true_spectral_density(x).clamp_min(1e-12)
+
+    if truth_kind == "power_decay":
+        F_true = tau2_true / (t1_true + t2_true * x).pow(4)
+
+    elif truth_kind == "two_bump":
+        bump1 = a1_true * torch.exp(-0.5 * ((x - c1_true) / w1_true) ** 2)
+        bump2 = a2_true * torch.exp(-0.5 * ((x - c2_true) / w2_true) ** 2)
+        F_true = tau2_true * (bump1 + bump2)
+
+    else:
+        raise ValueError(f"Unknown truth_kind: {truth_kind}")
+
+    F_true = F_true.clamp_min(1e-12)
 
     z_true = torch.sqrt(F_true) * torch.randn(n, dtype=DTYPE, device=device)
     phi_true = U @ z_true
@@ -261,20 +462,48 @@ def simulate_hardcoded_truth(
         "z_true": z_true,
         "F_true": F_true,
         "empirical_energy": empirical_energy,
+        "truth_kind": truth_kind,
     }
 
-
 @torch.no_grad()
-def monte_carlo_mean_true_energy(lam: torch.Tensor, *, R: int) -> tuple[torch.Tensor, torch.Tensor]:
+def monte_carlo_mean_true_energy(
+    lam: torch.Tensor,
+    *,
+    R: int,
+    truth_kind: str = "power_decay",
+    t1_true: float = 3.0,
+    t2_true: float = 2.0,
+    c1_true: float = 0.25,
+    c2_true: float = 0.75,
+    w1_true: float = 0.08,
+    w2_true: float = 0.08,
+    a1_true: float = 1.0,
+    a2_true: float = 1.0,
+    tau2_true: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+
     lam_max = lam.max().clamp_min(1e-12)
     x = (lam / lam_max).clamp(0.0, 1.0)
-    F_true = true_spectral_density(x).clamp_min(1e-12)
+
+    if truth_kind == "power_decay":
+        F_true = tau2_true / (t1_true + t2_true * x).pow(4)
+
+    elif truth_kind == "two_bump":
+        bump1 = a1_true * torch.exp(-0.5 * ((x - c1_true) / w1_true) ** 2)
+        bump2 = a2_true * torch.exp(-0.5 * ((x - c2_true) / w2_true) ** 2)
+        F_true = tau2_true * (bump1 + bump2)
+
+    else:
+        raise ValueError(f"Unknown truth_kind: {truth_kind}")
+
+    F_true = F_true.clamp_min(1e-12)
+
     acc = torch.zeros_like(F_true)
     for _ in range(int(R)):
         z = torch.sqrt(F_true) * torch.randn_like(F_true)
         acc += z ** 2
-    return F_true, acc / float(R)
 
+    return F_true, acc / float(R)
 
 # ---------------------------------------------------------------------
 # Spectrum / predictive helpers
@@ -289,23 +518,42 @@ def spectrum_vi_mc_mean(filter_module, lam: torch.Tensor, *, S: int = 256) -> to
 
 
 @torch.no_grad()
-def filter_parameter_mc_mean(filter_module, *, S: int = 1024) -> dict[str, float]:
-    acc_t1 = 0.0
-    acc_t2 = 0.0
-    acc_tau2 = 0.0
+def filter_parameter_mc_mean(
+    filter_module,
+    *,
+    S: int = 1024,
+    filter_kind: str = "power_decay",
+) -> dict[str, float]:
+    if filter_kind == "power_decay":
+        acc_t1 = 0.0
+        acc_t2 = 0.0
+        acc_tau2 = 0.0
 
-    for _ in range(S):
-        th = filter_module.sample_unconstrained()
-        c = filter_module.constrain(th)
-        acc_t1 += float(c["t1"].detach().cpu())
-        acc_t2 += float(c["t2"].detach().cpu())
-        acc_tau2 += float(c["tau2"].detach().cpu())
+        for _ in range(S):
+            th = filter_module.sample_unconstrained()
+            c = filter_module.constrain(th)
+            acc_t1 += float(c["t1"].detach().cpu())
+            acc_t2 += float(c["t2"].detach().cpu())
+            acc_tau2 += float(c["tau2"].detach().cpu())
 
-    return {
-        "t1_mc_mean": acc_t1 / float(S),
-        "t2_mc_mean": acc_t2 / float(S),
-        "tau2_mc_mean": acc_tau2 / float(S),
-    }
+        return {
+            "t1_mc_mean": acc_t1 / float(S),
+            "t2_mc_mean": acc_t2 / float(S),
+            "tau2_mc_mean": acc_tau2 / float(S),
+        }
+
+    if filter_kind == "two_bump":
+        acc = {"c1": 0.0, "c2": 0.0, "w1": 0.0, "w2": 0.0, "a1": 0.0, "a2": 0.0, "tau2": 0.0}
+        for _ in range(S):
+            th = filter_module.sample_unconstrained()
+            c = filter_module.constrain(th)
+            for k in acc:
+                acc[k] += float(c[k].detach().cpu())
+
+        return {f"{k}_mc_mean": v / float(S) for k, v in acc.items()}
+
+    raise ValueError(f"Unknown filter_kind: {filter_kind}")
+
 
 def bandwise_energy_diagnostic(
     lam: torch.Tensor,
@@ -779,13 +1027,37 @@ def fit_model(
     vi_mc: int,
     vi_lr: float,
     device: torch.device,
+    filter_kind: str = "power_decay",
+    log_std0: float = -2.3,
+    init_t1: float = 3.0,
+    init_t2: float = 2.0,
+    init_c1: float = 0.25,
+    init_c2: float = 0.75,
+    init_w1: float = 0.08,
+    init_w2: float = 0.08,
+    init_a1: float = 1.0,
+    init_a2: float = 1.0,
+    init_tau2: float = 1.0,
 ) -> tuple[SpectralCAR_FullVI, dict]:
     tr = torch.as_tensor(train_idx, device=device)
     X_tr = X[tr, :]
     y_tr = y[tr]
     U_tr = U[tr, :]
 
-    filter_module = SimplePowerDecayFilter()
+    #filter_module = SimplePowerDecayFilter()
+    filter_module = build_filter_module(
+        filter_kind=filter_kind,
+        log_std0=log_std0,
+        init_t1=init_t1,
+        init_t2=init_t2,
+        init_c1=init_c1,
+        init_c2=init_c2,
+        init_w1=init_w1,
+        init_w2=init_w2,
+        init_a1=init_a1,
+        init_a2=init_a2,
+        init_tau2=init_tau2,
+    )
 
     prior_V0 = 10.0 * torch.eye(X.shape[1], dtype=DTYPE, device=device)
 
@@ -876,7 +1148,8 @@ def fit_model(
     )
 
     constrained_plugin = model.filter.posterior_mean_constrained()
-    parameter_mc = filter_parameter_mc_mean(model.filter, S=2048)
+    #parameter_mc = filter_parameter_mc_mean(model.filter, S=2048)
+    parameter_mc = filter_parameter_mc_mean(model.filter, S=2048, filter_kind=filter_kind)
 
     metrics = {
         "pll_vi_per_test": pll_vi / float(len(test_idx)),
@@ -890,12 +1163,6 @@ def fit_model(
         "y_rmse_test_post": y_rmse_test_post,
         "logF_rmse_plugin": None,
         "logF_rmse_post": None,
-        "t1_plugin": float(constrained_plugin["t1"].detach().cpu()),
-        "t2_plugin": float(constrained_plugin["t2"].detach().cpu()),
-        "tau2_plugin": float(constrained_plugin["tau2"].detach().cpu()),
-        "t1_mc_mean": parameter_mc["t1_mc_mean"],
-        "t2_mc_mean": parameter_mc["t2_mc_mean"],
-        "tau2_mc_mean": parameter_mc["tau2_mc_mean"],
         "sigma_true": float(sigma_true),
         "sigma2_true": float(sigma_true ** 2),
         "sigma_plugin": math.sqrt(max(sigma2_plugin_scalar, 1e-12)),
@@ -906,7 +1173,37 @@ def fit_model(
         "spectrum_mean_vi_post": F_vi_post.detach().cpu(),
         "phi_hat_vi_plugin": phi_hat_plugin.detach().cpu(),
         "phi_hat_vi_post": phi_hat_post.detach().cpu(),
+        "filter_kind": filter_kind,
     }
+
+    if filter_kind == "power_decay":
+        metrics.update({
+            "t1_plugin": float(constrained_plugin["t1"].detach().cpu()),
+            "t2_plugin": float(constrained_plugin["t2"].detach().cpu()),
+            "tau2_plugin": float(constrained_plugin["tau2"].detach().cpu()),
+            "t1_mc_mean": parameter_mc["t1_mc_mean"],
+            "t2_mc_mean": parameter_mc["t2_mc_mean"],
+            "tau2_mc_mean": parameter_mc["tau2_mc_mean"],
+        })
+
+    elif filter_kind == "two_bump":
+        metrics.update({
+            "c1_plugin": float(constrained_plugin["c1"].detach().cpu()),
+            "c2_plugin": float(constrained_plugin["c2"].detach().cpu()),
+            "w1_plugin": float(constrained_plugin["w1"].detach().cpu()),
+            "w2_plugin": float(constrained_plugin["w2"].detach().cpu()),
+            "a1_plugin": float(constrained_plugin["a1"].detach().cpu()),
+            "a2_plugin": float(constrained_plugin["a2"].detach().cpu()),
+            "tau2_plugin": float(constrained_plugin["tau2"].detach().cpu()),
+            "c1_mc_mean": parameter_mc["c1_mc_mean"],
+            "c2_mc_mean": parameter_mc["c2_mc_mean"],
+            "w1_mc_mean": parameter_mc["w1_mc_mean"],
+            "w2_mc_mean": parameter_mc["w2_mc_mean"],
+            "a1_mc_mean": parameter_mc["a1_mc_mean"],
+            "a2_mc_mean": parameter_mc["a2_mc_mean"],
+            "tau2_mc_mean": parameter_mc["tau2_mc_mean"],
+        })
+
     return model, metrics
 
 def build_snr_summary_row(
@@ -978,6 +1275,50 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vi_mc", type=int, default=10)
     p.add_argument("--vi_lr", type=float, default=5e-3)
 
+    p.add_argument(
+        "--filter_kind",
+        type=str,
+        default="power_decay",
+        choices=["power_decay", "two_bump"],
+        help="Variational spectral filter family to fit.",
+    )
+
+    p.add_argument(
+        "--truth_kind",
+        type=str,
+        default="power_decay",
+        choices=["power_decay", "two_bump"],
+        help="True spectral family used to generate synthetic data.",
+    )
+
+    # truth parameters for power-decay truth
+    p.add_argument("--t1_true", type=float, default=3.0)
+    p.add_argument("--t2_true", type=float, default=2.0)
+    p.add_argument("--tau2_true", type=float, default=1.0)
+
+    # truth parameters for two-bump truth
+    p.add_argument("--c1_true", type=float, default=0.25)
+    p.add_argument("--c2_true", type=float, default=0.75)
+    p.add_argument("--w1_true", type=float, default=0.08)
+    p.add_argument("--w2_true", type=float, default=0.08)
+    p.add_argument("--a1_true", type=float, default=1.0)
+    p.add_argument("--a2_true", type=float, default=1.0)
+
+    p.add_argument("--log_std0", type=float, default=-2.3)
+
+    # Power-decay filter init
+    p.add_argument("--init_t1", type=float, default=3.0)
+    p.add_argument("--init_t2", type=float, default=2.0)
+
+    # Two-bump filter init
+    p.add_argument("--init_c1", type=float, default=0.25)
+    p.add_argument("--init_c2", type=float, default=0.75)
+    p.add_argument("--init_w1", type=float, default=0.08)
+    p.add_argument("--init_w2", type=float, default=0.08)
+    p.add_argument("--init_a1", type=float, default=1.0)
+    p.add_argument("--init_a2", type=float, default=1.0)
+    p.add_argument("--init_tau2", type=float, default=1.0)
+
     p.add_argument("--use_markers", action="store_true")
 
     p.add_argument("--device", type=str, default="cpu")
@@ -1026,9 +1367,19 @@ def run_sigma_sweep(args) -> None:
             U=U,
             lam=lam,
             beta0=args.beta0,
-            sigma=sigma_val,
+            sigma=args.sigma,
             device=device,
             normalize_phi_sd=args.normalize_phi_sd,
+            truth_kind=args.truth_kind,
+            t1_true=args.t1_true,
+            t2_true=args.t2_true,
+            c1_true=args.c1_true,
+            c2_true=args.c2_true,
+            w1_true=args.w1_true,
+            w2_true=args.w2_true,
+            a1_true=args.a1_true,
+            a2_true=args.a2_true,
+            tau2_true=args.tau2_true,
         )
 
         X = data["X"]
@@ -1056,6 +1407,18 @@ def run_sigma_sweep(args) -> None:
             vi_mc=args.vi_mc,
             vi_lr=args.vi_lr,
             device=device,
+            filter_kind=args.filter_kind,
+            log_std0=args.log_std0,
+            init_t1=args.init_t1,
+            init_t2=args.init_t2,
+            init_c1=args.init_c1,
+            init_c2=args.init_c2,
+            init_w1=args.init_w1,
+            init_w2=args.init_w2,
+            init_a1=args.init_a1,
+            init_a2=args.init_a2,
+            init_tau2=args.init_tau2,
+            
         )
 
         F_hat_plugin = metrics["spectrum_mean_vi_plugin"].to(F_true.device)
@@ -1145,8 +1508,12 @@ def main() -> None:
     outdir = ensure_dir(args.outdir)
 
     print("\n[INFO] Starting matched-family recovery demo with learned sigma")
-    print("[INFO] True spectral density: F0(x) = 1 / (3 + 2x)^4")
-    print("[INFO] Fitted family: F_theta(x) = tau2 / (t1 + t2 x)^4")
+    #print("[INFO] True spectral density: F0(x) = 1 / (3 + 2x)^4")
+
+    if args.filter_kind == "power_decay":
+        print("[INFO] Fitted family: F_theta(x) = tau2 / (t1 + t2 x)^4")
+    elif args.filter_kind == "two_bump":
+        print("[INFO] Fitted family: two-bump Gaussian mixture spectrum")
     print("[INFO] sigma^2 is learned, not fixed")
 
     coords = make_grid_2d_coords(args.nx, args.ny, device=device, dtype=DTYPE)
@@ -1160,6 +1527,16 @@ def main() -> None:
         sigma=args.sigma,
         device=device,
         normalize_phi_sd=args.normalize_phi_sd,
+        truth_kind=args.truth_kind,
+        t1_true=args.t1_true,
+        t2_true=args.t2_true,
+        c1_true=args.c1_true,
+        c2_true=args.c2_true,
+        w1_true=args.w1_true,
+        w2_true=args.w2_true,
+        a1_true=args.a1_true,
+        a2_true=args.a2_true,
+        tau2_true=args.tau2_true,
     )
 
     X = data["X"]
@@ -1171,7 +1548,16 @@ def main() -> None:
 
     lam_max = lam.max().clamp_min(1e-12)
     x = (lam / lam_max).clamp(0.0, 1.0)
-    F_formula = 1.0 / (3.0 + 2.0 * x).pow(4)
+    
+    if args.truth_kind == "power_decay":
+        F_formula = args.tau2_true / (args.t1_true + args.t2_true * x).pow(4)
+    elif args.truth_kind == "two_bump":
+        bump1 = args.a1_true * torch.exp(-0.5 * ((x - args.c1_true) / args.w1_true) ** 2)
+        bump2 = args.a2_true * torch.exp(-0.5 * ((x - args.c2_true) / args.w2_true) ** 2)
+        F_formula = args.tau2_true * (bump1 + bump2)
+    else:
+        raise ValueError(f"Unknown truth_kind: {args.truth_kind}")
+
     z_from_phi = U.T @ phi_true
     empirical_from_phi = z_from_phi ** 2
 
@@ -1184,7 +1570,20 @@ def main() -> None:
     print(f"sigma_true             = {float(args.sigma):.6e}")
     print(f"sigma2_true            = {float(args.sigma ** 2):.6e}")
 
-    F_true_mc, mc_mean_energy = monte_carlo_mean_true_energy(lam, R=args.mc_reps)
+    F_true_mc, mc_mean_energy = monte_carlo_mean_true_energy(
+        lam,
+        R=args.mc_reps,
+        truth_kind=args.truth_kind,
+        t1_true=args.t1_true,
+        t2_true=args.t2_true,
+        c1_true=args.c1_true,
+        c2_true=args.c2_true,
+        w1_true=args.w1_true,
+        w2_true=args.w2_true,
+        a1_true=args.a1_true,
+        a2_true=args.a2_true,
+        tau2_true=args.tau2_true,
+    )
 
     plot_true_vs_empirical(
         lam=lam,
@@ -1253,15 +1652,45 @@ def main() -> None:
         vi_mc=args.vi_mc,
         vi_lr=args.vi_lr,
         device=device,
+        filter_kind=args.filter_kind,
+        log_std0=args.log_std0,
+        init_t1=args.init_t1,
+        init_t2=args.init_t2,
+        init_c1=args.init_c1,
+        init_c2=args.init_c2,
+        init_w1=args.init_w1,
+        init_w2=args.init_w2,
+        init_a1=args.init_a1,
+        init_a2=args.init_a2,
+        init_tau2=args.init_tau2,
     )
 
     print("\n[DEBUG] Learned parameter summaries")
-    print(f"t1_plugin    = {metrics['t1_plugin']:.6f}")
-    print(f"t2_plugin    = {metrics['t2_plugin']:.6f}")
-    print(f"tau2_plugin  = {metrics['tau2_plugin']:.6f}")
-    print(f"t1_mc_mean   = {metrics['t1_mc_mean']:.6f}")
-    print(f"t2_mc_mean   = {metrics['t2_mc_mean']:.6f}")
-    print(f"tau2_mc_mean = {metrics['tau2_mc_mean']:.6f}")
+
+    if args.filter_kind == "power_decay":
+        print(f"t1_plugin    = {metrics['t1_plugin']:.6f}")
+        print(f"t2_plugin    = {metrics['t2_plugin']:.6f}")
+        print(f"tau2_plugin  = {metrics['tau2_plugin']:.6f}")
+        print(f"t1_mc_mean   = {metrics['t1_mc_mean']:.6f}")
+        print(f"t2_mc_mean   = {metrics['t2_mc_mean']:.6f}")
+        print(f"tau2_mc_mean = {metrics['tau2_mc_mean']:.6f}")
+
+    elif args.filter_kind == "two_bump":
+        print(f"c1_plugin    = {metrics['c1_plugin']:.6f}")
+        print(f"c2_plugin    = {metrics['c2_plugin']:.6f}")
+        print(f"w1_plugin    = {metrics['w1_plugin']:.6f}")
+        print(f"w2_plugin    = {metrics['w2_plugin']:.6f}")
+        print(f"a1_plugin    = {metrics['a1_plugin']:.6f}")
+        print(f"a2_plugin    = {metrics['a2_plugin']:.6f}")
+        print(f"tau2_plugin  = {metrics['tau2_plugin']:.6f}")
+        print(f"c1_mc_mean   = {metrics['c1_mc_mean']:.6f}")
+        print(f"c2_mc_mean   = {metrics['c2_mc_mean']:.6f}")
+        print(f"w1_mc_mean   = {metrics['w1_mc_mean']:.6f}")
+        print(f"w2_mc_mean   = {metrics['w2_mc_mean']:.6f}")
+        print(f"a1_mc_mean   = {metrics['a1_mc_mean']:.6f}")
+        print(f"a2_mc_mean   = {metrics['a2_mc_mean']:.6f}")
+        print(f"tau2_mc_mean = {metrics['tau2_mc_mean']:.6f}")
+
     print(f"sigma_plugin = {metrics['sigma_plugin']:.6f}")
     print(f"sigma2_plugin = {metrics['sigma2_plugin']:.6f}")
 
@@ -1402,6 +1831,132 @@ def main() -> None:
         outpath=outdir / "phi_hat_vi_post.png",
     )
 
+    # summary = {
+    #     "truth": {
+    #         "t1_true": 3.0,
+    #         "t2_true": 2.0,
+    #         "tau2_true": 1.0,
+    #         "sigma_true": float(args.sigma),
+    #         "sigma2_true": float(args.sigma ** 2),
+    #         "formula": "F0(x) = 1 / (3 + 2x)^4",
+    #         "fitted_family": "F_theta(x) = tau2 / (t1 + t2 x)^4",
+    #         "noise_learning": "sigma2 learned",
+    #     },
+    #     "recovery": {
+    #         "t1_plugin": metrics["t1_plugin"],
+    #         "t2_plugin": metrics["t2_plugin"],
+    #         "tau2_plugin": metrics["tau2_plugin"],
+    #         "t1_mc_mean": metrics["t1_mc_mean"],
+    #         "t2_mc_mean": metrics["t2_mc_mean"],
+    #         "tau2_mc_mean": metrics["tau2_mc_mean"],
+    #         "sigma_plugin": metrics["sigma_plugin"],
+    #         "sigma2_plugin": metrics["sigma2_plugin"],
+    #         "abs_err_t1_plugin": abs(metrics["t1_plugin"] - 3.0),
+    #         "abs_err_t2_plugin": abs(metrics["t2_plugin"] - 2.0),
+    #         "abs_err_tau2_plugin": abs(metrics["tau2_plugin"] - 1.0),
+    #         "abs_err_t1_mc_mean": abs(metrics["t1_mc_mean"] - 3.0),
+    #         "abs_err_t2_mc_mean": abs(metrics["t2_mc_mean"] - 2.0),
+    #         "abs_err_tau2_mc_mean": abs(metrics["tau2_mc_mean"] - 1.0),
+    #         "abs_err_sigma_plugin": metrics["abs_err_sigma_plugin"],
+    #         "abs_err_sigma2_plugin": metrics["abs_err_sigma2_plugin"],
+    #         "sigma_plugin": metrics["sigma_plugin"],
+    #         "sigma2_plugin": metrics["sigma2_plugin"],
+    #     },
+    #     "metrics": {
+    #         "pll_vi_per_test": metrics["pll_vi_per_test"],
+    #         "phi_rmse_plugin": metrics["phi_rmse_plugin"],
+    #         "phi_rmse_post": metrics["phi_rmse_post"],
+    #         "eta_rmse_plugin": metrics["eta_rmse_plugin"],
+    #         "eta_rmse_post": metrics["eta_rmse_post"],
+    #         "y_rmse_train_plugin": metrics["y_rmse_train_plugin"],
+    #         "y_rmse_test_plugin": metrics["y_rmse_test_plugin"],
+    #         "y_rmse_train_post": metrics["y_rmse_train_post"],
+    #         "y_rmse_test_post": metrics["y_rmse_test_post"],
+    #         "logF_rmse_plugin": metrics["logF_rmse_plugin"],
+    #         "logF_rmse_post": metrics["logF_rmse_post"],
+    #         "bandwise_plugin": band_plugin,
+    #         "bandwise_post": band_post,
+    #         "rel_l2_error_plugin": metrics["rel_l2_error_plugin"],
+    #         "rel_l2_error_post": metrics["rel_l2_error_post"],
+    #         "scale_ratio_plugin": metrics["scale_ratio_plugin"],
+    #         "scale_ratio_post": metrics["scale_ratio_post"],
+    #         "sigma_ratio_plugin": metrics["sigma_ratio_plugin"],
+    #         "sigma2_ratio_plugin": metrics["sigma2_ratio_plugin"],
+    #         "total_var_rel_l2_plugin": metrics["total_var_rel_l2_plugin"],
+    #         "total_var_rel_l2_post": metrics["total_var_rel_l2_post"],
+    #     },
+    #     "config": {
+    #         "nx": args.nx,
+    #         "ny": args.ny,
+    #         "k": args.k,
+    #         "gamma": args.gamma,
+    #         "rho": args.rho,
+    #         "beta0": args.beta0,
+    #         "sigma": args.sigma,
+    #         "normalize_phi_sd": args.normalize_phi_sd,
+    #         "mc_reps": args.mc_reps,
+    #         "test_frac": args.test_frac,
+    #         "seed": args.seed,
+    #         "vi_iters": args.vi_iters,
+    #         "vi_mc": args.vi_mc,
+    #         "vi_lr": args.vi_lr,
+    #         "use_markers": bool(args.use_markers),
+    #     },
+    # }
+
+    # ------------------------------------------------------------------
+    # Truth + fitted family description
+    # ------------------------------------------------------------------
+    if args.filter_kind == "power_decay":
+        fitted_family_str = "F_theta(x) = tau2 / (t1 + t2 x)^4"
+    elif args.filter_kind == "two_bump":
+        fitted_family_str = "F_theta(x) = tau2 * [a1 N(c1,w1) + a2 N(c2,w2)]"
+    else:
+        fitted_family_str = "unknown"
+
+    # ------------------------------------------------------------------
+    # Recovery block (filter-specific)
+    # ------------------------------------------------------------------
+    if args.filter_kind == "power_decay":
+        recovery_block = {
+            "t1_plugin": metrics["t1_plugin"],
+            "t2_plugin": metrics["t2_plugin"],
+            "tau2_plugin": metrics["tau2_plugin"],
+            "t1_mc_mean": metrics["t1_mc_mean"],
+            "t2_mc_mean": metrics["t2_mc_mean"],
+            "tau2_mc_mean": metrics["tau2_mc_mean"],
+            "abs_err_t1_plugin": abs(metrics["t1_plugin"] - 3.0),
+            "abs_err_t2_plugin": abs(metrics["t2_plugin"] - 2.0),
+            "abs_err_tau2_plugin": abs(metrics["tau2_plugin"] - 1.0),
+            "abs_err_t1_mc_mean": abs(metrics["t1_mc_mean"] - 3.0),
+            "abs_err_t2_mc_mean": abs(metrics["t2_mc_mean"] - 2.0),
+            "abs_err_tau2_mc_mean": abs(metrics["tau2_mc_mean"] - 1.0),
+        }
+
+    elif args.filter_kind == "two_bump":
+        recovery_block = {
+            "c1_plugin": metrics["c1_plugin"],
+            "c2_plugin": metrics["c2_plugin"],
+            "w1_plugin": metrics["w1_plugin"],
+            "w2_plugin": metrics["w2_plugin"],
+            "a1_plugin": metrics["a1_plugin"],
+            "a2_plugin": metrics["a2_plugin"],
+            "tau2_plugin": metrics["tau2_plugin"],
+            "c1_mc_mean": metrics["c1_mc_mean"],
+            "c2_mc_mean": metrics["c2_mc_mean"],
+            "w1_mc_mean": metrics["w1_mc_mean"],
+            "w2_mc_mean": metrics["w2_mc_mean"],
+            "a1_mc_mean": metrics["a1_mc_mean"],
+            "a2_mc_mean": metrics["a2_mc_mean"],
+            "tau2_mc_mean": metrics["tau2_mc_mean"],
+        }
+
+    else:
+        recovery_block = {}
+
+    # ------------------------------------------------------------------
+    # Final summary
+    # ------------------------------------------------------------------
     summary = {
         "truth": {
             "t1_true": 3.0,
@@ -1410,29 +1965,19 @@ def main() -> None:
             "sigma_true": float(args.sigma),
             "sigma2_true": float(args.sigma ** 2),
             "formula": "F0(x) = 1 / (3 + 2x)^4",
-            "fitted_family": "F_theta(x) = tau2 / (t1 + t2 x)^4",
+            "fitted_family": fitted_family_str,
+            "filter_kind": args.filter_kind,
             "noise_learning": "sigma2 learned",
         },
+
         "recovery": {
-            "t1_plugin": metrics["t1_plugin"],
-            "t2_plugin": metrics["t2_plugin"],
-            "tau2_plugin": metrics["tau2_plugin"],
-            "t1_mc_mean": metrics["t1_mc_mean"],
-            "t2_mc_mean": metrics["t2_mc_mean"],
-            "tau2_mc_mean": metrics["tau2_mc_mean"],
+            **recovery_block,
             "sigma_plugin": metrics["sigma_plugin"],
             "sigma2_plugin": metrics["sigma2_plugin"],
-            "abs_err_t1_plugin": abs(metrics["t1_plugin"] - 3.0),
-            "abs_err_t2_plugin": abs(metrics["t2_plugin"] - 2.0),
-            "abs_err_tau2_plugin": abs(metrics["tau2_plugin"] - 1.0),
-            "abs_err_t1_mc_mean": abs(metrics["t1_mc_mean"] - 3.0),
-            "abs_err_t2_mc_mean": abs(metrics["t2_mc_mean"] - 2.0),
-            "abs_err_tau2_mc_mean": abs(metrics["tau2_mc_mean"] - 1.0),
             "abs_err_sigma_plugin": metrics["abs_err_sigma_plugin"],
             "abs_err_sigma2_plugin": metrics["abs_err_sigma2_plugin"],
-            "sigma_plugin": metrics["sigma_plugin"],
-            "sigma2_plugin": metrics["sigma2_plugin"],
         },
+
         "metrics": {
             "pll_vi_per_test": metrics["pll_vi_per_test"],
             "phi_rmse_plugin": metrics["phi_rmse_plugin"],
@@ -1456,6 +2001,7 @@ def main() -> None:
             "total_var_rel_l2_plugin": metrics["total_var_rel_l2_plugin"],
             "total_var_rel_l2_post": metrics["total_var_rel_l2_post"],
         },
+
         "config": {
             "nx": args.nx,
             "ny": args.ny,
@@ -1472,27 +2018,61 @@ def main() -> None:
             "vi_mc": args.vi_mc,
             "vi_lr": args.vi_lr,
             "use_markers": bool(args.use_markers),
+            "filter_kind": args.filter_kind,
         },
     }
 
     (outdir / "recovery_summary.json").write_text(json.dumps(summary, indent=2))
 
     print("\n[RESULT] Parameter recovery")
-    print(
-        f"  true t1 = 3.0000 | "
-        f"plugin = {metrics['t1_plugin']:.4f} | "
-        f"MC mean = {metrics['t1_mc_mean']:.4f}"
-    )
-    print(
-        f"  true t2 = 2.0000 | "
-        f"plugin = {metrics['t2_plugin']:.4f} | "
-        f"MC mean = {metrics['t2_mc_mean']:.4f}"
-    )
-    print(
-        f"  true tau2 = 1.0000 | "
-        f"plugin = {metrics['tau2_plugin']:.4f} | "
-        f"MC mean = {metrics['tau2_mc_mean']:.4f}"
-    )
+
+    if args.filter_kind == "power_decay":
+        print(
+            f"  true t1 = 3.0000 | "
+            f"plugin = {metrics['t1_plugin']:.4f} | "
+            f"MC mean = {metrics['t1_mc_mean']:.4f}"
+        )
+        print(
+            f"  true t2 = 2.0000 | "
+            f"plugin = {metrics['t2_plugin']:.4f} | "
+            f"MC mean = {metrics['t2_mc_mean']:.4f}"
+        )
+        print(
+            f"  true tau2 = 1.0000 | "
+            f"plugin = {metrics['tau2_plugin']:.4f} | "
+            f"MC mean = {metrics['tau2_mc_mean']:.4f}"
+        )
+
+    elif args.filter_kind == "two_bump":
+        print(
+            f"  c1 plugin = {metrics['c1_plugin']:.4f} | "
+            f"MC mean = {metrics['c1_mc_mean']:.4f}"
+        )
+        print(
+            f"  c2 plugin = {metrics['c2_plugin']:.4f} | "
+            f"MC mean = {metrics['c2_mc_mean']:.4f}"
+        )
+        print(
+            f"  w1 plugin = {metrics['w1_plugin']:.4f} | "
+            f"MC mean = {metrics['w1_mc_mean']:.4f}"
+        )
+        print(
+            f"  w2 plugin = {metrics['w2_plugin']:.4f} | "
+            f"MC mean = {metrics['w2_mc_mean']:.4f}"
+        )
+        print(
+            f"  a1 plugin = {metrics['a1_plugin']:.4f} | "
+            f"MC mean = {metrics['a1_mc_mean']:.4f}"
+        )
+        print(
+            f"  a2 plugin = {metrics['a2_plugin']:.4f} | "
+            f"MC mean = {metrics['a2_mc_mean']:.4f}"
+        )
+        print(
+            f"  tau2 plugin = {metrics['tau2_plugin']:.4f} | "
+            f"MC mean = {metrics['tau2_mc_mean']:.4f}"
+        )
+
     print(
         f"  true sigma = {args.sigma:.4f} | "
         f"plugin = {metrics['sigma_plugin']:.4f}"
