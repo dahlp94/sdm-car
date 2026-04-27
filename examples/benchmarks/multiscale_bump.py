@@ -16,59 +16,41 @@ def build_multiscale_bump_filter(
     device: torch.device,
     lam_max: float,
     K: int = 2,
-    s_min: float = 0.05,
+    s_min: float = 0.08,#0.05,
+    floor: float = 1e-2,#1e-6,
     prior_mu: float = 0.0,
     prior_std: float = 1.0,
     log_std0: float = -2.3,
     **kwargs,
 ):
-    # init amplitudes so bumps start around the right scale
-    # (tau2_true here is just a rough calibration hint, like logspline does)
-    mu0_a = math.log(max(float(tau2_true), 1e-12))
-
     return MultiScaleBumpFilterFullVI(
         lam_max=float(lam_max),
         eps_car=float(eps_car),
         K=int(K),
+        s_min=float(s_min),
+        floor=float(floor),
         mu_log_tau2=math.log(max(float(tau2_true), 1e-12)),
-        log_std0=-2.3,
+        log_std0=float(log_std0),
+        prior_mu=float(prior_mu),
+        prior_std=float(prior_std),
     ).to(device)
 
 
 def step_theta_multiscale(filter_module) -> dict[str, float]:
-    """
-    MH proposal step sizes in unconstrained space
-    for MultiScaleBumpFilterFullVI.
-
-    Unconstrained names now include:
-      log_tau2
-      a{k}_raw
-      m{k}_raw
-      log_s{k}_raw
-      alpha{k}_raw
-    """
-
     d: dict[str, float] = {}
 
     for nm in filter_module.unconstrained_names():
-        # Global scale (important — keep moderate)
         if nm == "log_tau2":
             d[nm] = 0.18
-        # Log-amplitudes
-        elif nm.startswith("a") and nm.endswith("_raw"):
-            d[nm] = 0.18
-        # Centers (constrained via sigmoid, so slightly larger ok)
         elif nm.startswith("m") and nm.endswith("_raw"):
             d[nm] = 0.22
-        # Widths (softplus-constrained, can be sensitive)
         elif nm.startswith("log_s") and nm.endswith("_raw"):
             d[nm] = 0.18
-        # Mixture logits (softmax downstream → moderate)
         elif nm.startswith("alpha") and nm.endswith("_raw"):
             d[nm] = 0.15
-        # Fallback (should not trigger, but safe)
         else:
             d[nm] = 0.18
+
     return d
 
 register(
@@ -79,7 +61,7 @@ register(
             "k2": CaseSpec(
                 case_id="k2",
                 display_name="msbump_k2",
-                fixed=dict(K=2, s_min=0.05),
+                fixed=dict(K=2, s_min=0.08, floor=1e-2),    #fixed=dict(K=2, s_min=0.05),
                 build_filter=build_multiscale_bump_filter,
                 step_s=0.14,
                 step_theta=step_theta_multiscale,

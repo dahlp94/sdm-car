@@ -20,7 +20,7 @@ from sdmcar.graph import build_laplacian_from_knn, laplacian_eigendecomp
 from sdmcar.models import SpectralCAR_FullVI
 from sdmcar.mcmc import MCMCConfig, make_collapsed_mcmc_from_model
 from sdmcar import diagnostics
-from sdmcar.diagnostics import spectrum_error_log_l1
+from sdmcar.diagnostics import spectrum_error_log_l1, weighted_relative_l2_spectrum_error
 
 # IMPORTANT: importing benchmarks triggers registrations
 from examples.benchmarks.registry import get_filter_spec, available_filters
@@ -97,6 +97,266 @@ def plot_hist_with_lines(
     plt.savefig(save_path, dpi=200)
     plt.close()
 
+def plot_true_vs_empirical(
+    *,
+    lam: torch.Tensor,
+    F_true: torch.Tensor,
+    empirical_energy: torch.Tensor,
+    outpath: Path,
+    title: str,
+    logy: bool = False,
+    use_markers: bool = True,
+    xlabel=r"$\lambda$",
+) -> None:
+    lam_np = lam.detach().cpu().numpy()
+    F_np = F_true.detach().cpu().numpy()
+    e_np = empirical_energy.detach().cpu().numpy()
+
+    if logy:
+        F_np = np.clip(F_np, 1e-12, None)
+        e_np = np.clip(e_np, 1e-12, None)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+
+    if use_markers:
+        ax.plot(
+            lam_np, F_np,
+            marker="o", linestyle="none",
+            label="True $F_0(x)$", markersize=4, alpha=0.9,
+        )
+        ax.plot(
+            lam_np, e_np,
+            marker="x", linestyle="none",
+            label="Empirical energy $z^2$", markersize=4, alpha=0.7,
+        )
+    else:
+        ax.plot(lam_np, F_np, label="True $F_0(x)$", linewidth=2.5)
+        ax.plot(lam_np, e_np, label="Empirical energy $z^2$", linewidth=1.8)
+
+    if logy:
+        ax.set_yscale("log")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Spectral value")
+    ax.set_title(title)
+    ax.legend(frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=180)
+    plt.close(fig)
+
+
+def plot_true_vs_learned_spectra(
+    *,
+    lam: torch.Tensor,
+    F_true: torch.Tensor,
+    learned: dict[str, torch.Tensor],
+    outpath: Path,
+    title: str,
+    logy: bool = False,
+    use_markers: bool = True,
+    xlabel: str = r"$\lambda$",
+) -> None:
+    lam_np = lam.detach().cpu().numpy()
+    true_np = F_true.detach().cpu().numpy()
+
+    if logy:
+        true_np = np.clip(true_np, 1e-12, None)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+
+    if use_markers:
+        ax.plot(
+            lam_np, true_np,
+            marker="o", linestyle="none",
+            label="True $F_0(x)$", markersize=4,
+        )
+    else:
+        ax.plot(lam_np, true_np, label="True $F_0(x)$", linewidth=2.5)
+
+    for label, spec in learned.items():
+        spec_np = spec.detach().cpu().numpy()
+        if logy:
+            spec_np = np.clip(spec_np, 1e-12, None)
+
+        if use_markers:
+            ax.plot(
+                lam_np, spec_np,
+                marker="x", linestyle="none",
+                label=label, markersize=4, alpha=0.8,
+            )
+        else:
+            ax.plot(lam_np, spec_np, label=label, linewidth=2.0)
+
+    if logy:
+        ax.set_yscale("log")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Spectral value")
+    ax.set_title(title)
+    ax.legend(frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=180)
+    plt.close(fig)
+
+
+def plot_true_vs_learned_curves(
+    *,
+    lam: torch.Tensor,
+    true_curve: torch.Tensor,
+    learned: dict[str, torch.Tensor],
+    outpath: Path,
+    title: str,
+    ylabel: str,
+    logy: bool = False,
+    use_markers: bool = True,
+    xlabel: str = r"$\lambda$",
+) -> None:
+    lam_np = lam.detach().cpu().numpy()
+    true_np = true_curve.detach().cpu().numpy()
+
+    if logy:
+        true_np = np.clip(true_np, 1e-12, None)
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.8))
+
+    if use_markers:
+        ax.plot(
+            lam_np,
+            true_np,
+            marker="o",
+            linestyle="none",
+            label="Truth",
+            markersize=4,
+        )
+    else:
+        ax.plot(lam_np, true_np, label="Truth", linewidth=2.5)
+
+    for label, curve in learned.items():
+        curve_np = curve.detach().cpu().numpy()
+        if logy:
+            curve_np = np.clip(curve_np, 1e-12, None)
+
+        if use_markers:
+            ax.plot(
+                lam_np,
+                curve_np,
+                marker="x",
+                linestyle="none",
+                label=label,
+                markersize=4,
+                alpha=0.8,
+            )
+        else:
+            ax.plot(lam_np, curve_np, label=label, linewidth=2.0)
+
+    if logy:
+        ax.set_yscale("log")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend(frameon=False)
+
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=180)
+    plt.close(fig)
+
+
+def plot_spectrum_with_bands(
+    *,
+    lam: torch.Tensor,
+    F_true: torch.Tensor,
+    vi_mean: torch.Tensor,
+    vi_q025: torch.Tensor,
+    vi_q975: torch.Tensor,
+    mcmc_mean: torch.Tensor | None,
+    mcmc_q025: torch.Tensor | None,
+    mcmc_q975: torch.Tensor | None,
+    outpath: Path,
+    title: str,
+    logx: bool = False,
+    logy: bool = True,
+    xlabel: str = r"$\lambda$",
+) -> None:
+    x = lam.detach().cpu().numpy()
+    true_np = F_true.detach().cpu().numpy()
+    vi_mean_np = vi_mean.detach().cpu().numpy()
+    vi_lo_np = vi_q025.detach().cpu().numpy()
+    vi_hi_np = vi_q975.detach().cpu().numpy()
+
+    eps = 1e-12
+    if logy:
+        true_np = np.clip(true_np, eps, None)
+        vi_mean_np = np.clip(vi_mean_np, eps, None)
+        vi_lo_np = np.clip(vi_lo_np, eps, None)
+        vi_hi_np = np.clip(vi_hi_np, eps, None)
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+    ax.plot(x, true_np, linewidth=2.5, label="True spectrum")
+    ax.plot(x, vi_mean_np, linewidth=2.0, label="VI mean")
+    ax.fill_between(x, vi_lo_np, vi_hi_np, alpha=0.25, label="VI 95% band")
+
+    if mcmc_mean is not None and mcmc_q025 is not None and mcmc_q975 is not None:
+        m_mean_np = mcmc_mean.detach().cpu().numpy()
+        m_lo_np = mcmc_q025.detach().cpu().numpy()
+        m_hi_np = mcmc_q975.detach().cpu().numpy()
+
+        if logy:
+            m_mean_np = np.clip(m_mean_np, eps, None)
+            m_lo_np = np.clip(m_lo_np, eps, None)
+            m_hi_np = np.clip(m_hi_np, eps, None)
+
+        ax.plot(x, m_mean_np, linewidth=2.0, linestyle="--", label="MCMC mean")
+        ax.fill_between(x, m_lo_np, m_hi_np, alpha=0.18, label="MCMC 95% band")
+
+    if logy:
+        ax.set_yscale("log")
+    if logx:
+        ax.set_xscale("log")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(r"$F(\lambda)$")
+    ax.set_title(title)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=200)
+    plt.close(fig)
+
+def spectral_plot_axis(
+    *,
+    lam: torch.Tensor,
+    eps_car: float,
+    filter_name: str,
+) -> tuple[torch.Tensor, str, str]:
+    """
+    Returns:
+        x_axis: tensor used for plotting
+        xlabel: axis label
+        axis_tag: short name for filenames
+    """
+    if filter_name == "multiscale_bump":
+        return (
+            torch.log(lam + eps_car),
+            r"$\log(\lambda+\epsilon)$",
+            "logfreq",
+        )
+
+    if filter_name in {"poly", "rational"}:
+        x = (lam / lam.max().clamp_min(1e-12)).clamp(0.0, 1.0)
+        return (
+            x,
+            r"$x=\lambda/\lambda_{\max}$",
+            "normalized_x",
+        )
+
+    return (
+        lam,
+        r"$\lambda$",
+        "lambda",
+    )
 
 def resolve_fixed_tokens(fixed: dict, eps_car: float) -> dict:
     """
@@ -465,6 +725,31 @@ def run_case(
 
     theta_raw, theta_constr = decode_theta_chain(out, model.filter)
 
+    # -------------------------
+    # MCMC spectrum posterior bands
+    # -------------------------
+    with torch.no_grad():
+        theta_mcmc = out["theta"].detach().cpu().numpy()
+        theta_names = out["theta_names"]
+
+        F_mcmc_draws = []
+        for i in range(theta_mcmc.shape[0]):
+            theta_i = {
+                theta_names[j]: torch.tensor(
+                    [theta_mcmc[i, j]],
+                    dtype=lam.dtype,
+                    device=lam.device,
+                )
+                for j in range(len(theta_names))
+            }
+            F_i = model.filter.spectrum(lam, theta_i).clamp_min(1e-12)
+            F_mcmc_draws.append(F_i)
+
+        F_mcmc_draws = torch.stack(F_mcmc_draws, dim=0)  # [S, n]
+        F_mcmc_mean = F_mcmc_draws.mean(dim=0)
+        F_mcmc_q025 = torch.quantile(F_mcmc_draws, 0.025, dim=0)
+        F_mcmc_q975 = torch.quantile(F_mcmc_draws, 0.975, dim=0)
+
     # integrating ridge diagnostics
     from sdmcar.diagnostics import ridge_report, plot_corr_heatmap, spectrum_draw_sd
 
@@ -571,6 +856,133 @@ def run_case(
 
     F_true_local = F_true.detach().to(device=lam.device, dtype=lam.dtype).reshape(-1)
 
+    plot_x, plot_xlabel, plot_axis_tag = spectral_plot_axis(
+        lam=lam,
+        eps_car=eps_car,
+        filter_name=filter_name,
+    )
+
+    plot_spectrum_with_bands(
+        lam=plot_x,
+        F_true=F_true_local,
+        vi_mean=F_vi_mc_mean.to(device),
+        vi_q025=F_vi_mc_q025.to(device),
+        vi_q975=F_vi_mc_q975.to(device),
+        mcmc_mean=F_mcmc_mean.to(device),
+        mcmc_q025=F_mcmc_q025.to(device),
+        mcmc_q975=F_mcmc_q975.to(device),
+        outpath=case_dir / f"spectrum_posterior_bands_{plot_axis_tag}_logy.png",
+        title=f"Posterior spectrum bands — {filter_name}/{case_spec.display_name}",
+        logy=True,
+        xlabel=plot_xlabel,
+    )
+
+    z_true = U.T @ phi_true
+    empirical_energy = z_true.pow(2).detach()
+
+    true_total_var = F_true_local + sigma2_true
+    vi_plugin_total_var = F_plugin.to(device) + sigma2_vi_plugin
+    vi_mc_total_var = F_vi_mc_mean.to(device) + sigma2_vi_mc_mean
+
+    # -----------------------------
+    # Diagnostics: sigma^2 + scale
+    # -----------------------------
+    print(
+        f"[DIAG] sigma2: "
+        f"true={sigma2_true:.4f} | "
+        f"VI_plugin={sigma2_vi_plugin:.4f} | "
+        f"VI_mc={sigma2_vi_mc_mean:.4f}"
+    )
+
+    scale_true = F_true_local.sum()
+    scale_hat_vi = F_vi_mc_mean.to(device).sum()
+    scale_hat_plugin = F_plugin.to(device).sum()
+
+    print(
+        f"[DIAG] spectral scale ratio: "
+        f"VI_plugin={scale_hat_plugin/scale_true:.4f} | "
+        f"VI_mc={scale_hat_vi/scale_true:.4f}"
+    )
+
+    plot_true_vs_learned_curves(
+        lam=plot_x,
+        true_curve=true_total_var,
+        learned={
+            "VI plugin": vi_plugin_total_var,
+            "VI MC mean": vi_mc_total_var,
+        },
+        outpath=case_dir / f"true_vs_vi_total_modal_variance_{plot_axis_tag}.png",
+        title=f"True vs learned total modal variance — {filter_name}/{case_spec.display_name}",
+        ylabel=r"$F(\lambda) + \sigma^2$",
+        logy=False,
+        use_markers=True,
+        xlabel=plot_xlabel,
+    )
+
+    plot_true_vs_learned_curves(
+        lam=plot_x,
+        true_curve=true_total_var,
+        learned={
+            "VI plugin": vi_plugin_total_var,
+            "VI MC mean": vi_mc_total_var,
+        },
+        outpath=case_dir / f"true_vs_vi_total_modal_variance_{plot_axis_tag}_logy.png",
+        title=f"True vs learned total modal variance log-y — {filter_name}/{case_spec.display_name}",
+        ylabel=r"$F(\lambda) + \sigma^2$",
+        logy=True,
+        use_markers=True,
+        xlabel=plot_xlabel,
+    )
+
+    plot_true_vs_empirical(
+        lam=plot_x,
+        F_true=F_true_local,
+        empirical_energy=empirical_energy,
+        outpath=case_dir / f"true_vs_empirical_spectrum_{plot_axis_tag}.png",
+        title=f"True spectrum vs empirical energy — {filter_name}/{case_spec.display_name}",
+        logy=False,
+        use_markers=True,
+        xlabel=plot_xlabel,
+    )
+
+    plot_true_vs_empirical(
+        lam=plot_x,
+        F_true=F_true_local,
+        empirical_energy=empirical_energy,
+        outpath=case_dir / f"true_vs_empirical_spectrum_{plot_axis_tag}_logy.png",
+        title=f"True spectrum vs empirical energy log-y — {filter_name}/{case_spec.display_name}",
+        logy=True,
+        use_markers=True,
+        xlabel=plot_xlabel,
+    )
+
+    plot_true_vs_learned_spectra(
+        lam=plot_x,
+        F_true=F_true_local,
+        learned={
+            "VI plugin": F_plugin.to(device),
+            "VI MC mean": F_vi_mc_mean.to(device),
+        },
+        outpath=case_dir / f"true_vs_vi_learned_spectrum_{plot_axis_tag}.png",
+        title=f"True vs VI learned spectrum — {filter_name}/{case_spec.display_name}",
+        logy=False,
+        use_markers=True,
+        xlabel=plot_xlabel,
+    )
+
+    plot_true_vs_learned_spectra(
+        lam=plot_x,
+        F_true=F_true_local,
+        learned={
+            "VI plugin": F_plugin.to(device),
+            "VI MC mean": F_vi_mc_mean.to(device),
+        },
+        outpath=case_dir / f"true_vs_vi_learned_spectrum_{plot_axis_tag}_logy.png",
+        title=f"True vs VI learned spectrum log-y — {filter_name}/{case_spec.display_name}",
+        logy=True,
+        use_markers=True,
+        xlabel=plot_xlabel,
+    )
 
     diagnostics.plot_spectrum_recovery(
         lam=lam,
@@ -584,7 +996,6 @@ def run_case(
         vi_band=True,
         mcmc_band=True,
     )
-
     # -------------------------
     # Spectrum error metrics
     # -------------------------
@@ -600,6 +1011,56 @@ def run_case(
         F_true=F_true_local,
         filter_module=model.filter,
         theta_mcmc=out["theta"],   # torch.Tensor [S,d]
+    )
+
+    spec_wl2_vi_plugin = weighted_relative_l2_spectrum_error(
+        F_true=F_true_local,
+        F_hat=F_plugin.to(device),
+        weight="signal",
+    )
+
+    spec_wl2_vi_mc = weighted_relative_l2_spectrum_error(
+        F_true=F_true_local,
+        F_hat=F_vi_mc_mean.to(device),
+        weight="signal",
+    )
+
+    spec_wl2_mcmc = weighted_relative_l2_spectrum_error(
+        F_true=F_true_local,
+        F_hat=F_mcmc_mean.to(device),
+        weight="signal",
+    )
+
+    print(
+        f"Spectrum weighted rel-L2: "
+        f"VI(plugin)={spec_wl2_vi_plugin:.4f} | "
+        f"VI(mc)={spec_wl2_vi_mc:.4f} | "
+        f"MCMC={spec_wl2_mcmc:.4f}"
+    )
+
+    total_wl2_vi_plugin = weighted_relative_l2_spectrum_error(
+        F_true=F_true_local + sigma2_true,
+        F_hat=F_plugin.to(device) + sigma2_vi_plugin,
+        weight="signal",
+    )
+
+    total_wl2_vi_mc = weighted_relative_l2_spectrum_error(
+        F_true=F_true_local + sigma2_true,
+        F_hat=F_vi_mc_mean.to(device) + sigma2_vi_mc_mean,
+        weight="signal",
+    )
+
+    total_wl2_mcmc = weighted_relative_l2_spectrum_error(
+        F_true=F_true_local + sigma2_true,
+        F_hat=F_mcmc_mean.to(device) + float(np.mean(sigma2_chain)),
+        weight="signal",
+    )
+
+    print(
+        f"Total variance weighted rel-L2: "
+        f"VI(plugin)={total_wl2_vi_plugin:.4f} | "
+        f"VI(mc)={total_wl2_vi_mc:.4f} | "
+        f"MCMC={total_wl2_mcmc:.4f}"
     )
 
 
@@ -804,6 +1265,12 @@ def run_case(
         "rmse_phi_mcmc": rmse_phi_mcmc,
         "spec_err_vi": spec_err_vi,
         "spec_err_mcmc": spec_err_mcmc,
+        "spec_wl2_vi_plugin": spec_wl2_vi_plugin,
+        "spec_wl2_vi_mc": spec_wl2_vi_mc,
+        "spec_wl2_mcmc": spec_wl2_mcmc,
+        "total_wl2_vi_plugin": spec_wl2_vi_plugin,
+        "total_wl2_vi_mc": spec_wl2_vi_mc,
+        "total_wl2_mcmc": spec_wl2_mcmc,
         "acc_s": acc["s"][2],
         "acc_theta": {k: v[2] for k, v in acc["theta"].items()},
         "vi_plugin": {
@@ -856,6 +1323,15 @@ def run_case(
     # Add predictive metrics in the summary.
     summary.update(pred)
 
+    summary.update({
+        "sigma2_true": float(sigma2_true),
+        "sigma2_vi_plugin": float(sigma2_vi_plugin),
+        "sigma2_vi_mc": float(sigma2_vi_mc_mean),
+
+        "scale_ratio_vi_plugin": float(scale_hat_plugin / scale_true),
+        "scale_ratio_vi_mc": float(scale_hat_vi / scale_true),
+    })
+
     # -------------------------
     # Write per-case metrics JSON
     # -------------------------
@@ -871,6 +1347,12 @@ def run_case(
                 "rmse_phi_mcmc": summary["rmse_phi_mcmc"],
                 "spec_err_vi": summary["spec_err_vi"],
                 "spec_err_mcmc": summary["spec_err_mcmc"],
+                "spec_wl2_vi_plugin": summary["spec_wl2_vi_plugin"],
+                "spec_wl2_vi_mc": summary["spec_wl2_vi_mc"],
+                "spec_wl2_mcmc": summary["spec_wl2_mcmc"],
+                "total_wl2_vi_plugin": summary["spec_wl2_vi_plugin"],
+                "total_wl2_vi_mc": summary["spec_wl2_vi_mc"],
+                "total_wl2_mcmc": summary["spec_wl2_mcmc"],
                 "acc_s": summary["acc_s"],
                 "acc_theta": summary["acc_theta"],
                 "vi_plugin": summary["vi_plugin"],
@@ -907,6 +1389,13 @@ def main():
     parser.add_argument("--mcmc_steps", type=int, default=30000)
     parser.add_argument("--mcmc_burnin", type=int, default=10000)
     parser.add_argument("--mcmc_thin", type=int, default=10)
+
+    parser.add_argument(
+        "--truth",
+        default="icar",
+        choices=["icar", "multiscale_bump", "poly", "rational"],
+        help="Data-generating spectral truth.",
+    )
 
     parser.add_argument(
     "--fast",
@@ -973,12 +1462,89 @@ def main():
     U = U.to(device)
 
     # --------------------------------------------
-    # 2) Generate CAR truth
+    # 2) Generate truth
     # --------------------------------------------
     tau2_true = 0.4
     eps_car = 1e-3
-    F_car = tau2_true / (lam + eps_car)
-    F_true = F_car
+
+    lam_max = lam.max().clamp_min(1e-12)
+    x = (lam / lam_max).clamp(0.0, 1.0)
+
+    if args.truth == "icar":
+        F_true = tau2_true / (lam + eps_car)
+
+    elif args.truth == "multiscale_bump":
+        t = torch.log(lam + eps_car)
+
+        lo = math.log(eps_car)
+        hi = math.log(float(lam.max().item()) + eps_car)
+
+        m1 = lo + 0.45 * (hi - lo)
+        m2 = lo + 0.80 * (hi - lo)
+
+        s1 = 0.055 * (hi - lo)
+        s2 = 0.045 * (hi - lo)
+
+        F_true = tau2_true * (
+            1.00 * torch.exp(-0.5 * ((t - m1) / s1) ** 2)
+            + 0.75 * torch.exp(-0.5 * ((t - m2) / s2) ** 2)
+            + 0.02
+        ).clamp_min(1e-12)
+    
+    elif args.truth == "poly":
+        # Example: decreasing polynomial
+        tau2_true = 0.4
+
+        a_true = torch.tensor([1.0, 2.0, 1.5, 0.5], dtype=lam.dtype, device=lam.device)
+
+        basis = 1.0 - x  # match "decreasing" mode
+
+        P = torch.zeros_like(x)
+        for k in range(len(a_true)):
+            P += a_true[k] * (basis ** k)
+
+        F_true = tau2_true * P.clamp_min(1e-12)
+    
+    # elif args.truth == "rational":
+    #     tau2_true = 0.4
+
+    #     # numerator (degree 2)
+    #     a_true = torch.tensor([1.0, 1.5, 0.5], dtype=lam.dtype, device=lam.device)
+
+    #     # denominator (degree 1)
+    #     b_true = torch.tensor([0.5, 2.0], dtype=lam.dtype, device=lam.device)
+
+    #     P = torch.zeros_like(x)
+    #     for k in range(len(a_true)):
+    #         P += a_true[k] * (x ** k)
+
+    #     Q = torch.zeros_like(x)
+    #     for m in range(len(b_true)):
+    #         Q += b_true[m] * (x ** m)
+
+    #     F_true = tau2_true * P / (Q + 1e-12)
+    #     F_true = F_true.clamp_min(1e-12)
+
+    elif args.truth == "rational":
+        tau2_true = 0.4
+
+        a_true = torch.tensor([1.0], dtype=lam.dtype, device=lam.device)
+        b_true = torch.tensor([0.05, 2.0], dtype=lam.dtype, device=lam.device)
+
+        P = a_true[0] * torch.ones_like(x)
+        Q = b_true[0] + b_true[1] * x
+
+        F_true = tau2_true * P / (Q + 1e-12)
+        F_true = F_true.clamp_min(1e-12)
+    
+    else:
+        raise ValueError(f"Unknown truth: {args.truth}")
+    
+    # --------------------------------------------
+    # DEBUG
+    print(f"[TRUTH] truth={args.truth}")
+    print(f"[TRUTH] F_true min={F_true.min().item():.6g}, max={F_true.max().item():.6g}")
+
 
     z_true = torch.sqrt(F_true) * torch.randn(n, dtype=torch.double, device=device)
     phi_true = U @ z_true

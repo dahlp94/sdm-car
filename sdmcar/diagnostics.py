@@ -545,6 +545,32 @@ def spectrum_error_log_l1(
 
     return float(log_diff.mean().cpu().item())
 
+@torch.no_grad()
+def weighted_relative_l2_spectrum_error(
+    *,
+    F_true,
+    F_hat,
+    weight: str = "signal",
+    eps: float = 1e-12,
+) -> float:
+    F_true = F_true.reshape(-1).clamp_min(eps)
+    F_hat = F_hat.reshape(-1).clamp_min(eps)
+
+    if weight == "uniform":
+        w = torch.ones_like(F_true)
+    elif weight == "signal":
+        w = F_true / F_true.sum().clamp_min(eps)
+    elif weight == "sqrt_signal":
+        w = torch.sqrt(F_true)
+        w = w / w.sum().clamp_min(eps)
+    else:
+        raise ValueError(f"Unknown weight: {weight}")
+
+    num = torch.sum(w * (F_hat - F_true) ** 2)
+    den = torch.sum(w * F_true ** 2).clamp_min(eps)
+
+    return float(torch.sqrt(num / den).item())
+
 def posterior_corr_matrix(
     theta_draws: np.ndarray,
     theta_names: list[str],
