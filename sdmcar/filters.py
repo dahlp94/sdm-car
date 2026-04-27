@@ -492,129 +492,136 @@ class LogSplineFilterFullVI(BaseSpectralFilter):
         c = self._constrain(theta)
         return c["tau2"].reshape(()), c["rho0"].reshape(1)
     
-class DiffusionFilterFullVI(BaseSpectralFilter):
+    
+class DiffusionKernelFilterFullVI(BaseSpectralFilter):
     """
-    Variational diffusion filter:
+    Graph diffusion / heat-kernel spectral filter:
 
-        F(lam) = τ^2 * exp(-a lam),   with a = softplus(a_raw) > 0.
+        F(lam) = tau2 * exp(-kappa * lam / lam_max)
 
-    Variational posteriors (full VI):
-        q(log τ^2) = N(mu_tau, s_τ^2)
-        q(a_raw)   = N(μ_a, s_a^2)   (softplus transform for positivity of 'a')
+    Unconstrained:
+        log_tau2
+        log_kappa
 
-    Priors (on unconstrained variables):
-        log τ^2 ~ N(0, 1)
-        a_raw   ~ N(0, 1)
+    Constrained:
+        tau2 = exp(log_tau2)
+        kappa = softplus(log_kappa)
     """
-    def __init__(self,
-                 mu_log_tau2: float = 0.0,
-                 log_std_log_tau2: float = -2.3,
-                 mu_a_raw: float = 0.4,
-                 log_std_a_raw: float = -2.3):
+
+    def __init__(
+        self,
+        *,
+        lam_max: float,
+        mu_log_tau2: float = 0.0,
+        mu_log_kappa: float = 0.0,
+        log_std0: float = -2.3,
+        prior_mu: float = 0.0,
+        prior_std: float = 1.0,
+    ):
         super().__init__()
 
-        self.mu_log_tau2 = nn.Parameter(
-            torch.tensor([mu_log_tau2], dtype=torch.double)
-        )
-        self.log_std_log_tau2 = nn.Parameter(
-            torch.tensor([log_std_log_tau2], dtype=torch.double)
-        )
+        if lam_max <= 0:
+            raise ValueError("lam_max must be positive.")
+        if prior_std <= 0:
+            raise ValueError("prior_std must be positive.")
 
-        self.mu_a_raw = nn.Parameter(
-            torch.tensor([mu_a_raw], dtype=torch.double)
-        )
-        self.log_std_a_raw = nn.Parameter(
-            torch.tensor([log_std_a_raw], dtype=torch.double)
-        )
+        self.lam_max = float(lam_max)
+        self.prior_mu = float(prior_mu)
+        self.prior_std = float(prior_std)
 
-    def sample_params(self):
-        """
-        Reparameterized samples of (τ^2, a) and the unconstrained variables.
+        self.mu_log_tau2 = nn.Parameter(torch.tensor([mu_log_tau2], dtype=torch.double))
+        self.log_std_log_tau2 = nn.Parameter(torch.tensor([log_std0], dtype=torch.double))
 
-        Returns:
-            tau2: scalar tau2
-            a:    scalar a > 0
-            log_tau2: scalar log tau2 sample
-            a_raw:    scalar a_raw sample
-        """
-        eps1 = torch.randn_like(self.mu_log_tau2)
-        eps2 = torch.randn_like(self.mu_a_raw)
-
-        log_tau2 = self.mu_log_tau2 + torch.exp(self.log_std_log_tau2) * eps1
-        a_raw    = self.mu_a_raw    + torch.exp(self.log_std_a_raw)    * eps2
-
-        tau2 = torch.exp(log_tau2)
-        a    = softplus(a_raw)
-        return tau2, a, log_tau2, a_raw
-
-    def F(self, lam, tau2, a):
-        """
-        Compute F(lam) elementwise for a given sample (tau2, a).
-
-        Args:
-            lam: [n] eigenvalues.
-            tau2: scalar tau2.
-            a: scalar a > 0.
-
-        Returns:
-            F_lam: [n] spectral variances.
-        """
-        return tau2 * torch.exp(-a * lam)
-
-    def kl_q_p(self):
-        """
-        KL( q(log tau2)||N(0,1) ) + KL( q(a_raw)||N(0,1) ).
-
-        Returns:
-            scalar KL value.
-        """
-        kl = kl_normal_std(self.mu_log_tau2, self.log_std_log_tau2)
-        kl += kl_normal_std(self.mu_a_raw,    self.log_std_a_raw)
-        return kl.sum()
-
-    @torch.no_grad()
-    def mean_params(self):
-        """
-        Return mean parameters under q: tau2_mean, a_mean.
-
-        Returns:
-            tau2_mean: scalar E_q[tau2]
-            a_mean:    scalar E_q[a]
-        """
-        tau2_mean = torch.exp(self.mu_log_tau2)
-        a_mean    = softplus(self.mu_a_raw)
-        return tau2_mean, a_mean
-
-    def init_a_raw(self) -> torch.Tensor:
-        """Return raw free variable(s) for initializing MCMC (shape [d] or empty)."""
-        return self.mu_a_raw.detach()
-    
-    # --------- Universal interface ---------
+        self.mu_log_kappa = nn.Parameter(torch.tensor([mu_log_kappa], dtype=torch.double))
+        self.log_std_log_kappa = nn.Parameter(torch.tensor([log_std0], dtype=torch.double))
 
     def unconstrained_names(self) -> list[str]:
-        return ["log_tau2", "a_raw"]
+        return ["log_tau2", "log_kappa"]
+
+    def blocks(self) -> list[ParamBlock]:
+        return [
+            ParamBlock.single("log_tau2"),
+            ParamBlock.single("log_kappa"),
+        ]
+
+    def _constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        tau2 = torch.exp(theta["log_tau2"]).reshape(())
+        kappa = softplus(theta["log_kappa"]).reshape(())
+        return {"tau2": tau2, "kappa": kappa}
+
+    def spectrum(self, lam: torch.Tensor, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        c = self._constrain(theta)
+        tau2 = c["tau2"]
+        kappa = c["kappa"]
+
+        x = (lam / max(self.lam_max, 1e-12)).clamp(0.0, 1.0)
+        F = tau2 * torch.exp(-kappa * x)
+        return F.clamp_min(1e-12).reshape(-1)
+
+    def pack(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        return torch.cat([theta[nm].reshape(-1) for nm in self.unconstrained_names()], dim=0)
+
+    def unpack(self, vec: torch.Tensor) -> dict[str, torch.Tensor]:
+        vec = vec.reshape(-1)
+        return {
+            "log_tau2": vec[0:1].clone(),
+            "log_kappa": vec[1:2].clone(),
+        }
 
     def sample_unconstrained(self) -> dict[str, torch.Tensor]:
-        _, _, log_tau2, a_raw = self.sample_params()
-        return {"log_tau2": log_tau2.reshape(1), "a_raw": a_raw.reshape(1)}
+        eps = torch.randn_like(self.mu_log_tau2)
+        log_tau2 = self.mu_log_tau2 + torch.exp(self.log_std_log_tau2) * eps
+
+        eps = torch.randn_like(self.mu_log_kappa)
+        log_kappa = self.mu_log_kappa + torch.exp(self.log_std_log_kappa) * eps
+
+        return {
+            "log_tau2": log_tau2.reshape(1),
+            "log_kappa": log_kappa.reshape(1),
+        }
 
     @torch.no_grad()
     def mean_unconstrained(self) -> dict[str, torch.Tensor]:
-        return {"log_tau2": self.mu_log_tau2.detach().reshape(1),
-                "a_raw": self.mu_a_raw.detach().reshape(1)}
-
-    def _constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        log_tau2 = theta["log_tau2"]
-        a_raw = theta["a_raw"]
         return {
-            "tau2": torch.exp(log_tau2),
-            "a": softplus(a_raw),
+            "log_tau2": self.mu_log_tau2.detach().reshape(1),
+            "log_kappa": self.mu_log_kappa.detach().reshape(1),
         }
 
-    def spectrum_from_unconstrained(self, lam: torch.Tensor, theta: dict[str, torch.Tensor]) -> torch.Tensor:
-        c = self._constrain(theta)
-        return self.F(lam, c["tau2"], c["a"])
+    def log_prior(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        anchor = theta["log_tau2"]
+        dtype, device = anchor.dtype, anchor.device
 
+        mu = torch.tensor(self.prior_mu, dtype=dtype, device=device)
+        std = torch.tensor(self.prior_std, dtype=dtype, device=device)
+        Np = Normal(mu, std)
+
+        v = self.pack(theta).reshape(-1)
+        return Np.log_prob(v).sum()
+
+    def kl_q_p(self) -> torch.Tensor:
+        kl = torch.zeros((), dtype=torch.double, device=self.mu_log_tau2.device)
+
+        kl = kl + kl_normal_to_normal(
+            self.mu_log_tau2,
+            self.log_std_log_tau2,
+            mu_p=self.prior_mu,
+            std_p=self.prior_std,
+        ).sum()
+
+        kl = kl + kl_normal_to_normal(
+            self.mu_log_kappa,
+            self.log_std_log_kappa,
+            mu_p=self.prior_mu,
+            std_p=self.prior_std,
+        ).sum()
+
+        return kl
+
+    @torch.no_grad()
+    def mean_params(self):
+        tau2 = torch.exp(self.mu_log_tau2.detach()).reshape(())
+        kappa = softplus(self.mu_log_kappa.detach()).reshape(())
+        return tau2, kappa.reshape(1)
 
 class MaternLikeFilterFullVI(BaseSpectralFilter):
     """
@@ -857,7 +864,6 @@ class MaternLikeFilterFullVI(BaseSpectralFilter):
         a = torch.stack([rho0, nu])
 
         return self.F(lam, c["tau2"], a)
-
 
 
 class InverseLinearCARFilterFullVI(BaseSpectralFilter):
