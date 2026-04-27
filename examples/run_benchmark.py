@@ -1393,7 +1393,7 @@ def main():
     parser.add_argument(
         "--truth",
         default="icar",
-        choices=["icar", "multiscale_bump", "poly", "rational"],
+        choices=["icar", "multiscale_bump", "poly", "rational", "diffusion"],
         help="Data-generating spectral truth.",
     )
 
@@ -1505,26 +1505,6 @@ def main():
 
         F_true = tau2_true * P.clamp_min(1e-12)
     
-    # elif args.truth == "rational":
-    #     tau2_true = 0.4
-
-    #     # numerator (degree 2)
-    #     a_true = torch.tensor([1.0, 1.5, 0.5], dtype=lam.dtype, device=lam.device)
-
-    #     # denominator (degree 1)
-    #     b_true = torch.tensor([0.5, 2.0], dtype=lam.dtype, device=lam.device)
-
-    #     P = torch.zeros_like(x)
-    #     for k in range(len(a_true)):
-    #         P += a_true[k] * (x ** k)
-
-    #     Q = torch.zeros_like(x)
-    #     for m in range(len(b_true)):
-    #         Q += b_true[m] * (x ** m)
-
-    #     F_true = tau2_true * P / (Q + 1e-12)
-    #     F_true = F_true.clamp_min(1e-12)
-
     elif args.truth == "rational":
         tau2_true = 0.4
 
@@ -1535,6 +1515,13 @@ def main():
         Q = b_true[0] + b_true[1] * x
 
         F_true = tau2_true * P / (Q + 1e-12)
+        F_true = F_true.clamp_min(1e-12)
+
+    elif args.truth == "diffusion":
+        tau2_true = 0.4
+        kappa_true = 4.0
+
+        F_true = tau2_true * torch.exp(-kappa_true * x)
         F_true = F_true.clamp_min(1e-12)
     
     else:
