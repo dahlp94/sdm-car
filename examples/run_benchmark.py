@@ -1393,7 +1393,7 @@ def main():
     parser.add_argument(
         "--truth",
         default="icar",
-        choices=["icar", "multiscale_bump", "poly", "rational", "diffusion"],
+        choices=["icar", "leroux", "multiscale_bump", "poly", "rational", "diffusion"],
         help="Data-generating spectral truth.",
     )
 
@@ -1472,6 +1472,13 @@ def main():
 
     if args.truth == "icar":
         F_true = tau2_true / (lam + eps_car)
+    
+    elif args.truth == "leroux":
+        tau2_true = 0.4
+        rho_true = 0.95
+
+        F_true = tau2_true / ((1.0 - rho_true) + rho_true * lam)
+        F_true = F_true.clamp_min(1e-12)
 
     elif args.truth == "multiscale_bump":
         t = torch.log(lam + eps_car)
