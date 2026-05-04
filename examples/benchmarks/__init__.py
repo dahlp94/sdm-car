@@ -8,3 +8,4 @@ from . import leroux
 from . import logspline
 from . import multiscale_bump
 from . import diffusion_kernel
+from . import bernstein_log
