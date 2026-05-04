@@ -1815,3 +1815,203 @@ class MultiScaleBumpFilterFullVI(BaseSpectralFilter):
         bumps = torch.exp(-0.5 * (z ** 2))
 
         return (tau2 * w[:, None] * bumps).clamp_min(1e-12)
+
+
+class BernsteinLogSpectrumFilterFullVI(BaseSpectralFilter):
+    """
+    Bernstein log-spectrum SDM-CAR filter.
+
+        F(lam) = floor + tau2 * exp( sum_{k=0}^K c_k B_{k,K}(x) )
+
+    where:
+        x = lam / lam_max
+        B_{k,K}(x) = choose(K,k) x^k (1-x)^{K-k}
+
+    Key points:
+      - c_k are signed, so the spectrum can be nonmonotone
+      - positivity is guaranteed by exponentiating the log-spectrum
+      - Bernstein basis is stable on [0,1]
+    """
+
+    def __init__(
+        self,
+        *,
+        lam_max: float,
+        degree: int = 5,
+        floor: float = 1e-6,
+        mu_log_tau2: float = 0.0,
+        mu_c0: float = 0.0,
+        log_std0: float = -2.3,
+        prior_mu: float = 0.0,
+        prior_std: float = 0.7,
+    ):
+        super().__init__()
+
+        if lam_max <= 0:
+            raise ValueError("lam_max must be positive.")
+        if degree < 0:
+            raise ValueError("degree must be nonnegative.")
+        if floor < 0:
+            raise ValueError("floor must be nonnegative.")
+        if prior_std <= 0:
+            raise ValueError("prior_std must be positive.")
+
+        self.lam_max = float(lam_max)
+        self.degree = int(degree)
+        self.floor = float(floor)
+        self.prior_mu = float(prior_mu)
+        self.prior_std = float(prior_std)
+
+        K = self.degree
+
+        # Global scale.
+        self.mu_log_tau2 = nn.Parameter(
+            torch.tensor([mu_log_tau2], dtype=torch.double)
+        )
+        self.log_std_log_tau2 = nn.Parameter(
+            torch.tensor([log_std0], dtype=torch.double)
+        )
+
+        # Signed Bernstein coefficients c_0,...,c_K.
+        self.mu_c = nn.Parameter(
+            torch.tensor([mu_c0] * (K + 1), dtype=torch.double)
+        )
+        self.log_std_c = nn.Parameter(
+            torch.tensor([log_std0] * (K + 1), dtype=torch.double)
+        )
+
+    def unconstrained_names(self) -> list[str]:
+        names = ["log_tau2"]
+        names += [f"c{k}_raw" for k in range(self.degree + 1)]
+        return names
+
+    def blocks(self) -> list[ParamBlock]:
+        return [
+            ParamBlock.single("log_tau2"),
+            ParamBlock(
+                name="c_raw",
+                param_names=tuple(f"c{k}_raw" for k in range(self.degree + 1)),
+            ),
+        ]
+
+    def _normal_kl(self, mu_q, log_std_q, mu_p: float, std_p: float):
+        std_q = torch.exp(log_std_q)
+        mu_p_t = torch.tensor(mu_p, dtype=mu_q.dtype, device=mu_q.device)
+        std_p_t = torch.tensor(std_p, dtype=mu_q.dtype, device=mu_q.device)
+
+        return (
+            torch.log(std_p_t / std_q)
+            + (std_q**2 + (mu_q - mu_p_t) ** 2) / (2.0 * std_p_t**2)
+            - 0.5
+        )
+
+    def kl_q_p(self) -> torch.Tensor:
+        kl = torch.zeros(
+            (),
+            dtype=self.mu_log_tau2.dtype,
+            device=self.mu_log_tau2.device,
+        )
+
+        kl = kl + self._normal_kl(
+            self.mu_log_tau2,
+            self.log_std_log_tau2,
+            self.prior_mu,
+            self.prior_std,
+        ).sum()
+
+        kl = kl + self._normal_kl(
+            self.mu_c,
+            self.log_std_c,
+            self.prior_mu,
+            self.prior_std,
+        ).sum()
+
+        return kl
+
+    def log_prior(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        anchor = theta["log_tau2"]
+        dtype, device = anchor.dtype, anchor.device
+
+        mu = torch.tensor(self.prior_mu, dtype=dtype, device=device)
+        std = torch.tensor(self.prior_std, dtype=dtype, device=device)
+        dist = Normal(mu, std)
+
+        v = self.pack(theta).reshape(-1)
+        return dist.log_prob(v).sum()
+
+    def _constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        log_tau2 = theta["log_tau2"].reshape(())
+        tau2 = torch.exp(log_tau2)
+
+        c = torch.stack(
+            [theta[f"c{k}_raw"].reshape(()) for k in range(self.degree + 1)],
+            dim=0,
+        )
+
+        return {
+            "tau2": tau2,
+            "c": c,
+        }
+
+    def _bernstein_basis(self, lam: torch.Tensor) -> torch.Tensor:
+        """
+        Return Bernstein basis matrix B with shape [K+1, n].
+        """
+        K = self.degree
+
+        x = (lam / max(self.lam_max, 1e-12)).clamp(0.0, 1.0)
+        dtype, device = x.dtype, x.device
+
+        B = []
+        for k in range(K + 1):
+            coef = math.comb(K, k)
+            b = coef * (x ** k) * ((1.0 - x) ** (K - k))
+            B.append(b)
+
+        return torch.stack(B, dim=0).to(dtype=dtype, device=device)
+
+    def spectrum_from_unconstrained(
+        self,
+        lam: torch.Tensor,
+        theta: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        cdict = self._constrain(theta)
+        tau2 = cdict["tau2"]
+        c = cdict["c"]
+
+        B = self._bernstein_basis(lam)  # [K+1, n]
+        g = c @ B                       # [n]
+
+        F = self.floor + tau2 * torch.exp(g)
+        return F.clamp_min(1e-12).reshape(-1)
+
+    def sample_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+
+        eps = torch.randn_like(self.mu_log_tau2)
+        log_tau2 = self.mu_log_tau2 + torch.exp(self.log_std_log_tau2) * eps
+        out["log_tau2"] = log_tau2.reshape(1)
+
+        eps = torch.randn_like(self.mu_c)
+        c = self.mu_c + torch.exp(self.log_std_c) * eps
+
+        for k in range(self.degree + 1):
+            out[f"c{k}_raw"] = c[k:k + 1]
+
+        return out
+
+    @torch.no_grad()
+    def mean_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {
+            "log_tau2": self.mu_log_tau2.detach().reshape(1)
+        }
+
+        for k in range(self.degree + 1):
+            out[f"c{k}_raw"] = self.mu_c[k:k + 1].detach()
+
+        return out
+
+    @torch.no_grad()
+    def mean_params(self):
+        tau2 = torch.exp(self.mu_log_tau2.detach()).reshape(())
+        return tau2, self.mu_c.detach()
