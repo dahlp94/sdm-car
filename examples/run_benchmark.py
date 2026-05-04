@@ -344,7 +344,7 @@ def spectral_plot_axis(
             "logfreq",
         )
 
-    if filter_name in {"poly", "rational"}:
+    if filter_name in {"poly", "rational", "bernstein_log"}:
         x = (lam / lam.max().clamp_min(1e-12)).clamp(0.0, 1.0)
         return (
             x,
@@ -1393,7 +1393,7 @@ def main():
     parser.add_argument(
         "--truth",
         default="icar",
-        choices=["icar", "leroux", "multiscale_bump", "poly", "rational", "diffusion"],
+        choices=["icar", "leroux", "multiscale_bump", "poly", "rational", "diffusion", "exp_decay", "exp_bump", "exp_sine"],
         help="Data-generating spectral truth.",
     )
 
@@ -1529,6 +1529,45 @@ def main():
         kappa_true = 4.0
 
         F_true = tau2_true * torch.exp(-kappa_true * x)
+        F_true = F_true.clamp_min(1e-12)
+    
+    elif args.truth == "exp_decay":
+        tau2_true = 0.4
+
+        a = 3.0
+        floor = 1e-2
+
+        F_true = floor + tau2_true * torch.exp(-a * x)
+        F_true = F_true.clamp_min(1e-12)
+    
+    elif args.truth == "exp_bump":
+        tau2_true = 0.4
+
+        #x = (lam / lam.max().clamp_min(1e-12)).clamp(0.0, 1.0)
+
+        a = 3.0       # global exponential decay
+        b = 1.25      # bump strength
+        x0 = 0.45     # mid-frequency location
+        s = 0.10      # bump width
+        floor = 1e-2
+
+        bump = torch.exp(-0.5 * ((x - x0) / s) ** 2)
+
+        F_true = floor + tau2_true * torch.exp(-a * x) * (1.0 + b * bump)
+        F_true = F_true.clamp_min(1e-12)
+    
+    elif args.truth == "exp_sine":
+        tau2_true = 0.4
+
+        x = (lam / lam.max().clamp_min(1e-12)).clamp(0.0, 1.0)
+
+        a = 3.0
+        b = 0.45
+        floor = 1e-2
+
+        F_true = floor + tau2_true * torch.exp(
+            -a * x + b * torch.sin(2.0 * math.pi * x)
+        )
         F_true = F_true.clamp_min(1e-12)
     
     else:
