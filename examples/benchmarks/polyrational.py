@@ -47,6 +47,17 @@ register(FilterSpec(
             step_s=0.12,
             step_theta=lambda f: {"log_tau2": 0.20, **{nm: 0.36 for nm in f.unconstrained_names() if nm.startswith("a")}},
         ),
+        "deg10": CaseSpec(
+            case_id="deg10",
+            display_name="poly_deg10_dec",
+            fixed={"degree": 10, "mode": "decreasing"},
+            build_filter=build_poly,
+            step_s=0.12,
+            step_theta=lambda f: {
+                "log_tau2": 0.20,
+                **{nm: 0.08 for nm in f.unconstrained_names() if nm.startswith("a")}
+            },
+        ),
     }
 ))
 
