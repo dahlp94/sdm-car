@@ -30,7 +30,8 @@ class SpectralCAR_FullVI(nn.Module):
                  num_mc: int = 5,
                  sigma2_prior: str = "logsigma2_normal",
                  sigma2_prior_params: dict | None = None,
-                 kl_sigma_mc: int = 8):
+                 kl_sigma_mc: int = 8,
+                 fixed_sigma2: float | None = None):
         super().__init__()
 
         # Data and spectrum
@@ -59,13 +60,34 @@ class SpectralCAR_FullVI(nn.Module):
         self.m_beta = torch.zeros(p, dtype=torch.double, device=device)
         self.V_beta = torch.eye(p, dtype=torch.double, device=device)
 
+        # ------------------------------------------
+        # Optional fixed sigma^2 diagnostic
+        # ------------------------------------------
+        self.fixed_sigma2 = None if fixed_sigma2 is None else float(fixed_sigma2)
+
+        if self.fixed_sigma2 is not None:
+            if self.fixed_sigma2 <= 0:
+                raise ValueError("fixed_sigma2 must be positive")
+            sigma_mu_init = math.log(self.fixed_sigma2)
+            sigma_requires_grad = False
+        else:
+            sigma_mu_init = float(mu_log_sigma2)
+            sigma_requires_grad = True
+
         # -------- We have unconstrained parameters here. --------
-        # q(log sigma2) = N(mu_log_sigma2, exp(...)^2), prior N(0,1)
+        # q(log sigma2) = N(mu_log_sigma2, exp(log_std)^2)
+        #
+        # When fixed_sigma2 is provided:
+        #   - mu_log_sigma2 is frozen at log(fixed_sigma2)
+        #   - log_std_log_sigma2 is frozen
+        #   - all sigma2-related methods explicitly return the fixed value
         self.mu_log_sigma2 = nn.Parameter(
-            torch.tensor([mu_log_sigma2], dtype=torch.double, device=device)
+            torch.tensor([sigma_mu_init], dtype=torch.double, device=device),
+            requires_grad=sigma_requires_grad,
         )
         self.log_std_log_sigma2 = nn.Parameter(
-            torch.tensor([log_std_log_sigma2], dtype=torch.double, device=device)
+            torch.tensor([log_std_log_sigma2], dtype=torch.double, device=device),
+            requires_grad = sigma_requires_grad,
         )
         
         # ---- Prior on s = log sigma^2 ----
@@ -93,14 +115,22 @@ class SpectralCAR_FullVI(nn.Module):
 
         Convention:
             - theta plugin = variational mean in unconstrained space
-            - sigma2 plugin = lognormal mean under q(s), s = log sigma^2
-                            = exp(mu + 0.5 * std^2)
+            - sigma2 plugin:
+                * fixed value if fixed_sigma2 is provided
+                * otherwise lognormal mean under q(s), s = log sigma^2
         """
         theta_u = self.filter.mean_unconstrained()
         theta_c = self.filter._constrain(theta_u)
 
-        std_s = torch.exp(self.log_std_log_sigma2)
-        sigma2_plugin = torch.exp(self.mu_log_sigma2 + 0.5 * std_s**2).clamp_min(1e-12)
+        if self.fixed_sigma2 is not None:
+            sigma2_plugin = torch.tensor(
+                [self.fixed_sigma2],
+                dtype=self.y.dtype,
+                device=self.y.device
+            ).clamp_min(1e-12)
+        else:
+            std_s = torch.exp(self.log_std_log_sigma2)
+            sigma2_plugin = torch.exp(self.mu_log_sigma2 + 0.5 * std_s**2).clamp_min(1e-12)
 
         return theta_u, theta_c, sigma2_plugin
     
@@ -121,6 +151,7 @@ class SpectralCAR_FullVI(nn.Module):
             - sigma2 = exp(s)
             - theta samples are drawn in unconstrained space
             - constrained parameters are produced via filter._constrain(...)
+            - when fixed_sigma2 is provided, all sigma2 draws equal that fixed value
         """
         K = int(num_mc)
         if K <= 0:
@@ -130,12 +161,18 @@ class SpectralCAR_FullVI(nn.Module):
         dtype = self.y.dtype
 
         # -------------------------
-        # Sample s = log sigma2
+        # Sample or fix s = log sigma2
         # -------------------------
-        eps = torch.randn((K,) + self.mu_log_sigma2.shape, dtype=dtype, device=device)
-        s_draws = self.mu_log_sigma2.unsqueeze(0) + torch.exp(self.log_std_log_sigma2).unsqueeze(0) * eps
-        s_draws = s_draws.reshape(K)
-        sigma2_draws = torch.exp(s_draws).clamp_min(1e-12)
+
+        if self.fixed_sigma2 is not None:
+            fixed_s = math.log(self.fixed_sigma2)
+            s_draws = torch.full((K,), fixed_s, dtype=dtype, device=device)
+            sigma2_draws = torch.full((K,), self.fixed_sigma2, dtype=dtype, device=device).clamp_min(1e-12)
+        else:
+            eps = torch.randn((K,) + self.mu_log_sigma2.shape, dtype=dtype, device=device)
+            s_draws = self.mu_log_sigma2.unsqueeze(0) + torch.exp(self.log_std_log_sigma2).unsqueeze(0) * eps
+            s_draws = s_draws.reshape(K)
+            sigma2_draws = torch.exp(s_draws).clamp_min(1e-12)
 
         # -------------------------
         # Sample theta in unconstrained space, then constrain
@@ -575,7 +612,13 @@ class SpectralCAR_FullVI(nn.Module):
         KL(q(s)||p(s)), where s=log sigma^2.
         Closed form for logsigma2_normal with N(0,1) (or any N).
         Otherwise MC estimate.
+        
+        If sigma^2 is fixed, there is no variational distribution over sigma^2,
+        so this contribution is zero
         """
+        if self.fixed_sigma2 is not None:
+            return torch.zeros((), dtype=self.y.dtype, device=self.y.device)
+
         name = self.sigma2_prior
 
         # closed form ONLY when p(s) is standard normal AND q is normal OR more generally normal-normal
@@ -629,10 +672,18 @@ class SpectralCAR_FullVI(nn.Module):
         last_sigma2 = None
 
         for _ in range(num_mc):
-            # ---- Sample s = log sigma2 from q(s) ----
-            eps_sig = torch.randn_like(self.mu_log_sigma2)
-            s = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps_sig
-            sigma2 = torch.exp(s).clamp_min(1e-12)  # scalar tensor
+            # -------------- sample or fix sigma2 -------------------------
+            if self.fixed_sigma2 is not None:
+                sigma2 = torch.tensor(
+                    [self.fixed_sigma2],
+                    dtype=self.y.dtype,
+                    device=self.y.device
+                ).clamp_min(1e-12)
+            else:
+                eps_sig = torch.randn_like(self.mu_log_sigma2)
+                s = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps_sig
+                sigma2 = torch.exp(s).clamp_min(1e-12)
+            
             last_sigma2 = sigma2
 
             # ---- Sample filter hyperparameters theta (unconstrained) from q(filter) ----
@@ -698,6 +749,12 @@ class SpectralCAR_FullVI(nn.Module):
         Returns:
             mean_phi : [n]
             var_phi_diag : [n]
+
+        Notes:
+        - plugin mode uses plugin_hyperparams()
+        - mc mode averages over q(theta) and:
+            * fixed sigma2 if self.fixed_sigma2 is not None
+            * sampled sigma2 otherwise
         """
 
         # ---------------------------
@@ -736,10 +793,19 @@ class SpectralCAR_FullVI(nn.Module):
             mean2_acc = torch.zeros(n, dtype=self.y.dtype, device=self.y.device)
 
             for _ in range(int(num_mc)):
-                # sample s = log sigma2
-                eps = torch.randn_like(self.mu_log_sigma2)
-                s = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps
-                sigma2 = torch.exp(s).clamp_min(1e-12)
+                # ------------------------------
+                # Sample or fix sigma2
+                # ------------------------------
+                if self.fixed_sigma2 is not None:
+                    sigma2 = torch.tensor(
+                        [self.fixed_sigma2],
+                        dtype=self.y.dtype,
+                        device=self.y.device
+                    ).clamp_min(1e-12)
+                else:
+                    eps = torch.randn_like(self.mu_log_sigma2)
+                    s = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps
+                    sigma2 = torch.exp(s).clamp_min(1e-12)
 
                 # sample theta
                 theta = self.filter.sample_unconstrained()
@@ -831,10 +897,19 @@ class SpectralCAR_FullVI(nn.Module):
             ll_list = []
 
             for _ in range(K):
-                # sample s = log sigma2
-                eps = torch.randn_like(self.mu_log_sigma2)
-                s = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps
-                sigma2 = torch.exp(s).clamp_min(1e-12)
+                # ----------------------------------------------------
+                # Sample or fix sigma2
+                # ----------------------------------------------------
+                if self.fixed_sigma2 is not None:
+                    sigma2 = torch.tensor(
+                        [self.fixed_sigma2],
+                        dtype=y.dtype,
+                        device=y.device
+                    ).clamp_min(1e-12)
+                else:
+                    eps = torch.randn_like(self.mu_log_sigma2)
+                    s = self.mu_log_sigma2 + torch.exp(self.log_std_log_sigma2) * eps
+                    sigma2 = torch.exp(s).clamp_min(1e-12)
 
                 # sample theta
                 theta = self.filter.sample_unconstrained()
