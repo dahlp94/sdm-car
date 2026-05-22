@@ -344,7 +344,7 @@ def spectral_plot_axis(
             "logfreq",
         )
 
-    if filter_name in {"poly", "rational", "bernstein_log"}:
+    if filter_name in {"poly", "rational", "bernstein_log", "logpoly_shrink", "truncated_cubic_spline"}:
         x = (lam / lam.max().clamp_min(1e-12)).clamp(0.0, 1.0)
         return (
             x,
@@ -371,11 +371,66 @@ def resolve_fixed_tokens(fixed: dict, eps_car: float) -> dict:
     return out
 
 
+# def unpack_filter_params_from_means(filter_module):
+#     """
+#     Generic: uses mean_unconstrained() + _constrain() if available.
+#     Falls back to legacy mean_params() if needed.
+#     Returns scalars where possible.
+#     """
+#     # New-style API
+#     if hasattr(filter_module, "mean_unconstrained") and hasattr(filter_module, "_constrain"):
+#         theta_mean = filter_module.mean_unconstrained()
+#         c = filter_module._constrain(theta_mean)
+
+#         out = {
+#             "tau2": c.get("tau2", None),
+#             "rho0": c.get("rho0", None),
+#             "nu":   c.get("nu", None),
+#         }
+
+#         # Optional extras you may want later
+#         # poly/rational:
+#         if "a" in c:
+#             out["a"] = c["a"]
+#         if "b" in c:
+#             out["b"] = c["b"]
+
+#         # reshape scalars
+#         for k in ("tau2", "rho0", "nu"):
+#             if out.get(k, None) is not None:
+#                 out[k] = out[k].reshape(())
+
+#         return out
+
+#     # Legacy API fallback
+#     if hasattr(filter_module, "mean_params"):
+#         tau2_m, a_m = filter_module.mean_params()
+#         a_flat = a_m.reshape(-1)
+
+#         rho0_m = None
+#         nu_m = None
+#         if a_flat.numel() == 2:
+#             rho0_m = a_flat[0]
+#             nu_m = a_flat[1]
+#         elif a_flat.numel() == 1:
+#             rho0_m = a_flat[0]
+
+#         return {
+#             "tau2": tau2_m.reshape(()),
+#             "rho0": None if rho0_m is None else rho0_m.reshape(()),
+#             "nu": None if nu_m is None else nu_m.reshape(()),
+#         }
+
+#     raise AttributeError(
+#         f"{type(filter_module).__name__} must implement either "
+#         f"(mean_unconstrained + _constrain) or mean_params()."
+#     )
+
 def unpack_filter_params_from_means(filter_module):
     """
     Generic: uses mean_unconstrained() + _constrain() if available.
     Falls back to legacy mean_params() if needed.
-    Returns scalars where possible.
+    Returns scalars where possible and preserves vector parameters.
     """
     # New-style API
     if hasattr(filter_module, "mean_unconstrained") and hasattr(filter_module, "_constrain"):
@@ -385,18 +440,27 @@ def unpack_filter_params_from_means(filter_module):
         out = {
             "tau2": c.get("tau2", None),
             "rho0": c.get("rho0", None),
-            "nu":   c.get("nu", None),
+            "nu": c.get("nu", None),
+
+            # Optional scale-like / diagnostic quantities
+            "scale": c.get("scale", None),
+
+            # Polynomial / rational coefficients
+            "a": c.get("a", None),
+            "b": c.get("b", None),
+
+            # Log-polynomial shrinkage coefficients
+            "c": c.get("c", None),
+
+            # Sparse bump amplitudes
+            "A": c.get("A", None),
+            "effective_A": c.get("effective_A", None),
+            "centers": c.get("centers", None),
+            "widths": c.get("widths", None),
         }
 
-        # Optional extras you may want later
-        # poly/rational:
-        if "a" in c:
-            out["a"] = c["a"]
-        if "b" in c:
-            out["b"] = c["b"]
-
-        # reshape scalars
-        for k in ("tau2", "rho0", "nu"):
+        # reshape scalar-like entries
+        for k in ("tau2", "rho0", "nu", "scale"):
             if out.get(k, None) is not None:
                 out[k] = out[k].reshape(())
 
@@ -419,6 +483,14 @@ def unpack_filter_params_from_means(filter_module):
             "tau2": tau2_m.reshape(()),
             "rho0": None if rho0_m is None else rho0_m.reshape(()),
             "nu": None if nu_m is None else nu_m.reshape(()),
+            "scale": None,
+            "a": a_m,
+            "b": None,
+            "c": None,
+            "A": None,
+            "effective_A": None,
+            "centers": None,
+            "widths": None,
         }
 
     raise AttributeError(
@@ -511,6 +583,7 @@ def run_case(
     mcmc_num_steps: int = 30000,
     mcmc_burnin: int = 10000,
     mcmc_thin: int = 10,
+    fix_sigma2: bool = False,
 ):
     fixed = resolve_fixed_tokens(case_spec.fixed, eps_car=eps_car)
 
@@ -547,6 +620,7 @@ def run_case(
         mu_log_sigma2=math.log(sigma2_true),
         log_std_log_sigma2=-2.3,
         num_mc=vi_num_mc,
+        fixed_sigma2=sigma2_true if fix_sigma2 else None,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=vi_lr)
@@ -572,6 +646,14 @@ def run_case(
                 rho0_m = theta_plugin_c.get("rho0", None)
                 nu_m = theta_plugin_c.get("nu", None)
 
+                # logpoly_shrink uses scale=exp(c0), not tau2
+                scale_m = theta_plugin_c.get("scale", None)
+                c_m = theta_plugin_c.get("c", None)
+
+                # sparse_fixed_bump diagnostics
+                A_m = theta_plugin_c.get("A", None)
+                effective_A_m = theta_plugin_c.get("effective_A", None)
+
                 mu_s = model.mu_log_sigma2.detach()
                 std_s = torch.exp(model.log_std_log_sigma2.detach())
 
@@ -579,8 +661,31 @@ def run_case(
                 sigma2_mean = torch.exp(mu_s + 0.5 * std_s**2).item()
                 beta_m = model.m_beta.detach().cpu().numpy()
 
-            nu_str = "NA" if nu_m is None else f"{nu_m.item():.3f}"
+            tau2_str = "NA" if tau2_m is None else f"{tau2_m.item():.3f}"
             rho0_str = "NA" if rho0_m is None else f"{rho0_m.item():.6f}"
+            nu_str = "NA" if nu_m is None else f"{nu_m.item():.3f}"
+            scale_str = "NA" if scale_m is None else f"{scale_m.item():.3f}"
+
+            # compact coefficient diagnostics for logpoly_shrink
+            if c_m is not None:
+                c_np = c_m.detach().cpu().numpy()
+                c_str = ", ".join(
+                    [f"c{j}={c_np[j]:+.3f}" for j in range(min(4, len(c_np)))]
+                )
+            else:
+                c_str = "NA"
+
+            # compact amplitude diagnostics for sparse_fixed_bump
+            if effective_A_m is not None:
+                eff_np = effective_A_m.detach().cpu().numpy()
+                top_idx = np.argsort(-eff_np)[:3]
+                A_top_str = ", ".join([f"eA{j}={eff_np[j]:.3f}" for j in top_idx])
+            elif A_m is not None:
+                A_np = A_m.detach().cpu().numpy()
+                top_idx = np.argsort(-A_np)[:3]
+                A_top_str = ", ".join([f"A{j}={A_np[j]:.3f}" for j in top_idx])
+            else:
+                A_top_str = "NA"
 
             print(
                 f"[VI {it+1:04d}] ELBO={elbo.item():.2f} "
@@ -588,7 +693,8 @@ def run_case(
                 f"KLbeta={stats['mc_kl_beta'].item():.2f} "
                 f"KLfilt={stats['kl_filter'].item():.2f} "
                 f"KLsig={stats['kl_sigma2'].item():.2f} "
-                f"tau2={tau2_m.item():.3f} rho0={rho0_str} nu={nu_str} "
+                f"tau2={tau2_str} scale={scale_str} rho0={rho0_str} nu={nu_str} "
+                f"coeffs={c_str} A_top={A_top_str} "
                 f"sigma2_med={sigma2_median:.4f} sigma2_mean={sigma2_mean:.4f} beta={beta_m}"
             )
 
@@ -661,7 +767,7 @@ def run_case(
         num_steps=mcmc_num_steps,
         burnin=mcmc_burnin,
         thin=mcmc_thin,
-        step_s=float(case_spec.step_s),
+        step_s=0.0 if fix_sigma2 else float(case_spec.step_s),
         step_theta=case_spec.get_step_theta(model.filter),
         seed=0,
         device=device,
@@ -1268,9 +1374,9 @@ def run_case(
         "spec_wl2_vi_plugin": spec_wl2_vi_plugin,
         "spec_wl2_vi_mc": spec_wl2_vi_mc,
         "spec_wl2_mcmc": spec_wl2_mcmc,
-        "total_wl2_vi_plugin": spec_wl2_vi_plugin,
-        "total_wl2_vi_mc": spec_wl2_vi_mc,
-        "total_wl2_mcmc": spec_wl2_mcmc,
+        "total_wl2_vi_plugin": total_wl2_vi_plugin,
+        "total_wl2_vi_mc": total_wl2_vi_mc,
+        "total_wl2_mcmc": total_wl2_mcmc,
         "acc_s": acc["s"][2],
         "acc_theta": {k: v[2] for k, v in acc["theta"].items()},
         "vi_plugin": {
@@ -1350,9 +1456,9 @@ def run_case(
                 "spec_wl2_vi_plugin": summary["spec_wl2_vi_plugin"],
                 "spec_wl2_vi_mc": summary["spec_wl2_vi_mc"],
                 "spec_wl2_mcmc": summary["spec_wl2_mcmc"],
-                "total_wl2_vi_plugin": summary["spec_wl2_vi_plugin"],
-                "total_wl2_vi_mc": summary["spec_wl2_vi_mc"],
-                "total_wl2_mcmc": summary["spec_wl2_mcmc"],
+                "total_wl2_vi_plugin": summary["total_wl2_vi_plugin"],
+                "total_wl2_vi_mc": summary["total_wl2_vi_mc"],
+                "total_wl2_mcmc": summary["total_wl2_mcmc"],
                 "acc_s": summary["acc_s"],
                 "acc_theta": summary["acc_theta"],
                 "vi_plugin": summary["vi_plugin"],
@@ -1390,18 +1496,29 @@ def main():
     parser.add_argument("--mcmc_burnin", type=int, default=10000)
     parser.add_argument("--mcmc_thin", type=int, default=10)
 
+    # Optional grid size controls
+    parser.add_argument("--nx", type=int, default=40)
+    parser.add_argument("--ny", type=int, default=40)
+
     parser.add_argument(
         "--truth",
         default="icar",
-        choices=["icar", "leroux", "multiscale_bump", "poly", "rational", "diffusion", "exp_decay", "exp_bump", "exp_sine"],
+        choices=["icar", "leroux", "multiscale_bump", "poly", "rational", "diffusion", "exp_decay", "exp_bump", "exp_sine", 
+                 "loglinear_spectrum"],
         help="Data-generating spectral truth.",
     )
 
     parser.add_argument(
-    "--fast",
-    action="store_true",
-    help="Fast mode for CI / smoke tests (fewer VI iters and MCMC steps)",
-)
+        "--fast",
+        action="store_true",
+        help="Fast mode for CI / smoke tests (fewer VI iters and MCMC steps)",
+    )
+
+    parser.add_argument(
+        "--fix_sigma2",
+        action="store_true",
+        help="Fix sigma2 to the true data-generating value for diagnostic runs.",
+    )
 
     # print("--- I am here ---")
     # print()
@@ -1449,7 +1566,7 @@ def main():
     # --------------------------------------------
     # 1) Grid + Laplacian + eigendecomp
     # --------------------------------------------
-    nx, ny = 40, 40
+    nx, ny = int(args.nx), int(args.ny)
     xs = torch.linspace(0.0, 1.0, nx, dtype=torch.double, device=device)
     ys = torch.linspace(0.0, 1.0, ny, dtype=torch.double, device=device)
     Xg, Yg = torch.meshgrid(xs, ys, indexing="ij")
@@ -1472,6 +1589,7 @@ def main():
 
     if args.truth == "icar":
         F_true = tau2_true / (lam + eps_car)
+        F_true - F_true.clamp_min(1e-12)
     
     elif args.truth == "leroux":
         tau2_true = 0.4
@@ -1543,8 +1661,6 @@ def main():
     elif args.truth == "exp_bump":
         tau2_true = 0.4
 
-        #x = (lam / lam.max().clamp_min(1e-12)).clamp(0.0, 1.0)
-
         a = 3.0       # global exponential decay
         b = 1.25      # bump strength
         x0 = 0.45     # mid-frequency location
@@ -1559,8 +1675,6 @@ def main():
     elif args.truth == "exp_sine":
         tau2_true = 0.4
 
-        x = (lam / lam.max().clamp_min(1e-12)).clamp(0.0, 1.0)
-
         a = 3.0
         b = 0.45
         floor = 1e-2
@@ -1569,6 +1683,21 @@ def main():
             -a * x + b * torch.sin(2.0 * math.pi * x)
         )
         F_true = F_true.clamp_min(1e-12)
+    
+    elif args.truth == "loglinear_spectrum":
+        floor = 1e-2
+        c0 = math.log(0.4)
+        c1 = -3.0
+
+        F_true = floor + torch.exp(c0 + c1 * x)
+        F_true = F_true.clamp_min(1e-12)
+
+        tau2_true = math.exp(c0)
+
+        print(
+            f"[TRUTH] loglinear_spectrum floor={floor} "
+            f"c0={c0:.4f} c1={c1:.4f}"
+        )
     
     else:
         raise ValueError(f"Unknown truth: {args.truth}")
@@ -1579,6 +1708,9 @@ def main():
     print(f"[TRUTH] F_true min={F_true.min().item():.6g}, max={F_true.max().item():.6g}")
 
 
+    # ----------------------------------
+    # 3) Simulate data
+    # ----------------------------------
     z_true = torch.sqrt(F_true) * torch.randn(n, dtype=torch.double, device=device)
     phi_true = U @ z_true
 
@@ -1588,6 +1720,9 @@ def main():
     sigma2_true = 0.1
     y = X @ beta_true + phi_true + math.sqrt(sigma2_true) * torch.randn(n, dtype=torch.double, device=device)
 
+    if args.fix_sigma2:
+        print(f"[DIAG] fix_sigma2=True, fixed sigma2={sigma2_true:.6f}")
+    
     # Prior on beta
     sigma2_beta = 10.0
     prior_V0 = sigma2_beta * torch.eye(X.shape[1], dtype=torch.double, device=device)
@@ -1612,6 +1747,7 @@ def main():
                 mcmc_num_steps=args.mcmc_steps,
                 mcmc_burnin=args.mcmc_burnin,
                 mcmc_thin=args.mcmc_thin,
+                fix_sigma2=args.fix_sigma2,
             )
         )
 
