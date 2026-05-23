@@ -2015,3 +2015,555 @@ class BernsteinLogSpectrumFilterFullVI(BaseSpectralFilter):
     def mean_params(self):
         tau2 = torch.exp(self.mu_log_tau2.detach()).reshape(())
         return tau2, self.mu_c.detach()
+
+class LogPolyShrinkFilterFullVI(BaseSpectralFilter):
+    """
+    Log-polynomial shrinkage spectral filter.
+
+        F(lam) = floor + exp( c0 + c1 x + c2 x^2 + ... + cK x^K )
+
+    where
+
+        x = lam / lam_max in [0, 1].
+
+    This filter is intended for shrinkage experiments.
+
+    Example truth:
+
+        log(F_true - floor) = c0 + c1 x
+
+    and the fitted model uses degree K=10. Then coefficients c2,...,cK
+    are unnecessary and should shrink toward zero under the prior.
+
+    There is no separate tau2 parameter because c0 already controls the
+    global spectral scale. Including both tau2 and c0 would create
+    non-identifiability:
+
+        tau2 * exp(c0) = exp(log(tau2) + c0).
+    """
+
+    def __init__(
+        self,
+        *,
+        lam_max: float,
+        degree: int = 10,
+        floor: float = 1e-2,
+        init_c0: float = -1.0,
+        init_c1: float = -1.0,
+        init_other: float = 0.0,
+        log_std0: float = -2.3,
+        prior_mu_c0: float = -1.0,
+        prior_std_c0: float = 1.0,
+        prior_mu_rest: float = 0.0,
+        prior_std_rest: float = 0.5,
+        logF_min: float = -30.0,
+        logF_max: float = 30.0,
+    ):
+        super().__init__()
+
+        if lam_max <= 0:
+            raise ValueError("lam_max must be positive.")
+        if degree < 1:
+            raise ValueError("degree must be at least 1.")
+        if floor < 0:
+            raise ValueError("floor must be nonnegative.")
+        if prior_std_c0 <= 0:
+            raise ValueError("prior_std_c0 must be positive.")
+        if prior_std_rest <= 0:
+            raise ValueError("prior_std_rest must be positive.")
+        if logF_min >= logF_max:
+            raise ValueError("logF_min must be smaller than logF_max.")
+
+        self.lam_max = float(lam_max)
+        self.degree = int(degree)
+        self.floor = float(floor)
+
+        self.prior_mu_c0 = float(prior_mu_c0)
+        self.prior_std_c0 = float(prior_std_c0)
+        self.prior_mu_rest = float(prior_mu_rest)
+        self.prior_std_rest = float(prior_std_rest)
+
+        self.logF_min = float(logF_min)
+        self.logF_max = float(logF_max)
+
+        init = torch.full(
+            (self.degree + 1,),
+            float(init_other),
+            dtype=torch.double,
+        )
+        init[0] = float(init_c0)
+        init[1] = float(init_c1)
+
+        self.mu_c = nn.Parameter(init)
+        self.log_std_c = nn.Parameter(
+            torch.full((self.degree + 1,), float(log_std0), dtype=torch.double)
+        )
+
+    def unconstrained_names(self) -> list[str]:
+        return [f"c{k}_raw" for k in range(self.degree + 1)]
+
+    def blocks(self) -> list[ParamBlock]:
+        return [
+            ParamBlock.single("c0_raw"),
+            ParamBlock(
+                name="c_rest_raw",
+                param_names=tuple(
+                    f"c{k}_raw" for k in range(1, self.degree + 1)
+                ),
+            ),
+        ]
+
+    def _constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        c = torch.stack(
+            [
+                theta[f"c{k}_raw"].reshape(())
+                for k in range(self.degree + 1)
+            ],
+            dim=0,
+        )
+
+        return {
+            "c": c,
+            "scale": torch.exp(c[0]),
+        }
+
+    def spectrum_from_unconstrained(
+        self,
+        lam: torch.Tensor,
+        theta: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        lam = lam.clamp_min(0.0)
+
+        x = (lam / float(self.lam_max)).clamp(0.0, 1.0)
+
+        c = self._constrain(theta)["c"]
+
+        powers = torch.stack(
+            [x ** k for k in range(self.degree + 1)],
+            dim=0,
+        )  # [degree+1, n]
+
+        logF = (c[:, None] * powers).sum(dim=0)
+        logF = logF.clamp(self.logF_min, self.logF_max)
+
+        F = self.floor + torch.exp(logF)
+
+        return F.clamp_min(1e-12).reshape(-1)
+
+    def sample_unconstrained(self) -> dict[str, torch.Tensor]:
+        eps = torch.randn_like(self.mu_c)
+        c = self.mu_c + torch.exp(self.log_std_c) * eps
+
+        out: dict[str, torch.Tensor] = {}
+        for k in range(self.degree + 1):
+            out[f"c{k}_raw"] = c[k:k + 1]
+
+        return out
+
+    @torch.no_grad()
+    def mean_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+        for k in range(self.degree + 1):
+            out[f"c{k}_raw"] = self.mu_c[k:k + 1].detach()
+        return out
+
+    def log_prior(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        anchor = theta["c0_raw"]
+        dtype, device = anchor.dtype, anchor.device
+
+        c = torch.stack(
+            [
+                theta[f"c{k}_raw"].reshape(())
+                for k in range(self.degree + 1)
+            ],
+            dim=0,
+        )
+
+        mu0 = torch.tensor(self.prior_mu_c0, dtype=dtype, device=device)
+        sd0 = torch.tensor(self.prior_std_c0, dtype=dtype, device=device)
+
+        mur = torch.tensor(self.prior_mu_rest, dtype=dtype, device=device)
+        sdr = torch.tensor(self.prior_std_rest, dtype=dtype, device=device)
+
+        logp0 = Normal(mu0, sd0).log_prob(c[0])
+        logprest = Normal(mur, sdr).log_prob(c[1:]).sum()
+
+        return logp0 + logprest
+
+    def kl_q_p(self) -> torch.Tensor:
+        kl0 = kl_normal_to_normal(
+            self.mu_c[0:1],
+            self.log_std_c[0:1],
+            mu_p=self.prior_mu_c0,
+            std_p=self.prior_std_c0,
+        ).sum()
+
+        klrest = kl_normal_to_normal(
+            self.mu_c[1:],
+            self.log_std_c[1:],
+            mu_p=self.prior_mu_rest,
+            std_p=self.prior_std_rest,
+        ).sum()
+
+        return kl0 + klrest
+
+    @torch.no_grad()
+    def mean_params(self):
+        """
+        Compatibility helper.
+
+        No tau2 exists in this model. We return exp(c0) as a scale-like
+        quantity and the full coefficient vector as the second output.
+        """
+        c = self.mu_c.detach()
+        scale = torch.exp(c[0]).reshape(())
+        return scale, c
+
+    @torch.no_grad()
+    def coefficient_summary(self):
+        """
+        Convenience helper for shrinkage diagnostics.
+
+        Returns posterior mean coefficients on the natural coefficient scale.
+        """
+        return self.mu_c.detach().clone()
+
+class TruncatedCubicSplineSpectrumFullVI(BaseSpectralFilter):
+    """
+    Nonparametric spectral density model using a truncated cubic spline basis.
+
+        x = lam / lam_max in [0, 1]
+
+        log F(lam) = g(x)
+
+        g(x) =
+            theta_0
+            + theta_1 x
+            + theta_2 x^2
+            + theta_3 x^3
+            + sum_{k=1}^K alpha_k (x - knot_k)_+^3
+
+        F(lam) = exp(g(x))
+
+    The knots are fixed and evenly spaced in (0, 1).
+
+    Variational family:
+        diagonal Gaussian over all unconstrained coefficients:
+            theta_0, ..., theta_3
+            alpha_0, ..., alpha_{K-1}
+
+    Priors:
+        theta_i ~ N(0, prior_std_theta^2)
+        alpha_k ~ N(0, prior_std_alpha^2)
+
+    Notes:
+        - No CAR baseline is included.
+        - No tau2 parameter is included.
+        - No log-frequency transform is used.
+        - No anchoring is used.
+    """
+
+    def __init__(
+        self,
+        *,
+        lam_max: float,
+        K: int = 8,
+        prior_std_theta: float = 2.0,
+        prior_std_alpha: float = 0.5,
+        log_std0: float = -2.3,
+        init_theta: list[float] | None = None,
+        init_alpha: float = 0.0,
+        logF_min: float = -30.0,
+        logF_max: float = 30.0,
+    ):
+        super().__init__()
+
+        if lam_max <= 0:
+            raise ValueError("lam_max must be positive.")
+        if K < 0:
+            raise ValueError("K must be nonnegative.")
+        if prior_std_theta <= 0:
+            raise ValueError("prior_std_theta must be positive.")
+        if prior_std_alpha <= 0:
+            raise ValueError("prior_std_alpha must be positive.")
+        if logF_min >= logF_max:
+            raise ValueError("logF_min must be smaller than logF_max.")
+
+        self.lam_max = float(lam_max)
+        self.K = int(K)
+
+        self.prior_std_theta = float(prior_std_theta)
+        self.prior_std_alpha = float(prior_std_alpha)
+
+        self.logF_min = float(logF_min)
+        self.logF_max = float(logF_max)
+
+        # Evenly spaced knots in (0, 1)
+        if self.K > 0:
+            knots = torch.linspace(
+                0.0,
+                1.0,
+                self.K + 2,
+                dtype=torch.double,
+            )[1:-1]
+        else:
+            knots = torch.empty(0, dtype=torch.double)
+
+        self.register_buffer("knots", knots)
+
+        # Initialize theta coefficients
+        if init_theta is None:
+            init_theta = [0.0, 0.0, 0.0, 0.0]
+
+        if len(init_theta) != 4:
+            raise ValueError("init_theta must contain exactly 4 values.")
+
+        self.mu_theta = nn.Parameter(
+            torch.tensor(init_theta, dtype=torch.double)
+        )
+        self.log_std_theta = nn.Parameter(
+            torch.full((4,), float(log_std0), dtype=torch.double)
+        )
+
+        # Initialize truncated cubic spline coefficients
+        self.mu_alpha = nn.Parameter(
+            torch.full((self.K,), float(init_alpha), dtype=torch.double)
+        )
+        self.log_std_alpha = nn.Parameter(
+            torch.full((self.K,), float(log_std0), dtype=torch.double)
+        )
+
+    def unconstrained_names(self) -> list[str]:
+        names = [f"theta{i}_raw" for i in range(4)]
+        names += [f"alpha{k}_raw" for k in range(self.K)]
+        return names
+
+    def blocks(self) -> list[ParamBlock]:
+        blocks = [
+            ParamBlock(
+                name="theta_raw",
+                param_names=tuple(f"theta{i}_raw" for i in range(4)),
+            )
+        ]
+
+        if self.K > 0:
+            blocks.append(
+                ParamBlock(
+                    name="alpha_raw",
+                    param_names=tuple(f"alpha{k}_raw" for k in range(self.K)),
+                )
+            )
+
+        return blocks
+
+    def sample_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+
+        eps_theta = torch.randn_like(self.mu_theta)
+        theta = self.mu_theta + torch.exp(self.log_std_theta) * eps_theta
+
+        for i in range(4):
+            out[f"theta{i}_raw"] = theta[i:i + 1]
+
+        if self.K > 0:
+            eps_alpha = torch.randn_like(self.mu_alpha)
+            alpha = self.mu_alpha + torch.exp(self.log_std_alpha) * eps_alpha
+
+            for k in range(self.K):
+                out[f"alpha{k}_raw"] = alpha[k:k + 1]
+
+        return out
+
+    @torch.no_grad()
+    def mean_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+
+        for i in range(4):
+            out[f"theta{i}_raw"] = self.mu_theta[i:i + 1].detach()
+
+        for k in range(self.K):
+            out[f"alpha{k}_raw"] = self.mu_alpha[k:k + 1].detach()
+
+        return out
+
+    def _constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        theta_vec = torch.stack(
+            [
+                theta[f"theta{i}_raw"].reshape(())
+                for i in range(4)
+            ],
+            dim=0,
+        )
+
+        if self.K > 0:
+            alpha_vec = torch.stack(
+                [
+                    theta[f"alpha{k}_raw"].reshape(())
+                    for k in range(self.K)
+                ],
+                dim=0,
+            )
+        else:
+            alpha_vec = theta_vec.new_empty((0,))
+
+        coef = torch.cat([theta_vec, alpha_vec], dim=0)
+
+        return {
+            "theta": theta_vec,
+            "alpha": alpha_vec,
+            "coef": coef,
+        }
+
+    def spectrum_from_unconstrained(
+        self,
+        lam: torch.Tensor,
+        theta: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        x = (lam / float(self.lam_max)).clamp(0.0, 1.0)
+
+        ones = torch.ones_like(x)
+
+        poly = torch.stack(
+            [
+                ones,
+                x,
+                x**2,
+                x**3,
+            ],
+            dim=1,
+        )  # [n, 4]
+
+        c = self._constrain(theta)
+        theta_vec = c["theta"]
+        alpha_vec = c["alpha"]
+
+        if self.K > 0:
+            knots = self.knots.to(dtype=x.dtype, device=x.device)
+            # truncated = torch.relu(
+            #     x[:, None] - knots[None, :]
+            # ) ** 3  # [n, K]
+            raw_truncated = torch.relu(x[:, None] - knots[None, :]) ** 3
+            denom = (1.0 - knots).clamp_min(1e-12) ** 3
+            truncated = raw_truncated / denom[None, :]
+
+            B = torch.cat([poly, truncated], dim=1)  # [n, 4+K]
+            coef = torch.cat([theta_vec, alpha_vec], dim=0)
+        else:
+            B = poly
+            coef = theta_vec
+
+        logF = B @ coef
+        logF = logF.clamp(self.logF_min, self.logF_max)
+
+        F = torch.exp(logF).clamp_min(1e-12)
+
+        return F.reshape(-1)
+
+    def log_prior(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        anchor = theta["theta0_raw"]
+        dtype, device = anchor.dtype, anchor.device
+
+        theta_vec = torch.stack(
+            [
+                theta[f"theta{i}_raw"].reshape(())
+                for i in range(4)
+            ],
+            dim=0,
+        )
+
+        theta_prior = Normal(
+            torch.tensor(0.0, dtype=dtype, device=device),
+            torch.tensor(self.prior_std_theta, dtype=dtype, device=device),
+        )
+
+        logp = theta_prior.log_prob(theta_vec).sum()
+
+        if self.K > 0:
+            alpha_vec = torch.stack(
+                [
+                    theta[f"alpha{k}_raw"].reshape(())
+                    for k in range(self.K)
+                ],
+                dim=0,
+            )
+
+            alpha_prior = Normal(
+                torch.tensor(0.0, dtype=dtype, device=device),
+                torch.tensor(self.prior_std_alpha, dtype=dtype, device=device),
+            )
+
+            logp = logp + alpha_prior.log_prob(alpha_vec).sum()
+
+        return logp
+
+    def kl_q_p(self) -> torch.Tensor:
+        kl_theta = kl_normal_to_normal(
+            self.mu_theta,
+            self.log_std_theta,
+            mu_p=0.0,
+            std_p=self.prior_std_theta,
+        ).sum()
+
+        if self.K > 0:
+            kl_alpha = kl_normal_to_normal(
+                self.mu_alpha,
+                self.log_std_alpha,
+                mu_p=0.0,
+                std_p=self.prior_std_alpha,
+            ).sum()
+        else:
+            kl_alpha = torch.zeros(
+                (),
+                dtype=self.mu_theta.dtype,
+                device=self.mu_theta.device,
+            )
+
+        return kl_theta + kl_alpha
+
+    @torch.no_grad()
+    def mean_params(self):
+        """
+        Compatibility helper.
+
+        There is no tau2 parameter. We return exp(theta0) as a scale-like
+        quantity and the full coefficient vector as the second object.
+        """
+        theta_mean = self.mu_theta.detach()
+        alpha_mean = self.mu_alpha.detach()
+
+        scale_like = torch.exp(theta_mean[0]).reshape(())
+        coef = torch.cat([theta_mean, alpha_mean], dim=0)
+
+        return scale_like, coef
+
+    @torch.no_grad()
+    def shrinkage_summary(self):
+        """
+        Convenience diagnostics for spline flexibility.
+
+        Returns:
+            theta: posterior mean polynomial coefficients
+            alpha: posterior mean spline coefficients
+            alpha_l1: total absolute spline mass
+            alpha_l2: Euclidean spline mass
+            max_abs_alpha: largest absolute spline coefficient
+        """
+        theta = self.mu_theta.detach().clone()
+        alpha = self.mu_alpha.detach().clone()
+
+        if self.K > 0:
+            alpha_l1 = torch.sum(torch.abs(alpha))
+            alpha_l2 = torch.sqrt(torch.sum(alpha**2))
+            max_abs_alpha = torch.max(torch.abs(alpha))
+        else:
+            alpha_l1 = theta.new_tensor(0.0)
+            alpha_l2 = theta.new_tensor(0.0)
+            max_abs_alpha = theta.new_tensor(0.0)
+
+        return {
+            "theta": theta,
+            "alpha": alpha,
+            "alpha_l1": alpha_l1.reshape(()),
+            "alpha_l2": alpha_l2.reshape(()),
+            "max_abs_alpha": max_abs_alpha.reshape(()),
+        }
