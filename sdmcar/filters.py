@@ -2272,7 +2272,7 @@ class TruncatedCubicSplineSpectrumFullVI(BaseSpectralFilter):
         prior_std_alpha: float = 0.5,
         log_std0: float = -2.3,
         init_theta: list[float] | None = None,
-        init_alpha: float = 0.0,
+        init_alpha: float | list[float] | tuple[float, ...] | torch.Tensor = 0.0,
         logF_min: float = -30.0,
         logF_max: float = 30.0,
     ):
@@ -2325,10 +2325,39 @@ class TruncatedCubicSplineSpectrumFullVI(BaseSpectralFilter):
             torch.full((4,), float(log_std0), dtype=torch.double)
         )
 
-        # Initialize truncated cubic spline coefficients
-        self.mu_alpha = nn.Parameter(
-            torch.full((self.K,), float(init_alpha), dtype=torch.double)
-        )
+        # Initialize truncated cubic spline coefficients alpha
+        if self.K > 0:
+            if isinstance(init_alpha, torch.Tensor):
+                alpha_init = init_alpha.detach().clone().to(dtype=torch.double).reshape(-1)
+
+                if alpha_init.numel() != self.K:
+                    raise ValueError(
+                        f"init_alpha tensor must have length K={self.K}, "
+                        f"got {alpha_init.numel()}."
+                    )
+
+            elif isinstance(init_alpha, (list, tuple)):
+                if len(init_alpha) != self.K:
+                    raise ValueError(
+                        f"init_alpha list/tuple must have length K={self.K}, "
+                        f"got {len(init_alpha)}."
+                    )
+
+                alpha_init = torch.tensor(
+                    list(init_alpha),
+                    dtype=torch.double,
+                )
+
+            else:
+                alpha_init = torch.full(
+                    (self.K,),
+                    float(init_alpha),
+                    dtype=torch.double,
+                )
+        else:
+            alpha_init = torch.empty(0, dtype=torch.double)
+
+        self.mu_alpha = nn.Parameter(alpha_init)
         self.log_std_alpha = nn.Parameter(
             torch.full((self.K,), float(log_std0), dtype=torch.double)
         )
@@ -2566,4 +2595,773 @@ class TruncatedCubicSplineSpectrumFullVI(BaseSpectralFilter):
             "alpha_l1": alpha_l1.reshape(()),
             "alpha_l2": alpha_l2.reshape(()),
             "max_abs_alpha": max_abs_alpha.reshape(()),
+        }
+
+class AnchoredTruncatedCubicSplineSpectrumFullVI(BaseSpectralFilter):
+    """
+    Anchored nonparametric spectral density model using a truncated cubic
+    spline correction on top of a linear log-spectrum baseline.
+
+        x = lam / lam_max in [0, 1]
+
+        log F(lam) = g(x)
+
+        g(x) =
+            theta_0
+            + theta_1 x
+            + sum_{k=1}^K alpha_k T_k(x)
+
+        where
+
+            T_k(x)
+            =
+            ((x - knot_k)_+^3 / (1 - knot_k)^3) - x
+
+        so that
+
+            T_k(0) = 0
+            T_k(1) = 0.
+
+    Therefore:
+
+        g(0) = theta_0
+        g(1) = theta_0 + theta_1
+
+    The alpha coefficients only control interior curvature/deviation.
+
+    This is useful because it reduces endpoint confounding:
+
+        - theta_0 controls low-frequency log spectrum.
+        - theta_0 + theta_1 controls high-frequency log spectrum.
+        - alpha controls interior bumps/bends.
+
+    Variational family:
+        diagonal Gaussian over all unconstrained coefficients:
+
+            theta_0, theta_1
+            alpha_0, ..., alpha_{K-1}
+
+    Priors:
+        theta_i ~ N(0, prior_std_theta^2)
+        alpha_k ~ N(0, prior_std_alpha^2)
+
+    Notes:
+        - No CAR baseline is included.
+        - No tau2 parameter is included.
+        - No log-frequency transform is used.
+        - The spline correction is anchored at x=0 and x=1.
+    """
+
+    def __init__(
+        self,
+        *,
+        lam_max: float,
+        K: int = 6,
+        prior_std_theta: float = 2.0,
+        prior_std_alpha: float = 0.25,
+        log_std0: float = -2.3,
+        init_theta: list[float] | None = None,
+        init_alpha: float | list[float] | tuple[float, ...] | torch.Tensor = 0.0,
+        logF_min: float = -30.0,
+        logF_max: float = 30.0,
+    ):
+        super().__init__()
+
+        if lam_max <= 0:
+            raise ValueError("lam_max must be positive.")
+        if K < 0:
+            raise ValueError("K must be nonnegative.")
+        if prior_std_theta <= 0:
+            raise ValueError("prior_std_theta must be positive.")
+        if prior_std_alpha <= 0:
+            raise ValueError("prior_std_alpha must be positive.")
+        if logF_min >= logF_max:
+            raise ValueError("logF_min must be smaller than logF_max.")
+
+        self.lam_max = float(lam_max)
+        self.K = int(K)
+
+        self.prior_std_theta = float(prior_std_theta)
+        self.prior_std_alpha = float(prior_std_alpha)
+
+        self.logF_min = float(logF_min)
+        self.logF_max = float(logF_max)
+
+        # Evenly spaced knots in (0, 1)
+        if self.K > 0:
+            knots = torch.linspace(
+                0.0,
+                1.0,
+                self.K + 2,
+                dtype=torch.double,
+            )[1:-1]
+        else:
+            knots = torch.empty(0, dtype=torch.double)
+
+        self.register_buffer("knots", knots)
+
+        # Initialize theta coefficients.
+        #
+        # theta_0 = low-frequency log spectrum g(0)
+        # theta_1 = difference g(1) - g(0)
+        #
+        # Default: flat log spectrum, F(x)=1.
+        #
+        # For spatial data, a better benchmark initialization is often:
+        #
+        #     init_theta=[math.log(0.4), -3.0]
+        #
+        # which gives F(x)=0.4 exp(-3x) when alpha=0.
+        if init_theta is None:
+            init_theta = [0.0, 0.0]
+
+        if len(init_theta) != 2:
+            raise ValueError("init_theta must contain exactly 2 values.")
+
+        self.mu_theta = nn.Parameter(
+            torch.tensor(init_theta, dtype=torch.double)
+        )
+
+        self.log_std_theta = nn.Parameter(
+            torch.full((2,), float(log_std0), dtype=torch.double)
+        )
+
+        # Initialize anchored truncated cubic spline coefficients alpha
+        if self.K > 0:
+            if isinstance(init_alpha, torch.Tensor):
+                alpha_init = init_alpha.detach().clone().to(dtype=torch.double).reshape(-1)
+
+                if alpha_init.numel() != self.K:
+                    raise ValueError(
+                        f"init_alpha tensor must have length K={self.K}, "
+                        f"got {alpha_init.numel()}."
+                    )
+
+            elif isinstance(init_alpha, (list, tuple)):
+                if len(init_alpha) != self.K:
+                    raise ValueError(
+                        f"init_alpha list/tuple must have length K={self.K}, "
+                        f"got {len(init_alpha)}."
+                    )
+
+                alpha_init = torch.tensor(
+                    list(init_alpha),
+                    dtype=torch.double,
+                )
+
+            else:
+                alpha_init = torch.full(
+                    (self.K,),
+                    float(init_alpha),
+                    dtype=torch.double,
+                )
+        else:
+            alpha_init = torch.empty(0, dtype=torch.double)
+
+        self.mu_alpha = nn.Parameter(alpha_init)
+
+        self.log_std_alpha = nn.Parameter(
+            torch.full((self.K,), float(log_std0), dtype=torch.double)
+        )
+
+    def unconstrained_names(self) -> list[str]:
+        names = [f"theta{i}_raw" for i in range(2)]
+        names += [f"alpha{k}_raw" for k in range(self.K)]
+        return names
+
+    def blocks(self) -> list[ParamBlock]:
+        blocks = [
+            ParamBlock(
+                name="theta_raw",
+                param_names=tuple(f"theta{i}_raw" for i in range(2)),
+            )
+        ]
+
+        if self.K > 0:
+            blocks.append(
+                ParamBlock(
+                    name="alpha_raw",
+                    param_names=tuple(f"alpha{k}_raw" for k in range(self.K)),
+                )
+            )
+
+        return blocks
+
+    def sample_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+
+        eps_theta = torch.randn_like(self.mu_theta)
+        theta = self.mu_theta + torch.exp(self.log_std_theta) * eps_theta
+
+        for i in range(2):
+            out[f"theta{i}_raw"] = theta[i:i + 1]
+
+        if self.K > 0:
+            eps_alpha = torch.randn_like(self.mu_alpha)
+            alpha = self.mu_alpha + torch.exp(self.log_std_alpha) * eps_alpha
+
+            for k in range(self.K):
+                out[f"alpha{k}_raw"] = alpha[k:k + 1]
+
+        return out
+
+    @torch.no_grad()
+    def mean_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+
+        for i in range(2):
+            out[f"theta{i}_raw"] = self.mu_theta[i:i + 1].detach()
+
+        for k in range(self.K):
+            out[f"alpha{k}_raw"] = self.mu_alpha[k:k + 1].detach()
+
+        return out
+
+    def _constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        theta_vec = torch.stack(
+            [
+                theta[f"theta{i}_raw"].reshape(())
+                for i in range(2)
+            ],
+            dim=0,
+        )
+
+        if self.K > 0:
+            alpha_vec = torch.stack(
+                [
+                    theta[f"alpha{k}_raw"].reshape(())
+                    for k in range(self.K)
+                ],
+                dim=0,
+            )
+        else:
+            alpha_vec = theta_vec.new_empty((0,))
+
+        coef = torch.cat([theta_vec, alpha_vec], dim=0)
+
+        return {
+            "theta": theta_vec,
+            "alpha": alpha_vec,
+            "coef": coef,
+        }
+
+    def spectrum_from_unconstrained(
+        self,
+        lam: torch.Tensor,
+        theta: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        x = (lam / float(self.lam_max)).clamp(0.0, 1.0)
+
+        ones = torch.ones_like(x)
+
+        # Linear baseline:
+        #
+        #   theta_0 + theta_1 x
+        #
+        # This makes theta_0 = g(0) and theta_0 + theta_1 = g(1).
+        poly = torch.stack(
+            [
+                ones,
+                x,
+            ],
+            dim=1,
+        )  # [n, 2]
+
+        c = self._constrain(theta)
+        theta_vec = c["theta"]
+        alpha_vec = c["alpha"]
+
+        if self.K > 0:
+            knots = self.knots.to(dtype=x.dtype, device=x.device)
+
+            # Raw truncated cubic basis:
+            #
+            #   (x - knot_k)_+^3
+            raw_truncated = torch.relu(x[:, None] - knots[None, :]) ** 3
+
+            # Normalize so the raw truncated term equals 1 at x=1.
+            #
+            #   ((x - knot_k)_+^3) / ((1 - knot_k)^3)
+            denom = (1.0 - knots).clamp_min(1e-12) ** 3
+            truncated = raw_truncated / denom[None, :]
+
+            # Anchor the correction:
+            #
+            #   T_k(x) = normalized_truncated_k(x) - x
+            #
+            # Then:
+            #
+            #   T_k(0) = 0 - 0 = 0
+            #   T_k(1) = 1 - 1 = 0
+            #
+            # Thus alpha coefficients do not affect g(0) or g(1).
+            anchored_truncated = truncated - x[:, None]
+
+            B = torch.cat([poly, anchored_truncated], dim=1)  # [n, 2 + K]
+            coef = torch.cat([theta_vec, alpha_vec], dim=0)
+        else:
+            B = poly
+            coef = theta_vec
+
+        logF = B @ coef
+        logF = logF.clamp(self.logF_min, self.logF_max)
+
+        F = torch.exp(logF).clamp_min(1e-12)
+
+        return F.reshape(-1)
+
+    def log_prior(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        anchor = theta["theta0_raw"]
+        dtype, device = anchor.dtype, anchor.device
+
+        theta_vec = torch.stack(
+            [
+                theta[f"theta{i}_raw"].reshape(())
+                for i in range(2)
+            ],
+            dim=0,
+        )
+
+        theta_prior = Normal(
+            torch.tensor(0.0, dtype=dtype, device=device),
+            torch.tensor(self.prior_std_theta, dtype=dtype, device=device),
+        )
+
+        logp = theta_prior.log_prob(theta_vec).sum()
+
+        if self.K > 0:
+            alpha_vec = torch.stack(
+                [
+                    theta[f"alpha{k}_raw"].reshape(())
+                    for k in range(self.K)
+                ],
+                dim=0,
+            )
+
+            alpha_prior = Normal(
+                torch.tensor(0.0, dtype=dtype, device=device),
+                torch.tensor(self.prior_std_alpha, dtype=dtype, device=device),
+            )
+
+            logp = logp + alpha_prior.log_prob(alpha_vec).sum()
+
+        return logp
+
+    def kl_q_p(self) -> torch.Tensor:
+        kl_theta = kl_normal_to_normal(
+            self.mu_theta,
+            self.log_std_theta,
+            mu_p=0.0,
+            std_p=self.prior_std_theta,
+        ).sum()
+
+        if self.K > 0:
+            kl_alpha = kl_normal_to_normal(
+                self.mu_alpha,
+                self.log_std_alpha,
+                mu_p=0.0,
+                std_p=self.prior_std_alpha,
+            ).sum()
+        else:
+            kl_alpha = torch.zeros(
+                (),
+                dtype=self.mu_theta.dtype,
+                device=self.mu_theta.device,
+            )
+
+        return kl_theta + kl_alpha
+
+    @torch.no_grad()
+    def mean_params(self):
+        """
+        Compatibility helper.
+
+        There is no tau2 parameter. We return exp(theta0) as a scale-like
+        quantity and the full coefficient vector as the second object.
+
+        Here:
+
+            exp(theta0) = F(0)
+
+        because the anchored correction is zero at x=0.
+        """
+        theta_mean = self.mu_theta.detach()
+        alpha_mean = self.mu_alpha.detach()
+
+        scale_like = torch.exp(theta_mean[0]).reshape(())
+        coef = torch.cat([theta_mean, alpha_mean], dim=0)
+
+        return scale_like, coef
+
+    @torch.no_grad()
+    def shrinkage_summary(self):
+        """
+        Convenience diagnostics for spline flexibility.
+
+        Returns:
+            theta: posterior mean endpoint/baseline coefficients
+            alpha: posterior mean anchored spline coefficients
+            alpha_l1: total absolute spline mass
+            alpha_l2: Euclidean spline mass
+            max_abs_alpha: largest absolute spline coefficient
+        """
+        theta = self.mu_theta.detach().clone()
+        alpha = self.mu_alpha.detach().clone()
+
+        if self.K > 0:
+            alpha_l1 = torch.sum(torch.abs(alpha))
+            alpha_l2 = torch.sqrt(torch.sum(alpha**2))
+            max_abs_alpha = torch.max(torch.abs(alpha))
+        else:
+            alpha_l1 = theta.new_tensor(0.0)
+            alpha_l2 = theta.new_tensor(0.0)
+            max_abs_alpha = theta.new_tensor(0.0)
+
+        return {
+            "theta": theta,
+            "alpha": alpha,
+            "alpha_l1": alpha_l1.reshape(()),
+            "alpha_l2": alpha_l2.reshape(()),
+            "max_abs_alpha": max_abs_alpha.reshape(()),
+        }
+
+class AnchoredBSplineSpectrumFullVI(BaseSpectralFilter):
+    """
+    Anchored B-spline log-spectrum filter.
+
+        x = lam / lam_max in [0, 1]
+
+        log F(lam)
+            = theta_0 + theta_1 x + h_tilde(x)
+
+        h_tilde(x)
+            = h(x) - (1 - x) h(0) - x h(1)
+
+        h(x)
+            = B(x) w
+
+    Therefore:
+
+        h_tilde(0) = 0
+        h_tilde(1) = 0
+
+    So:
+
+        log F(0) = theta_0
+        log F(1) = theta_0 + theta_1
+
+    The B-spline weights control interior deviations only.
+
+    Variational family:
+        diagonal Gaussian over theta_0, theta_1, and w_0,...,w_{J-1}.
+
+    Priors:
+        theta_i ~ N(0, prior_std_theta^2)
+        w_j     ~ N(0, prior_std_w^2)
+
+    Optional:
+        You can later replace independent w priors with a second-difference
+        P-spline penalty.
+    """
+
+    def __init__(
+        self,
+        *,
+        lam_max: float,
+        degree: int = 3,
+        n_internal_knots: int = 8,
+        prior_std_theta: float = 2.0,
+        prior_std_w: float = 0.5,
+        log_std0: float = -2.3,
+        init_theta: list[float] | None = None,
+        init_w: float | list[float] | tuple[float, ...] | torch.Tensor = 0.0,
+        logF_min: float = -30.0,
+        logF_max: float = 30.0,
+    ):
+        super().__init__()
+
+        if lam_max <= 0:
+            raise ValueError("lam_max must be positive.")
+        if degree < 0:
+            raise ValueError("degree must be nonnegative.")
+        if n_internal_knots < 0:
+            raise ValueError("n_internal_knots must be nonnegative.")
+        if prior_std_theta <= 0:
+            raise ValueError("prior_std_theta must be positive.")
+        if prior_std_w <= 0:
+            raise ValueError("prior_std_w must be positive.")
+        if logF_min >= logF_max:
+            raise ValueError("logF_min must be smaller than logF_max.")
+
+        self.lam_max = float(lam_max)
+        self.degree = int(degree)
+        self.n_internal_knots = int(n_internal_knots)
+        self.prior_std_theta = float(prior_std_theta)
+        self.prior_std_w = float(prior_std_w)
+        self.logF_min = float(logF_min)
+        self.logF_max = float(logF_max)
+
+        # Domain is x in [0, 1]
+        self._t_min = 0.0
+        self._t_max = 1.0
+
+        # Number of B-spline basis functions:
+        # len(knots) = 2*(degree+1) + n_internal_knots
+        # J = len(knots) - degree - 1
+        self.J = (
+            2 * (self.degree + 1)
+            + self.n_internal_knots
+            - self.degree
+            - 1
+        )
+
+        if init_theta is None:
+            init_theta = [0.0, 0.0]
+
+        if len(init_theta) != 2:
+            raise ValueError("init_theta must contain exactly 2 values.")
+
+        self.mu_theta = nn.Parameter(
+            torch.tensor(init_theta, dtype=torch.double)
+        )
+
+        self.log_std_theta = nn.Parameter(
+            torch.full((2,), float(log_std0), dtype=torch.double)
+        )
+
+        # Initialize w
+        if isinstance(init_w, torch.Tensor):
+            w_init = init_w.detach().clone().to(dtype=torch.double).reshape(-1)
+            if w_init.numel() != self.J:
+                raise ValueError(
+                    f"init_w tensor must have length J={self.J}, "
+                    f"got {w_init.numel()}."
+                )
+        elif isinstance(init_w, (list, tuple)):
+            if len(init_w) != self.J:
+                raise ValueError(
+                    f"init_w list/tuple must have length J={self.J}, "
+                    f"got {len(init_w)}."
+                )
+            w_init = torch.tensor(list(init_w), dtype=torch.double)
+        else:
+            w_init = torch.full(
+                (self.J,),
+                float(init_w),
+                dtype=torch.double,
+            )
+
+        self.mu_w = nn.Parameter(w_init)
+
+        self.log_std_w = nn.Parameter(
+            torch.full((self.J,), float(log_std0), dtype=torch.double)
+        )
+
+    def _knots(self, device, dtype) -> torch.Tensor:
+        return _make_open_uniform_knots(
+            self._t_min,
+            self._t_max,
+            self.n_internal_knots,
+            self.degree,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _basis(self, x: torch.Tensor) -> torch.Tensor:
+        knots = self._knots(device=x.device, dtype=x.dtype)
+        return _bspline_basis_1d(x, knots, self.degree)
+
+    def unconstrained_names(self) -> list[str]:
+        names = [f"theta{i}_raw" for i in range(2)]
+        names += [f"w{i}_raw" for i in range(self.J)]
+        return names
+
+    def blocks(self) -> list[ParamBlock]:
+        return [
+            ParamBlock(
+                name="theta_raw",
+                param_names=tuple(f"theta{i}_raw" for i in range(2)),
+            ),
+            ParamBlock(
+                name="w_raw",
+                param_names=tuple(f"w{i}_raw" for i in range(self.J)),
+            ),
+        ]
+
+    def sample_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+
+        eps_theta = torch.randn_like(self.mu_theta)
+        theta = self.mu_theta + torch.exp(self.log_std_theta) * eps_theta
+
+        for i in range(2):
+            out[f"theta{i}_raw"] = theta[i:i + 1]
+
+        eps_w = torch.randn_like(self.mu_w)
+        w = self.mu_w + torch.exp(self.log_std_w) * eps_w
+
+        for j in range(self.J):
+            out[f"w{j}_raw"] = w[j:j + 1]
+
+        return out
+
+    @torch.no_grad()
+    def mean_unconstrained(self) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
+
+        for i in range(2):
+            out[f"theta{i}_raw"] = self.mu_theta[i:i + 1].detach()
+
+        for j in range(self.J):
+            out[f"w{j}_raw"] = self.mu_w[j:j + 1].detach()
+
+        return out
+
+    def _constrain(self, theta: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        theta_vec = torch.stack(
+            [
+                theta[f"theta{i}_raw"].reshape(())
+                for i in range(2)
+            ],
+            dim=0,
+        )
+
+        w_vec = torch.stack(
+            [
+                theta[f"w{j}_raw"].reshape(())
+                for j in range(self.J)
+            ],
+            dim=0,
+        )
+
+        coef = torch.cat([theta_vec, w_vec], dim=0)
+
+        return {
+            "theta": theta_vec,
+            "w": w_vec,
+            "coef": coef,
+        }
+
+    def spectrum_from_unconstrained(
+        self,
+        lam: torch.Tensor,
+        theta: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        x = (lam / float(self.lam_max)).clamp(0.0, 1.0)
+
+        c = self._constrain(theta)
+        theta_vec = c["theta"]
+        w = c["w"]
+
+        # Linear baseline
+        logF_base = theta_vec[0] + theta_vec[1] * x
+
+        # B-spline correction h(x) = B(x) w
+        B = self._basis(x)
+        h = B @ w
+
+        # Endpoint anchoring:
+        #
+        # h_tilde(x) = h(x) - (1-x)h(0) - x h(1)
+        x0 = x.new_tensor([0.0])
+        x1 = x.new_tensor([1.0])
+
+        B0 = self._basis(x0)
+        B1 = self._basis(x1)
+
+        h0 = (B0 @ w).reshape(())
+        h1 = (B1 @ w).reshape(())
+
+        h_tilde = h - (1.0 - x) * h0 - x * h1
+
+        logF = logF_base + h_tilde
+        logF = logF.clamp(self.logF_min, self.logF_max)
+
+        F = torch.exp(logF).clamp_min(1e-12)
+
+        return F.reshape(-1)
+
+    def log_prior(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
+        anchor = theta["theta0_raw"]
+        dtype, device = anchor.dtype, anchor.device
+
+        theta_vec = torch.stack(
+            [
+                theta[f"theta{i}_raw"].reshape(())
+                for i in range(2)
+            ],
+            dim=0,
+        )
+
+        w_vec = torch.stack(
+            [
+                theta[f"w{j}_raw"].reshape(())
+                for j in range(self.J)
+            ],
+            dim=0,
+        )
+
+        theta_prior = Normal(
+            torch.tensor(0.0, dtype=dtype, device=device),
+            torch.tensor(self.prior_std_theta, dtype=dtype, device=device),
+        )
+
+        w_prior = Normal(
+            torch.tensor(0.0, dtype=dtype, device=device),
+            torch.tensor(self.prior_std_w, dtype=dtype, device=device),
+        )
+
+        logp = theta_prior.log_prob(theta_vec).sum()
+        logp = logp + w_prior.log_prob(w_vec).sum()
+
+        return logp
+
+    def kl_q_p(self) -> torch.Tensor:
+        kl_theta = kl_normal_to_normal(
+            self.mu_theta,
+            self.log_std_theta,
+            mu_p=0.0,
+            std_p=self.prior_std_theta,
+        ).sum()
+
+        kl_w = kl_normal_to_normal(
+            self.mu_w,
+            self.log_std_w,
+            mu_p=0.0,
+            std_p=self.prior_std_w,
+        ).sum()
+
+        return kl_theta + kl_w
+
+    @torch.no_grad()
+    def mean_params(self):
+        """
+        Compatibility helper.
+
+        Return exp(theta0) as a scale-like quantity and the full coefficient
+        vector as the second object.
+        """
+        theta_mean = self.mu_theta.detach()
+        w_mean = self.mu_w.detach()
+
+        scale_like = torch.exp(theta_mean[0]).reshape(())
+        coef = torch.cat([theta_mean, w_mean], dim=0)
+
+        return scale_like, coef
+
+    @torch.no_grad()
+    def shrinkage_summary(self):
+        theta = self.mu_theta.detach().clone()
+        w = self.mu_w.detach().clone()
+
+        w_l1 = torch.sum(torch.abs(w))
+        w_l2 = torch.sqrt(torch.sum(w**2))
+        max_abs_w = torch.max(torch.abs(w)) if w.numel() > 0 else theta.new_tensor(0.0)
+
+        return {
+            "theta": theta,
+            "w": w,
+            "w_l1": w_l1.reshape(()),
+            "w_l2": w_l2.reshape(()),
+            "max_abs_w": max_abs_w.reshape(()),
         }
