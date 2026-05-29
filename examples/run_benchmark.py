@@ -97,6 +97,140 @@ def plot_hist_with_lines(
     plt.savefig(save_path, dpi=200)
     plt.close()
 
+def summarize_vector_draws(x: np.ndarray) -> dict:
+    """
+    x: array [S, d]
+    Returns mean/sd/quantiles for each coefficient.
+    """
+    x = np.asarray(x)
+    return {
+        "mean": np.mean(x, axis=0),
+        "sd": np.std(x, axis=0, ddof=1),
+        "q025": np.quantile(x, 0.025, axis=0),
+        "q975": np.quantile(x, 0.975, axis=0),
+    }
+
+def spline_alpha_shrinkage(alpha: np.ndarray) -> dict:
+    """
+    alpha can be shape [K] or [S,K].
+    Returns coefficient shrinkage diagnostics.
+    """
+    alpha = np.asarray(alpha)
+
+    if alpha.ndim == 1:
+        return {
+            "alpha_l1": float(np.sum(np.abs(alpha))),
+            "alpha_l2": float(np.sqrt(np.sum(alpha ** 2))),
+            "max_abs_alpha": float(np.max(np.abs(alpha))) if alpha.size > 0 else 0.0,
+        }
+
+    if alpha.ndim == 2:
+        vals = []
+        for s in range(alpha.shape[0]):
+            vals.append(spline_alpha_shrinkage(alpha[s]))
+        return {
+            "alpha_l1_mean": float(np.mean([v["alpha_l1"] for v in vals])),
+            "alpha_l1_sd": float(np.std([v["alpha_l1"] for v in vals], ddof=1)),
+            "alpha_l2_mean": float(np.mean([v["alpha_l2"] for v in vals])),
+            "alpha_l2_sd": float(np.std([v["alpha_l2"] for v in vals], ddof=1)),
+            "max_abs_alpha_mean": float(np.mean([v["max_abs_alpha"] for v in vals])),
+            "max_abs_alpha_sd": float(np.std([v["max_abs_alpha"] for v in vals], ddof=1)),
+        }
+    raise ValueError("alpha must be 1D or 2D.")
+
+
+@torch.no_grad()
+def vi_constrained_draws_for_filter(filter_module, *, keys=("theta", "alpha"), num_mc: int = 256):
+    """
+    Draw theta from q(filter) and summarize constrained parameters.
+
+    Returns:
+        dict[key -> np.ndarray]
+        where each array has shape [num_mc, ...].
+    """
+    draws = {k: [] for k in keys}
+
+    for _ in range(int(num_mc)):
+        theta_u = filter_module.sample_unconstrained()
+        theta_c = filter_module._constrain(theta_u)
+
+        for k in keys:
+            if k in theta_c:
+                draws[k].append(theta_c[k].detach().cpu().numpy())
+
+    out = {}
+    for k, vals in draws.items():
+        if len(vals) > 0:
+            out[k] = np.stack(vals, axis=0)
+
+    return out
+
+
+def plot_coefficient_intervals(
+    *,
+    names: list[str],
+    plugin: np.ndarray | None,
+    vi_mean: np.ndarray | None,
+    vi_q025: np.ndarray | None,
+    vi_q975: np.ndarray | None,
+    mcmc_mean: np.ndarray | None,
+    mcmc_q025: np.ndarray | None,
+    mcmc_q975: np.ndarray | None,
+    title: str,
+    ylabel: str,
+    save_path: Path,
+):
+    """
+    Plot plugin / VI-MC / MCMC coefficient summaries.
+    """
+    x = np.arange(len(names))
+
+    plt.figure(figsize=(max(7, 0.55 * len(names)), 4.0))
+
+    if vi_mean is not None:
+        vi_err_low = vi_mean - vi_q025
+        vi_err_high = vi_q975 - vi_mean
+
+        plt.errorbar(
+            x - 0.12,
+            vi_mean,
+            yerr=np.vstack([vi_err_low, vi_err_high]),
+            fmt="o",
+            capsize=3,
+            label="VI MC 95%",
+        )
+
+    if mcmc_mean is not None:
+        mcmc_err_low = mcmc_mean - mcmc_q025
+        mcmc_err_high = mcmc_q975 - mcmc_mean
+
+        plt.errorbar(
+            x + 0.12,
+            mcmc_mean,
+            yerr=np.vstack([mcmc_err_low, mcmc_err_high]),
+            fmt="s",
+            capsize=3,
+            label="MCMC 95%",
+        )
+
+    if plugin is not None:
+        plt.scatter(
+            x,
+            plugin,
+            marker="x",
+            s=60,
+            label="VI plugin",
+        )
+
+    plt.axhline(0.0, linewidth=1.0, linestyle="--")
+    plt.xticks(x, names, rotation=45, ha="right")
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
 def plot_true_vs_empirical(
     *,
     lam: torch.Tensor,
@@ -344,7 +478,8 @@ def spectral_plot_axis(
             "logfreq",
         )
 
-    if filter_name in {"poly", "rational", "bernstein_log", "logpoly_shrink", "truncated_cubic_spline"}:
+    if filter_name in {"poly", "rational", "bernstein_log",
+                       "logpoly_shrink", "truncated_cubic_spline", "anchored_truncated_cubic_spline", "anchored_bspline"}:
         x = (lam / lam.max().clamp_min(1e-12)).clamp(0.0, 1.0)
         return (
             x,
@@ -830,6 +965,180 @@ def run_case(
     sigma2_chain = np.exp(s_chain)
 
     theta_raw, theta_constr = decode_theta_chain(out, model.filter)
+
+    # -------------------------------------------------------
+    # Truncated cubic spline coefficient diagnostics
+    # -------------------------------------------------------
+    spline_diag = {}
+
+    with torch.no_grad():
+        theta_plugin_u, theta_plugin_c, _ = model.plugin_hyperparams()
+
+    has_spline_theta = "theta" in theta_plugin_c
+    has_spline_alpha = "alpha" in theta_plugin_c
+
+    if has_spline_theta or has_spline_alpha:
+        print("\nSpline coefficient diagnostics:")
+
+        # -------------------------
+        # Plugin coefficients
+        # -------------------------
+        theta_plugin_np = None
+        alpha_plugin_np = None
+
+        if has_spline_theta:
+            theta_plugin_np = theta_plugin_c["theta"].detach().cpu().numpy()
+            spline_diag["theta_plugin"] = {
+                f"theta{j}": float(theta_plugin_np[j])
+                for j in range(len(theta_plugin_np))
+            }
+            print("  theta plugin:", np.round(theta_plugin_np, 4))
+
+        if has_spline_alpha:
+            alpha_plugin_np = theta_plugin_c["alpha"].detach().cpu().numpy()
+            spline_diag["alpha_plugin"] = {
+                f"alpha{j}": float(alpha_plugin_np[j])
+                for j in range(len(alpha_plugin_np))
+            }
+
+            alpha_plugin_shrink = spline_alpha_shrinkage(alpha_plugin_np)
+            spline_diag["alpha_plugin_shrinkage"] = alpha_plugin_shrink
+
+            print("  alpha plugin:", np.round(alpha_plugin_np, 4))
+            print(
+                "  alpha plugin shrinkage: "
+                f"L1={alpha_plugin_shrink['alpha_l1']:.4f} | "
+                f"L2={alpha_plugin_shrink['alpha_l2']:.4f} | "
+                f"max|alpha|={alpha_plugin_shrink['max_abs_alpha']:.4f}"
+            )
+
+        # -------------------------
+        # VI-MC coefficient summaries
+        # -------------------------
+        vi_coef_draws = vi_constrained_draws_for_filter(
+            model.filter,
+            keys=("theta", "alpha"),
+            num_mc=256,
+        )
+
+        if "theta" in vi_coef_draws:
+            theta_vi_draws = vi_coef_draws["theta"]
+            theta_vi_sum = summarize_vector_draws(theta_vi_draws)
+
+            spline_diag["theta_vi_mc_mean"] = {
+                f"theta{j}": float(theta_vi_sum["mean"][j])
+                for j in range(theta_vi_sum["mean"].shape[0])
+            }
+            spline_diag["theta_vi_mc_sd"] = {
+                f"theta{j}": float(theta_vi_sum["sd"][j])
+                for j in range(theta_vi_sum["sd"].shape[0])
+            }
+
+            print("  theta VI-MC mean:", np.round(theta_vi_sum["mean"], 4))
+            print("  theta VI-MC sd  :", np.round(theta_vi_sum["sd"], 4))
+
+            theta_names = [f"$\\theta_{j}$" for j in range(theta_vi_sum["mean"].shape[0])]
+
+            theta_mcmc_sum = None
+            if "theta" in theta_constr:
+                theta_mcmc_draws = theta_constr["theta"]
+                theta_mcmc_sum = summarize_vector_draws(theta_mcmc_draws)
+
+                spline_diag["theta_mcmc_mean"] = {
+                    f"theta{j}": float(theta_mcmc_sum["mean"][j])
+                    for j in range(theta_mcmc_sum["mean"].shape[0])
+                }
+                spline_diag["theta_mcmc_sd"] = {
+                    f"theta{j}": float(theta_mcmc_sum["sd"][j])
+                    for j in range(theta_mcmc_sum["sd"].shape[0])
+                }
+
+                print("  theta MCMC mean :", np.round(theta_mcmc_sum["mean"], 4))
+                print("  theta MCMC sd   :", np.round(theta_mcmc_sum["sd"], 4))
+
+            plot_coefficient_intervals(
+                names=theta_names,
+                plugin=theta_plugin_np,
+                vi_mean=theta_vi_sum["mean"],
+                vi_q025=theta_vi_sum["q025"],
+                vi_q975=theta_vi_sum["q975"],
+                mcmc_mean=None if theta_mcmc_sum is None else theta_mcmc_sum["mean"],
+                mcmc_q025=None if theta_mcmc_sum is None else theta_mcmc_sum["q025"],
+                mcmc_q975=None if theta_mcmc_sum is None else theta_mcmc_sum["q975"],
+                title=f"Theta coefficients — {filter_name}/{case_spec.display_name}",
+                ylabel="coefficient value",
+                save_path=case_dir / "spline_theta_coefficients.png",
+            )
+
+        if "alpha" in vi_coef_draws:
+            alpha_vi_draws = vi_coef_draws["alpha"]
+            alpha_vi_sum = summarize_vector_draws(alpha_vi_draws)
+            alpha_vi_shrink = spline_alpha_shrinkage(alpha_vi_draws)
+
+            spline_diag["alpha_vi_mc_mean"] = {
+                f"alpha{j}": float(alpha_vi_sum["mean"][j])
+                for j in range(alpha_vi_sum["mean"].shape[0])
+            }
+            spline_diag["alpha_vi_mc_sd"] = {
+                f"alpha{j}": float(alpha_vi_sum["sd"][j])
+                for j in range(alpha_vi_sum["sd"].shape[0])
+            }
+            spline_diag["alpha_vi_mc_shrinkage"] = alpha_vi_shrink
+
+            print("  alpha VI-MC mean:", np.round(alpha_vi_sum["mean"], 4))
+            print("  alpha VI-MC sd  :", np.round(alpha_vi_sum["sd"], 4))
+            print(
+                "  alpha VI-MC shrinkage: "
+                f"L1={alpha_vi_shrink['alpha_l1_mean']:.4f} ± {alpha_vi_shrink['alpha_l1_sd']:.4f} | "
+                f"L2={alpha_vi_shrink['alpha_l2_mean']:.4f} ± {alpha_vi_shrink['alpha_l2_sd']:.4f} | "
+                f"max|alpha|={alpha_vi_shrink['max_abs_alpha_mean']:.4f} ± {alpha_vi_shrink['max_abs_alpha_sd']:.4f}"
+            )
+
+            alpha_names = [f"$\\alpha_{j}$" for j in range(alpha_vi_sum["mean"].shape[0])]
+
+            alpha_mcmc_sum = None
+            if "alpha" in theta_constr:
+                alpha_mcmc_draws = theta_constr["alpha"]
+                alpha_mcmc_sum = summarize_vector_draws(alpha_mcmc_draws)
+                alpha_mcmc_shrink = spline_alpha_shrinkage(alpha_mcmc_draws)
+
+                spline_diag["alpha_mcmc_mean"] = {
+                    f"alpha{j}": float(alpha_mcmc_sum["mean"][j])
+                    for j in range(alpha_mcmc_sum["mean"].shape[0])
+                }
+                spline_diag["alpha_mcmc_sd"] = {
+                    f"alpha{j}": float(alpha_mcmc_sum["sd"][j])
+                    for j in range(alpha_mcmc_sum["sd"].shape[0])
+                }
+                spline_diag["alpha_mcmc_shrinkage"] = alpha_mcmc_shrink
+
+                print("  alpha MCMC mean :", np.round(alpha_mcmc_sum["mean"], 4))
+                print("  alpha MCMC sd   :", np.round(alpha_mcmc_sum["sd"], 4))
+                print(
+                    "  alpha MCMC shrinkage: "
+                    f"L1={alpha_mcmc_shrink['alpha_l1_mean']:.4f} ± {alpha_mcmc_shrink['alpha_l1_sd']:.4f} | "
+                    f"L2={alpha_mcmc_shrink['alpha_l2_mean']:.4f} ± {alpha_mcmc_shrink['alpha_l2_sd']:.4f} | "
+                    f"max|alpha|={alpha_mcmc_shrink['max_abs_alpha_mean']:.4f} ± {alpha_mcmc_shrink['max_abs_alpha_sd']:.4f}"
+                )
+
+            plot_coefficient_intervals(
+                names=alpha_names,
+                plugin=alpha_plugin_np,
+                vi_mean=alpha_vi_sum["mean"],
+                vi_q025=alpha_vi_sum["q025"],
+                vi_q975=alpha_vi_sum["q975"],
+                mcmc_mean=None if alpha_mcmc_sum is None else alpha_mcmc_sum["mean"],
+                mcmc_q025=None if alpha_mcmc_sum is None else alpha_mcmc_sum["q025"],
+                mcmc_q975=None if alpha_mcmc_sum is None else alpha_mcmc_sum["q975"],
+                title=f"Alpha coefficients — {filter_name}/{case_spec.display_name}",
+                ylabel="coefficient value",
+                save_path=case_dir / "spline_alpha_coefficients.png",
+            )
+
+        # Save standalone coefficient diagnostics
+        import json
+        with open(case_dir / "spline_coefficients.json", "w") as f:
+            json.dump(spline_diag, f, indent=2)
 
     # -------------------------
     # MCMC spectrum posterior bands
@@ -1362,6 +1671,9 @@ def run_case(
         save_path_prefix=str(case_dir / "phi_mcmc"),
     )
 
+    # for non-spline filters to work
+    spline_diag = {}
+
     # compact summary
     summary = {
         "filter": filter_name,
@@ -1424,6 +1736,8 @@ def run_case(
         "rmse_eta_vi_plugin": rmse_eta_vi_plugin,
         "rmse_eta_vi": rmse_eta_vi,
         "rmse_eta_mcmc": rmse_eta_mcmc,
+
+        "spline_coefficients": spline_diag,
     }
 
     # Add predictive metrics in the summary.
@@ -1473,6 +1787,7 @@ def run_case(
                 "rmse_eta_vi_plugin": summary["rmse_eta_vi_plugin"],
                 "rmse_eta_vi": summary["rmse_eta_vi"],
                 "rmse_eta_mcmc": summary["rmse_eta_mcmc"],
+                "spline_coefficients": summary.get("spline_coefficients", {}),
             },
             f,
             indent=2,
@@ -1554,7 +1869,7 @@ def main():
                              f"Available: {list(spec.cases.keys())}")
 
     # Seeds + device
-    seed = 0
+    seed = 1
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -1662,9 +1977,9 @@ def main():
         tau2_true = 0.4
 
         a = 3.0       # global exponential decay
-        b = 1.25      # bump strength
+        b = 2.0      # bump strength
         x0 = 0.45     # mid-frequency location
-        s = 0.10      # bump width
+        s = 0.05      # bump width
         floor = 1e-2
 
         bump = torch.exp(-0.5 * ((x - x0) / s) ** 2)
