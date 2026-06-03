@@ -8,6 +8,7 @@ from pathlib import Path
 import math
 import random
 import argparse
+import time
 
 import matplotlib
 matplotlib.use("Agg")
@@ -33,6 +34,24 @@ torch.set_default_dtype(torch.double)
 # -------------------------
 # plotting helpers
 # -------------------------
+def sync_if_cuda(device: torch.device) -> None:
+    """
+    Make timing accurate if later we run on CUDA.
+    No-op for CPU.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+def seconds_to_str(x: float) -> str:
+    """
+    Pretty formatting for elapsed seconds.
+    """
+    if x < 60:
+        return f"{x:.2f}s"
+    if x < 3600:
+        return f"{x / 60:.2f}min"
+    return f"{x / 3600:.2f}hr"
+
 def summarize_chain(x: np.ndarray):
     mean = float(np.mean(x))
     sd = float(np.std(x, ddof=1))
@@ -479,7 +498,8 @@ def spectral_plot_axis(
         )
 
     if filter_name in {"poly", "rational", "bernstein_log",
-                       "logpoly_shrink", "truncated_cubic_spline", "anchored_truncated_cubic_spline", "anchored_bspline"}:
+                       "logpoly_shrink", "truncated_cubic_spline", "anchored_truncated_cubic_spline", "anchored_bspline",
+                       "unanchored_bspline",}:
         x = (lam / lam.max().clamp_min(1e-12)).clamp(0.0, 1.0)
         return (
             x,
@@ -720,6 +740,9 @@ def run_case(
     mcmc_thin: int = 10,
     fix_sigma2: bool = False,
 ):
+    sync_if_cuda(device)
+    case_t0 = time.perf_counter()
+
     fixed = resolve_fixed_tokens(case_spec.fixed, eps_car=eps_car)
 
     case_dir = fig_dir / filter_name / case_spec.display_name
@@ -765,6 +788,9 @@ def run_case(
     # -------------------------
     elbo_hist = []
     log_every = 50
+
+    sync_if_cuda(device)
+    vi_t0 = time.perf_counter()
 
     for it in range(vi_num_iters):
         optimizer.zero_grad()
@@ -833,6 +859,14 @@ def run_case(
                 f"sigma2_med={sigma2_median:.4f} sigma2_mean={sigma2_mean:.4f} beta={beta_m}"
             )
 
+    sync_if_cuda(device)
+    vi_train_seconds = time.perf_counter() - vi_t0
+
+    print(
+        f"[TIME] VI training: {seconds_to_str(vi_train_seconds)} "
+        f"({vi_train_seconds / max(vi_num_iters, 1):.4f}s/iter)"
+    )
+
     # save VI ELBO
     plt.figure(figsize=(6, 4))
     plt.plot(np.arange(1, vi_num_iters + 1), elbo_hist)
@@ -846,6 +880,9 @@ def run_case(
     # -------------------------
     # VI summaries (plugin + MC)
     # -------------------------
+    sync_if_cuda(device)
+    vi_summary_t0 = time.perf_counter()
+
     with torch.no_grad():
         beta_vi = model.beta_posterior_vi(num_mc=128, return_draws=False)
         sigma2_vi = model.sigma2_posterior_vi(num_mc=128, return_draws=False)
@@ -890,6 +927,11 @@ def run_case(
         F_vi_mc_sd = spectrum_vi["mc"]["sd"].detach()
         F_vi_mc_q025 = spectrum_vi["mc"]["q025"].detach()
         F_vi_mc_q975 = spectrum_vi["mc"]["q975"].detach()
+    
+    sync_if_cuda(device)
+    vi_summary_seconds = time.perf_counter() - vi_summary_t0
+
+    print(f"[TIME] VI summaries: {seconds_to_str(vi_summary_seconds)}")
 
     rmse_phi_vi_plugin = float(torch.sqrt(torch.mean((mean_phi_vi_plugin - phi_true.cpu()) ** 2)).item())
     rmse_phi_vi = float(torch.sqrt(torch.mean((mean_phi_vi - phi_true.cpu()) ** 2)).item())
@@ -906,7 +948,7 @@ def run_case(
         step_theta=case_spec.get_step_theta(model.filter),
         seed=0,
         device=device,
-        print_every=5000,
+        print_every=50,
     )
 
     sampler = make_collapsed_mcmc_from_model(model, config=cfg)
@@ -917,6 +959,10 @@ def run_case(
     init_theta_vec = model.filter.pack(theta0).detach()     # packed vector
 
     print("\nRunning MCMC...")
+
+    sync_if_cuda(device)
+    mcmc_t0 = time.perf_counter()
+
     out = sampler.run(
         init_s=init_s,
         init_theta_vec=init_theta_vec,
@@ -925,6 +971,14 @@ def run_case(
         U=U,
         X=X,
         y=y,
+    )
+
+    sync_if_cuda(device)
+    mcmc_seconds = time.perf_counter() - mcmc_t0
+
+    print(
+        f"[TIME] MCMC sampling: {seconds_to_str(mcmc_seconds)} "
+        f"({mcmc_seconds / max(mcmc_num_steps, 1):.4f}s/step)"
     )
 
 
@@ -939,12 +993,20 @@ def run_case(
     # --------------------------------------------
     # Predictive metrics (VI plugin + VI MC + MCMC)
     # --------------------------------------------
+    sync_if_cuda(device)
+    pred_t0 = time.perf_counter()
+
     pred = diagnostics.predictive_report(
         model=model,
         out=out,
         num_mc_vi=128,       # VI predictive MC draws
         max_draws_mcmc=1000, # cap LPD draws for speed
     )
+
+    sync_if_cuda(device)
+    predictive_seconds = time.perf_counter() - pred_t0
+
+    print(f"[TIME] Predictive metrics: {seconds_to_str(predictive_seconds)}")
 
     print("\nPredictive metrics:")
     print(
@@ -1672,7 +1734,7 @@ def run_case(
     )
 
     # for non-spline filters to work
-    spline_diag = {}
+    #spline_diag = {}
 
     # compact summary
     summary = {
@@ -1752,6 +1814,19 @@ def run_case(
         "scale_ratio_vi_mc": float(scale_hat_vi / scale_true),
     })
 
+    sync_if_cuda(device)
+    case_total_seconds = time.perf_counter() - case_t0
+
+    summary.update({
+        "time_vi_train_seconds": float(vi_train_seconds),
+        "time_vi_summary_seconds": float(vi_summary_seconds),
+        "time_mcmc_seconds": float(mcmc_seconds),
+        "time_predictive_seconds": float(predictive_seconds),
+        "time_case_total_seconds": float(case_total_seconds),
+        "time_vi_seconds_per_iter": float(vi_train_seconds / max(vi_num_iters, 1)),
+        "time_mcmc_seconds_per_step": float(mcmc_seconds / max(mcmc_num_steps, 1)),
+    })
+
     # -------------------------
     # Write per-case metrics JSON
     # -------------------------
@@ -1788,10 +1863,26 @@ def run_case(
                 "rmse_eta_vi": summary["rmse_eta_vi"],
                 "rmse_eta_mcmc": summary["rmse_eta_mcmc"],
                 "spline_coefficients": summary.get("spline_coefficients", {}),
+                "time_vi_train_seconds": summary["time_vi_train_seconds"],
+                "time_vi_summary_seconds": summary["time_vi_summary_seconds"],
+                "time_mcmc_seconds": summary["time_mcmc_seconds"],
+                "time_predictive_seconds": summary["time_predictive_seconds"],
+                "time_case_total_seconds": summary["time_case_total_seconds"],
+                "time_vi_seconds_per_iter": summary["time_vi_seconds_per_iter"],
+                "time_mcmc_seconds_per_step": summary["time_mcmc_seconds_per_step"],
             },
             f,
             indent=2,
         )
+    
+    # sync_if_cuda(device)
+    # case_total_seconds = time.perf_counter() - case_t0
+
+    print(
+        f"[TIME] Case total: {seconds_to_str(case_total_seconds)} | "
+        f"VI train={seconds_to_str(vi_train_seconds)} | "
+        f"MCMC={seconds_to_str(mcmc_seconds)}"
+    )
 
     return summary
 
@@ -1904,7 +1995,7 @@ def main():
 
     if args.truth == "icar":
         F_true = tau2_true / (lam + eps_car)
-        F_true - F_true.clamp_min(1e-12)
+        F_true = F_true.clamp_min(1e-12)
     
     elif args.truth == "leroux":
         tau2_true = 0.4
@@ -2083,6 +2174,9 @@ def main():
                 f"phi_RMSE(VI-plugin)={s['rmse_phi_vi_plugin']:.4f}  "
                 f"phi_RMSE(VI-mc)={s['rmse_phi_vi']:.4f}  "
                 f"phi_RMSE(MCMC)={s['rmse_phi_mcmc']:.4f} | "
+                f"VI={seconds_to_str(s['time_vi_train_seconds'])} | "
+                f"MCMC={seconds_to_str(s['time_mcmc_seconds'])} | "
+                f"total={seconds_to_str(s['time_case_total_seconds'])} | "
                 f"acc_s={s['acc_s']:.3f} | acc_theta[{theta_acc_str}] | "
                 f"MCMC mean sigma2={m['sigma2']:.4g}{tail}"
             )
