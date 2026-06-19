@@ -12,9 +12,78 @@ from scipy import sparse
 from scipy.linalg import eigh
 from sklearn.linear_model import LinearRegression
 
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression, RidgeCV
 
 DEFAULT_OUT_DIR = Path("data/processed")
 
+
+def default_covariate_columns(gdf: gpd.GeoDataFrame) -> list[str]:
+    """
+    Default mean-effect covariates saved from EJScreen.
+    """
+    candidate_covars = [
+        "ACSTOTPOP",
+        "ACSTOTHH",
+        "ACSTOTHU",
+        "PEOPCOLORPCT",
+        "LOWINCPCT",
+        "UNEMPPCT",
+        "DISABILITYPCT",
+        "LINGISOPCT",
+        "LESSHSPCT",
+        "UNDER5PCT",
+        "OVER64PCT",
+    ]
+
+    return [c for c in candidate_covars if c in gdf.columns]
+
+def covariate_design(
+    gdf: gpd.GeoDataFrame,
+    *,
+    include_coords: bool = True,
+    poly_degree: int = 2,
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Build mean-effect design matrix from real covariates plus optional coordinate terms.
+    """
+    covars = default_covariate_columns(gdf)
+
+    if not covars:
+        raise ValueError(
+            "No default covariates found in GPKG. "
+            "Rebuild the processed dataset after saving mean covariates."
+        )
+
+    X_parts = []
+    names = []
+
+    X_cov = gdf[covars].apply(pd.to_numeric, errors="coerce").copy()
+
+    # log-transform scale/count variables
+    for c in ["ACSTOTPOP", "ACSTOTHH", "ACSTOTHU"]:
+        if c in X_cov.columns:
+            X_cov[c] = np.log1p(X_cov[c])
+
+    X_parts.append(X_cov.to_numpy(dtype=float))
+    names.extend(covars)
+
+    if include_coords:
+        X_coord = coordinate_design(gdf, degree=poly_degree)
+        coord_names = ["x", "y"]
+        if poly_degree >= 2:
+            coord_names += ["x2", "xy", "y2"]
+        if poly_degree >= 3:
+            coord_names += ["x3", "x2y", "xy2", "y3"]
+
+        X_parts.append(X_coord)
+        names.extend(coord_names)
+
+    X = np.column_stack(X_parts)
+
+    return X, names
 
 def make_paths(
     *,
@@ -601,6 +670,49 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------
+    # 3. Actual covariate mean model
+    # ------------------------------------------------------------
+    X_cov, covar_names = covariate_design(
+        gdf,
+        include_coords=True,
+        poly_degree=args.poly_degree,
+    )
+
+    mean_model = make_pipeline(
+        SimpleImputer(strategy="median"),
+        StandardScaler(),
+        LinearRegression(),
+    )
+
+    mean_model.fit(X_cov, y)
+    yhat_cov = mean_model.predict(X_cov)
+    r_cov = y - yhat_cov
+
+    cov_r2 = 1.0 - np.sum((y - yhat_cov) ** 2) / np.sum((y - y.mean()) ** 2)
+
+    print("\nCovariate mean model:")
+    print(f"  number of covariates including coordinate terms = {X_cov.shape[1]}")
+    print(f"  R^2 = {cov_r2:.6f}")
+    print("  covariates:")
+    for c in covar_names:
+        print(f"    {c}")
+
+    gdf["trend_covariate_mean"] = yhat_cov
+    gdf["resid_covariate_mean"] = r_cov
+
+    summaries.append(
+        spectral_energy_summary(
+            name="Residual after covariate mean model",
+            r=r_cov,
+            lam=lam,
+            U=U,
+            out_dir=out_dir,
+            out_prefix=f"{run_tag}_covariate_mean",
+            n_bins=args.n_bins,
+        )
+    )
+
+    # ------------------------------------------------------------
     # 3. Remove first K low-frequency graph eigenvectors
     # ------------------------------------------------------------
     # This is not the primary mean-effect model. It is a sensitivity check:
@@ -648,6 +760,14 @@ def main() -> None:
                 f"Residual after coordinate polynomial trend degree {args.poly_degree}",
             ),
         ]
+
+        map_specs.append(
+            (
+                "resid_covariate_mean",
+                f"{run_tag}_covariate_mean_residual_map.png",
+                "Residual after covariate mean model",
+            )
+        )
 
         for K in args.remove_k:
             resid_col = f"resid_remove_first_{K}_eig"

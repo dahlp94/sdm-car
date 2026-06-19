@@ -21,6 +21,28 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # California tract shapefile
 TRACT_URL = "https://www2.census.gov/geo/tiger/TIGER2024/TRACT/tl_2024_06_tract.zip"
 
+def get_default_mean_covariates(df: pd.DataFrame) -> list[str]:
+    """
+    Default covariates for mean-effect removal.
+
+    These are demographic / socioeconomic / population scale variables.
+    They are not environmental exposure variables.
+    """
+    candidate_covars = [
+        "ACSTOTPOP",
+        "ACSTOTHH",
+        "ACSTOTHU",
+        "PEOPCOLORPCT",
+        "LOWINCPCT",
+        "UNEMPPCT",
+        "DISABILITYPCT",
+        "LINGISOPCT",
+        "LESSHSPCT",
+        "UNDER5PCT",
+        "OVER64PCT",
+    ]
+
+    return [c for c in candidate_covars if c in df.columns]
 
 def find_ejscreen_tract_file(raw_dir: Path) -> Path:
     """
@@ -653,6 +675,15 @@ def main():
     ej_la[response_col] = pd.to_numeric(ej_la[response_col], errors="coerce")
     ej_la[y_col] = make_transformed_response(ej_la[response_col], response_transform)
 
+    mean_covariates = get_default_mean_covariates(ej_la)
+
+    print("\nMean-effect covariates to save:")
+    for c in mean_covariates:
+        print(f"  {c}")
+
+    for c in mean_covariates:
+        ej_la[c] = pd.to_numeric(ej_la[c], errors="coerce")
+
     if args.screen_only:
         print("\n--screen-only was used. Stopping after response screening.")
         return
@@ -669,8 +700,10 @@ def main():
     print(f"LA County TIGER tracts: {tracts.shape[0]}")
 
     # 5. Join EJScreen data to tract polygons
+    save_cols = ["GEOID", response_col, y_col] + mean_covariates
+
     gdf = tracts.merge(
-        ej_la[["GEOID", response_col, y_col]],
+        ej_la[save_cols],
         on="GEOID",
         how="inner",
     )
@@ -714,7 +747,7 @@ def main():
 
     gdf.to_file(out_gpkg, layer="tracts", driver="GPKG")
 
-    gdf[["GEOID", response_col, y_col]].to_csv(out_csv, index=False)
+    gdf[["GEOID", response_col, y_col] + mean_covariates].to_csv(out_csv, index=False)
 
     sparse.save_npz(out_adj, A)
 
@@ -735,6 +768,7 @@ def main():
         "skew_abs": float(best["skew_abs"]),
         "excess_kurt_abs": float(best["excess_kurt_abs"]),
         "top_value_frac": float(best["top_value_frac"]),
+        "mean_covariates": mean_covariates,
     }
 
     with open(out_meta, "w", encoding="utf-8") as f:
