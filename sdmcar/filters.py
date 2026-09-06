@@ -6328,3 +6328,325 @@ class PositivePrecisionPSplineFullVI(
                 .reshape(())
             ),
         }
+
+class AdaptivePrecisionPSplineFullVI(BaseSpectralFilter):
+    """
+    Adaptive Positive precision P-spline with a hierarchical local-scale prior.
+    
+    Instead of a global RW2 smoothness prior, this model uses a continuous 
+    scale mixture. Each second difference parameter (d2_j) has its own local 
+    scale (lambda_j), allowing the spline to selectively disable smoothing 
+    at high frequencies to capture severe operator misspecification.
+    """
+
+    def __init__(
+        self,
+        *,
+        lam_max: float,
+        degree: int = 3,
+        n_internal_knots: int = 5,
+        prior_std_log_q: float = 2.0,
+        global_scale_d2: float = 0.15,         # The tau parameter (base penalty)
+        prior_std_log_lambda: float = 2.0,     # Prior variance for local scales
+        mu_log_lambda_init: float = 0.0,
+        log_std_log_lambda: float = -3.0,
+        mu_log_q_left: float = math.log(0.20),
+        mu_log_q_right: float = math.log(5.00),
+        log_std_log_q: float = -2.3,
+        log_std_d2: float = -2.3,
+        init_d2=0.0,
+        log_q_min: float = -20.0,
+        log_q_max: float = 20.0,
+    ):
+        super().__init__()
+
+        if lam_max <= 0:
+            raise ValueError("lam_max must be positive.")
+        if degree < 1:
+            raise ValueError("degree must be at least 1.")
+        if n_internal_knots < 0:
+            raise ValueError("n_internal_knots must be nonnegative.")
+
+        self.lam_max = float(lam_max)
+        self.degree = int(degree)
+        self.n_internal_knots = int(n_internal_knots)
+
+        self.prior_std_log_q = float(prior_std_log_q)
+        self.global_scale_d2 = float(global_scale_d2)
+        self.prior_std_log_lambda = float(prior_std_log_lambda)
+
+        self.log_q_min = float(log_q_min)
+        self.log_q_max = float(log_q_max)
+
+        self.J = self.n_internal_knots + self.degree + 1
+        self.K = self.J - 2
+
+        if self.K <= 0:
+            raise ValueError("The spline must have at least three basis functions.")
+
+        # -----------------------------------------------------
+        # 1. Endpoint precisions (Global structure)
+        # -----------------------------------------------------
+        self.mu_log_q_endpoints = nn.Parameter(
+            torch.tensor([mu_log_q_left, mu_log_q_right], dtype=torch.double)
+        )
+        self.log_std_log_q_endpoints = nn.Parameter(
+            torch.full((2,), float(log_std_log_q), dtype=torch.double)
+        )
+
+        # -----------------------------------------------------
+        # 2. Local Scale Parameters (Adaptive Shrinkage)
+        # -----------------------------------------------------
+        self.mu_log_lambda = nn.Parameter(
+            torch.full((self.K,), float(mu_log_lambda_init), dtype=torch.double)
+        )
+        self.log_std_log_lambda = nn.Parameter(
+            torch.full((self.K,), float(log_std_log_lambda), dtype=torch.double)
+        )
+
+        # -----------------------------------------------------
+        # 3. Second-difference parameters (Curvature)
+        # -----------------------------------------------------
+        if isinstance(init_d2, torch.Tensor):
+            d2_init = init_d2.detach().clone().to(dtype=torch.double).reshape(-1)
+        elif isinstance(init_d2, (list, tuple)):
+            d2_init = torch.tensor(list(init_d2), dtype=torch.double)
+        else:
+            d2_init = torch.full((self.K,), float(init_d2), dtype=torch.double)
+
+        self.mu_d2 = nn.Parameter(d2_init)
+        self.log_std_d2 = nn.Parameter(
+            torch.full((self.K,), float(log_std_d2), dtype=torch.double)
+        )
+
+        # -----------------------------------------------------
+        # Map second differences to residual coefficients
+        # -----------------------------------------------------
+        A = torch.zeros((self.K, self.K), dtype=torch.double)
+        for j in range(self.K):
+            A[j, j] = -2.0
+            if j > 0:
+                A[j, j - 1] = 1.0
+            if j + 1 < self.K:
+                A[j, j + 1] = 1.0
+
+        self.register_buffer("rw2_inverse", torch.linalg.inv(A))
+
+    # ---------------------------------------------------------
+    # B-spline basis functions (Unchanged)
+    # ---------------------------------------------------------
+    def _knots(self, device, dtype):
+        return _make_open_uniform_knots(
+            0.0, 1.0, self.n_internal_knots, self.degree, device=device, dtype=dtype
+        )
+
+    def _basis(self, x):
+        knots = self._knots(device=x.device, dtype=x.dtype)
+        return _bspline_basis_1d(x, knots, self.degree)
+
+    def _greville_points(self, device, dtype):
+        knots = self._knots(device=device, dtype=dtype)
+        points = []
+        for j in range(self.J):
+            point = knots[j + 1 : j + self.degree + 1].mean()
+            points.append(point)
+        return torch.stack(points)
+
+    # ---------------------------------------------------------
+    # Parameter bookkeeping
+    # ---------------------------------------------------------
+    def unconstrained_names(self):
+        names = ["log_q_left", "log_q_right"]
+        names += [f"d2_{j}_raw" for j in range(self.K)]
+        names += [f"log_lambda_{j}" for j in range(self.K)]
+        return names
+
+    def blocks(self):
+        return [
+            ParamBlock(
+                name="log_q_endpoints",
+                param_names=("log_q_left", "log_q_right"),
+            ),
+            ParamBlock(
+                name="d2_raw",
+                param_names=tuple(f"d2_{j}_raw" for j in range(self.K)),
+            ),
+            ParamBlock(
+                name="log_lambda",
+                param_names=tuple(f"log_lambda_{j}" for j in range(self.K)),
+            ),
+        ]
+
+    # ---------------------------------------------------------
+    # VI distribution
+    # ---------------------------------------------------------
+    def sample_unconstrained(self):
+        endpoint_eps = torch.randn_like(self.mu_log_q_endpoints)
+        log_q_endpoints = self.mu_log_q_endpoints + torch.exp(self.log_std_log_q_endpoints) * endpoint_eps
+
+        lambda_eps = torch.randn_like(self.mu_log_lambda)
+        log_lambda = self.mu_log_lambda + torch.exp(self.log_std_log_lambda) * lambda_eps
+
+        d2_eps = torch.randn_like(self.mu_d2)
+        d2 = self.mu_d2 + torch.exp(self.log_std_d2) * d2_eps
+
+        out = {
+            "log_q_left": log_q_endpoints[0:1],
+            "log_q_right": log_q_endpoints[1:2],
+        }
+
+        for j in range(self.K):
+            out[f"d2_{j}_raw"] = d2[j : j + 1]
+            out[f"log_lambda_{j}"] = log_lambda[j : j + 1]
+
+        return out
+
+    @torch.no_grad()
+    def mean_unconstrained(self):
+        endpoints = self.mu_log_q_endpoints.detach()
+        d2 = self.mu_d2.detach()
+        log_lambda = self.mu_log_lambda.detach()
+
+        out = {
+            "log_q_left": endpoints[0:1],
+            "log_q_right": endpoints[1:2],
+        }
+
+        for j in range(self.K):
+            out[f"d2_{j}_raw"] = d2[j : j + 1]
+            out[f"log_lambda_{j}"] = log_lambda[j : j + 1]
+
+        return out
+
+    # ---------------------------------------------------------
+    # Constrained representation (Unchanged)
+    # ---------------------------------------------------------
+    def _constrain(self, theta):
+        log_q_left = theta["log_q_left"].reshape(())
+        log_q_right = theta["log_q_right"].reshape(())
+        q_left = torch.exp(log_q_left)
+        q_right = torch.exp(log_q_right)
+
+        d2 = torch.stack(
+            [theta[f"d2_{j}_raw"].reshape(()) for j in range(self.K)], dim=0
+        )
+
+        residual_interior = self.rw2_inverse @ d2
+        zero = residual_interior.new_zeros(1)
+        residual = torch.cat([zero, residual_interior, zero], dim=0)
+
+        return {
+            "log_q_left": log_q_left,
+            "log_q_right": log_q_right,
+            "q_left": q_left,
+            "q_right": q_right,
+            "d2": d2,
+            "residual": residual,
+        }
+
+    def _coefficient_components(self, theta):
+        c = self._constrain(theta)
+        greville = self._greville_points(
+            device=c["q_left"].device, dtype=c["q_left"].dtype
+        )
+        affine_coef = (1.0 - greville) * c["q_left"] + greville * c["q_right"]
+        full_coef = affine_coef * torch.exp(c["residual"])
+        return {**c, "greville": greville, "affine_coef": affine_coef, "full_coef": full_coef}
+
+    # ---------------------------------------------------------
+    # Precision and covariance spectra (Unchanged)
+    # ---------------------------------------------------------
+    def precision_from_unconstrained(self, lam, theta):
+        x = (lam / self.lam_max).clamp(0.0, 1.0)
+        B = self._basis(x)
+        c = self._coefficient_components(theta)
+        q = B @ c["full_coef"]
+        log_q = torch.log(q.clamp_min(1e-12)).clamp(self.log_q_min, self.log_q_max)
+        return torch.exp(log_q)
+
+    def affine_precision_from_unconstrained(self, lam, theta):
+        x = (lam / self.lam_max).clamp(0.0, 1.0)
+        B = self._basis(x)
+        c = self._coefficient_components(theta)
+        q_affine = B @ c["affine_coef"]
+        return q_affine.clamp_min(1e-12)
+
+    def spectrum_from_unconstrained(self, lam, theta):
+        q = self.precision_from_unconstrained(lam, theta)
+        return (1.0 / q).clamp_min(1e-12)
+
+    def correction_from_unconstrained(self, lam, theta):
+        q_full = self.precision_from_unconstrained(lam, theta)
+        q_affine = self.affine_precision_from_unconstrained(lam, theta)
+        return -torch.log(q_full / q_affine)
+
+    # ---------------------------------------------------------
+    # Hierarchical KL Divergence
+    # ---------------------------------------------------------
+    def kl_q_p(self):
+        """
+        Computes the KL divergence for the hierarchical local-scale mixture.
+        Uses explicit closed-form math for stability.
+        """
+        # 1. Endpoints KL (Normal to Normal)
+        std_q = torch.exp(self.log_std_log_q_endpoints)
+        kl_endpoints = 0.5 * torch.sum(
+            (self.mu_log_q_endpoints**2 + std_q**2) / (self.prior_std_log_q**2)
+            + 2 * math.log(self.prior_std_log_q)
+            - 1.0
+            - 2 * self.log_std_log_q_endpoints
+        )
+
+        # 2. Local Scales (log_lambda) KL (Normal to Normal)
+        std_lambda = torch.exp(self.log_std_log_lambda)
+        kl_lambda = 0.5 * torch.sum(
+            (self.mu_log_lambda**2 + std_lambda**2) / (self.prior_std_log_lambda**2)
+            + 2 * math.log(self.prior_std_log_lambda)
+            - 1.0
+            - 2 * self.log_std_log_lambda
+        )
+
+        # 3. Curvature (d2) Conditional KL 
+        std_d2 = torch.exp(self.log_std_d2)
+        # Expected value of (1 / lambda^2) under the log-normal variational posterior
+        expected_inv_lambda_sq = torch.exp(-2 * self.mu_log_lambda + 2 * std_lambda**2)
+        
+        kl_d2 = torch.sum(
+            0.5 * (self.mu_d2**2 + std_d2**2) * expected_inv_lambda_sq / (self.global_scale_d2**2)
+            + self.mu_log_lambda
+            + math.log(self.global_scale_d2)
+            - 0.5
+            - self.log_std_d2
+        )
+
+        return kl_endpoints + kl_lambda + kl_d2
+
+    # ---------------------------------------------------------
+    # Reporting
+    # ---------------------------------------------------------
+    @torch.no_grad()
+    def mean_params(self):
+        c = self._coefficient_components(self.mean_unconstrained())
+        scale_like = (1.0 / c["q_left"]).reshape(())
+        parameters = torch.cat([c["q_left"].reshape(1), c["q_right"].reshape(1), c["d2"]], dim=0)
+        return scale_like, parameters
+
+    @torch.no_grad()
+    def shrinkage_summary(self):
+        c = self._coefficient_components(self.mean_unconstrained())
+        d2 = c["d2"]
+        residual = c["residual"]
+        
+        # Add local scale extraction to the summary
+        local_scales = torch.exp(self.mu_log_lambda.detach())
+
+        return {
+            "q_left": c["q_left"].detach().reshape(()),
+            "q_right": c["q_right"].detach().reshape(()),
+            "d2": d2.detach().clone(),
+            "local_scales": local_scales.clone(),
+            "residual": residual.detach().clone(),
+            "d2_l2": torch.sqrt(torch.sum(d2 ** 2)).reshape(()),
+            "max_abs_d2": torch.max(torch.abs(d2)).reshape(()),
+            "max_abs_residual": torch.max(torch.abs(residual)).reshape(()),
+        }
