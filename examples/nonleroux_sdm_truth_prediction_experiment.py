@@ -1903,6 +1903,53 @@ def plot_spectral_summary(
     )
     plt.close(fig)
 
+def plot_truth_vs_best_leroux_precision(
+    *,
+    lam,
+    q_true,
+    F_best_leroux,
+    output_path,
+    dpi=180,
+):
+    q_best_leroux = 1.0 / np.asarray(
+        F_best_leroux,
+        dtype=float,
+    )
+
+    fig, ax = plt.subplots(figsize=(7.5, 5.0))
+
+    ax.plot(
+        lam,
+        q_true,
+        linewidth=2.4,
+        label="True non-Leroux SDM precision",
+    )
+
+    ax.plot(
+        lam,
+        q_best_leroux,
+        linewidth=2.0,
+        linestyle="--",
+        label="Best Leroux approximation",
+    )
+
+    ax.set_xlabel("Graph Laplacian eigenvalue")
+    ax.set_ylabel("Modal precision")
+    ax.set_title(
+        "Non-Leroux truth and best Leroux approximation"
+    )
+
+    ax.legend()
+    ax.grid(alpha=0.2)
+
+    fig.savefig(
+        output_path,
+        dpi=dpi,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
 def build_cross_seed_outputs(
     output_dir: Path,
     dpi: int,
@@ -2130,6 +2177,31 @@ def main():
         "test_mask": test_mask,
         **truth,
     }
+
+    summary_plot_dir = output_dir / "summary_plots"
+    
+    summary_plot_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    plot_truth_vs_best_leroux_precision(
+        lam=lam_true,
+        q_true=np.asarray(
+            truth["q_true"],
+            dtype=float,
+        ),
+        F_best_leroux=np.asarray(
+            truth["best_leroux_F"],
+            dtype=float,
+        ),
+        output_path=(
+            summary_plot_dir
+            / "exp2_truth_vs_best_leroux_precision.png"
+        ),
+        dpi=args.dpi,
+    )
+    
     print("Project root:", project_root)
     print("Output directory:", output_dir)
     print("Device:", DEVICE)
